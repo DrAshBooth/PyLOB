@@ -23,6 +23,8 @@ class OrderList(object):
             returnVal = self.last
             self.last = self.last.nextOrder
             return returnVal
+    def getHeadOrder(self):
+        return self.headOrder
     def appendOrder(self, order):
         if len(self) == 0:
             order.nextOrder = None

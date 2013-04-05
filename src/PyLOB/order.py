@@ -9,25 +9,12 @@ class Order(object):
         self. useFloat = True    # Use floats to approximate prices instead of Decimals
         self.timestamp = int(quote['timestamp'])
         self.qty = int(quote['qty'])
-        self.price = self.convertPrice(quote['price'])
+        self.price = quote['price']
         self.idNum = quote['idNum']
         self.tid = quote['tid']
         self.nextOrder = None
         self.prevOrder = None
         self.orderList = orderList
-        
-    def convertPrice(self, price):
-        '''
-        Converts price to an integer representing a mil. 
-        1 mil = 0.0001
-        Smallest representable size is 0.0001
-        '''
-        if self.useFloat:
-            return int(float(price) * float(10000))
-        else:
-            # Exact representation
-            from decimal import Decimal
-            return int(Decimal(price) * Decimal(10000))
         
     def nextOrder(self):
         return self.nextOrder
@@ -43,7 +30,7 @@ class Order(object):
         self.qty = newQty
 
     def __str__(self):
-        return "%s\t@\t%.4f" % (self.qty, self.price / float(10000))
+        return "%s\t@\t%.4f\t@\t%d" % (self.qty, self.price / float(10000), self.timestamp)
     
 class Trade(Order):
     def __init__(self, quote):
