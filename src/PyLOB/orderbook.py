@@ -17,9 +17,8 @@ quote = {'timestamp' : 008,
          'side' : 'ask', 
          'qty' : 6, 
          'tid' : xxx}
-
+         
 '''
-
 
 import sys
 import math
@@ -43,7 +42,7 @@ class OrderBook(object):
     def addOrder(self, quote):
         pass
     
-    def processOrder(self, time, order_type, quote):
+    def processOrder(self, time, order_type, quote, verbose):
         if quote['qty'] <= 0:
             sys.exit('processLimitOrder() given order of qty <= 0')
         # Assign idNum
@@ -53,36 +52,87 @@ class OrderBook(object):
         quote['price'] = self.clipPrice(quote['price'])
         # Check order type
         if order_type=='market':
-            self.processMarketOrder(time, quote)
+            self.processMarketOrder(time, quote, verbose)
         elif order_type=='limit':
-            self.processLimitOrder(time, quote)
+            self.processLimitOrder(time, quote, verbose)
         else:
             sys.exit("processOrder() given neither 'market' nor 'limit'")
     
-    def processMarketOrder(self, time, quote):
+    def processMarketOrder(self, time, quote, verbose):
+        trades = []
         qty_to_trade = quote['qty']
         side = quote['side']
         if side == 'bid':
-            while qty_to_trade > 0 and self.asks:
+            while qty_to_trade > 0 and self.asks: 
                 best_price_asks = self.asks.minPriceList()
                 while len(best_price_asks)>0 and qty_to_trade > 0:
                     head_order = best_price_asks.getHeadOrder()
+                    traded_price = head_order.price
+                    counterparty = head_order.tid
                     if qty_to_trade < head_order.qty:
+                        traded_qty = qty_to_trade
                         # amend book order
                         new_book_qty = head_order.qty - qty_to_trade
                         head_order.updateQty(self, new_book_qty, head_order.timestamp)
                         # incoming done with
-                        pass
+                        qty_to_trade = 0
                     elif qty_to_trade == head_order.qty:
-                        pass
+                        traded_qty = qty_to_trade
+                        # lift the ask
+                        self.asks.removeOrderById(head_order.idNum)
+                        # incoming done with
+                        qty_to_trade = 0
                     else:
+                        traded_qty = head_order.qty
+                        # lift the ask
+                        self.asks.removeOrderById(head_order.idNum)
                         # we need to keep eating into volume at this price
-                        pass
+                        qty_to_trade -= traded_qty
+                    if verbose: print('>>> TRADE t=%d $%d %s %s' % (time, traded_price, traded_qty, counterparty, quote['tid']))
+                    transaction_record = {'time': time,
+                                               'price': traded_price,
+                                               'qty': traded_qty, 
+                                               'party1': [counterparty, 'ask'],
+                                               'party2': [quote['tid'], 'bid'],
+                                               'qty': traded_qty}
+                    self.trades.append(transaction_record)
         elif side == 'ask':
-            while qty_to_trade > 0 and self.bids:
-                pass
+            while qty_to_trade > 0 and self.bids: 
+                best_price_bids = self.bids.maxPriceList()
+                while len(best_price_bids)>0 and qty_to_trade > 0:
+                    head_order = best_price_bids.getHeadOrder()
+                    traded_price = head_order.price
+                    counterparty = head_order.tid
+                    if qty_to_trade < head_order.qty:
+                        traded_qty = qty_to_trade
+                        # amend book order
+                        new_book_qty = head_order.qty - qty_to_trade
+                        head_order.updateQty(self, new_book_qty, head_order.timestamp)
+                        # incoming done with
+                        qty_to_trade = 0
+                    elif qty_to_trade == head_order.qty:
+                        traded_qty = qty_to_trade
+                        # hit the bid
+                        self.bids.removeOrderById(head_order.idNum)
+                        # incoming done with
+                        qty_to_trade = 0
+                    else:
+                        traded_qty = head_order.qty
+                        # hit the bid
+                        self.bids.removeOrderById(head_order.idNum)
+                        # we need to keep eating into volume at this price
+                        qty_to_trade -= traded_qty
+                    if verbose: print('>>> TRADE t=%d $%d %s %s' % (time, traded_price, traded_qty, counterparty, quote['tid']))
+                    transaction_record = {'time': time,
+                                               'price': traded_price,
+                                               'qty': traded_qty, 
+                                               'party1': [counterparty, 'bid'],
+                                               'party2': [quote['tid'], 'ask'],
+                                               'qty': traded_qty}
+                    self.trades.append(transaction_record)
         else:
             sys.exit('processMarketOrder() received neither "bid" nor "ask"')
+        return trades
     
     def bidLimitClears(self, quote):
         trades = []
