@@ -30,18 +30,18 @@ class Order(object):
         self.qty = newQty
 
     def __str__(self):
-        return "%s\t@\t%.4f\t@\t%d" % (self.qty, self.price / float(10000), self.timestamp)
+        return "%s\t@\t%.4f\tt=%d" % (self.qty, self.price, self.timestamp)
     
-class Trade(Order):
-    def __init__(self, quote):
-        super(Trade, self).__init__(quote)
-
-class Ask(Order):
-    def __init__(self, quote):
-        super(Ask, self).__init__(quote)
-        self.isBid = False
-
-class Bid(Order):
-    def __init__(self, quote):
-        super(Bid, self).__init__(quote)
-        self.isBid = True
+#class Trade(Order):
+#    def __init__(self, quote):
+#        super(Trade, self).__init__(quote)
+#
+#class Ask(Order):
+#    def __init__(self, quote):
+#        super(Ask, self).__init__(quote)
+#        self.isBid = False
+#
+#class Bid(Order):
+#    def __init__(self, quote):
+#        super(Bid, self).__init__(quote)
+#        self.isBid = True

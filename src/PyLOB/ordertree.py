@@ -94,21 +94,7 @@ class OrderTree(object):
 ########## Test OrderTree #########
 ###################################
 
-some_orders = []
-import random
-for i in range(25):
-    some_orders.append({'timestamp' : i, 
-                'side' : 'ask', 
-                'qty' : 1, 
-                'price' : random.randint(100,105),
-                'tid' : i,
-                'idNum' : i})
-
-the_asks = OrderTree()
-for order in some_orders:
-    the_asks.insertOrder(order)
-print "min pricelist = \n{}".format(the_asks.minPriceList())
-print "head = %s" % (the_asks.minPriceList().headOrder)
+ 
 #print "max price = \n{}".format(the_asks.maxPriceList())
 #best_asks = the_asks.getPrice(101)
 #print 'go'

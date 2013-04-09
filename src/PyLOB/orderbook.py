@@ -23,12 +23,11 @@ quote = {'timestamp' : 008,
 import sys
 import math
 from collections import deque
-from order import Bid, Ask, Trade
 from ordertree import OrderTree
 
 class OrderBook(object):
     def __init__(self):
-        self.trades = deque(maxlen=None) # Index [0] is most recent trade
+        self.tape = deque(maxlen=None) # Index [0] is most recent trade
         self.bids = OrderTree()
         self.asks = OrderTree()
         self.lastTick = None
@@ -48,15 +47,16 @@ class OrderBook(object):
         # Assign idNum
         quote['idNum'] = self.nextQuoteID
         self.nextQuoteID += 1
-        # Clip the price according to the tick size
-        quote['price'] = self.clipPrice(quote['price'])
         # Check order type
         if order_type=='market':
-            self.processMarketOrder(time, quote, verbose)
+            trades = self.processMarketOrder(time, quote, verbose)
         elif order_type=='limit':
-            self.processLimitOrder(time, quote, verbose)
+            # Clip the price according to the tick size
+            quote['price'] = self.clipPrice(quote['price'])
+            trades = self.processLimitOrder(time, quote, verbose)
         else:
             sys.exit("processOrder() given neither 'market' nor 'limit'")
+        return trades
     
     def processMarketOrder(self, time, quote, verbose):
         trades = []
@@ -73,7 +73,7 @@ class OrderBook(object):
                         traded_qty = qty_to_trade
                         # amend book order
                         new_book_qty = head_order.qty - qty_to_trade
-                        head_order.updateQty(self, new_book_qty, head_order.timestamp)
+                        head_order.updateQty(new_book_qty, head_order.timestamp)
                         # incoming done with
                         qty_to_trade = 0
                     elif qty_to_trade == head_order.qty:
@@ -88,14 +88,15 @@ class OrderBook(object):
                         self.asks.removeOrderById(head_order.idNum)
                         # we need to keep eating into volume at this price
                         qty_to_trade -= traded_qty
-                    if verbose: print('>>> TRADE t=%d $%d %s %s' % (time, traded_price, traded_qty, counterparty, quote['tid']))
-                    transaction_record = {'time': time,
+                    if verbose: print('>>> TRADE \nt=%d $%f n=%d p1=%d p2=%d' % (time, traded_price, traded_qty, counterparty, quote['tid']))
+                    transaction_record = {'timestamp': time,
                                                'price': traded_price,
                                                'qty': traded_qty, 
                                                'party1': [counterparty, 'ask'],
                                                'party2': [quote['tid'], 'bid'],
                                                'qty': traded_qty}
-                    self.trades.append(transaction_record)
+                    self.tape.append(transaction_record)
+                    trades.append(transaction_record)
         elif side == 'ask':
             while qty_to_trade > 0 and self.bids: 
                 best_price_bids = self.bids.maxPriceList()
@@ -107,7 +108,7 @@ class OrderBook(object):
                         traded_qty = qty_to_trade
                         # amend book order
                         new_book_qty = head_order.qty - qty_to_trade
-                        head_order.updateQty(self, new_book_qty, head_order.timestamp)
+                        head_order.updateQty(new_book_qty, head_order.timestamp)
                         # incoming done with
                         qty_to_trade = 0
                     elif qty_to_trade == head_order.qty:
@@ -122,14 +123,15 @@ class OrderBook(object):
                         self.bids.removeOrderById(head_order.idNum)
                         # we need to keep eating into volume at this price
                         qty_to_trade -= traded_qty
-                    if verbose: print('>>> TRADE t=%d $%d %s %s' % (time, traded_price, traded_qty, counterparty, quote['tid']))
-                    transaction_record = {'time': time,
+                    if verbose: print('>>> TRADE \nt=%d $%f n=%d p1=%d p2=%d' % (time, traded_price, traded_qty, counterparty, quote['tid']))
+                    transaction_record = {'timestamp': time,
                                                'price': traded_price,
                                                'qty': traded_qty, 
                                                'party1': [counterparty, 'bid'],
                                                'party2': [quote['tid'], 'ask'],
                                                'qty': traded_qty}
-                    self.trades.append(transaction_record)
+                    trades.append(transaction_record)
+                    self.tape.append(transaction_record)
         else:
             sys.exit('processMarketOrder() received neither "bid" nor "ask"')
         return trades
@@ -247,15 +249,72 @@ class OrderBook(object):
             for k, v in self.asks.priceTree.items():
                 file_str.write('%s' % v)
         file_str.write("\n------ Trades ------\n")
-        if self.trades != None and len(self.trades) > 0:
+        if self.tape != None and len(self.tape) > 0:
             num = 0
-            for entry in self.trades:
+            for entry in self.tape:
                 if num < 5:
-                    file_str.write(str(entry.qty) + " @ " \
-                        + str(entry.price / 10000) \
-                        + " (" + str(entry.timestamp) + ")\n")
+                    file_str.write(str(entry['qty']) + " @ " \
+                        + str(entry['price']) \
+                        + " (" + str(entry['timestamp']) + ")\n")
                     num += 1
                 else:
                     break
         file_str.write("\n")
         return file_str.getvalue()
+    
+####################################
+########### For testing ############
+####################################
+the_lob = OrderBook()
+# creates some bids
+some_orders = [{'timestamp' : 1, 
+                'side' : 'bid', 
+                'qty' : 5, 
+                'price' : 99,
+                'tid' : 100,
+                'idNum' : 1},
+               {'timestamp' : 2, 
+                'side' : 'bid', 
+                'qty' : 5, 
+                'price' : 98,
+                'tid' : 101,
+                'idNum' : 2},
+               {'timestamp' : 3, 
+                'side' : 'bid', 
+                'qty' : 5, 
+                'price' : 99,
+                'tid' : 102,
+                'idNum' : 3},
+               {'timestamp' : 4, 
+                'side' : 'bid', 
+                'qty' : 5, 
+                'price' : 97,
+                'tid' : 103,
+                'idNum' : 4},
+               ]
+for order in some_orders:
+    the_lob.bids.insertOrder(order)
+
+print "book before MO..."
+print the_lob
+market_order = {'timestamp' : 4, 
+                'side' : 'ask', 
+                'qty' : 11, 
+                'tid' : 999}
+trades = the_lob.processOrder(4, 'market', market_order, True)
+print "\nbook after MO..."
+print the_lob
+print "\nResultant trades..."
+import pprint
+if trades:
+    pprint.pprint(trades)
+else:
+    print "no trades"
+    
+
+
+    
+    
+    
+    
+    
