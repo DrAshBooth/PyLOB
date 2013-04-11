@@ -65,7 +65,7 @@ class OrderTree(object):
             self.insertOrder(order_update)
         else:
             # Quantity changed
-            order.updateQty(order_update['qty'], order_update['price'])
+            order.updateQty(order_update['qty'], order_update['timestamp'])
         self.volume += order.qty - originalVolume
         
     def removeOrderById(self, idNum):

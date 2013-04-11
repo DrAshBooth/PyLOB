@@ -185,17 +185,39 @@ class OrderBook(object):
             sys.exit('cancelOrder() given neither bid nor ask')
         
     
-    def modifyOrder(self, side, idNum):
+    def modifyOrder(self, side, idNum, order_update):
         self.updateTime()
+        order_update['idNum'] = idNum
+        order_update['timestamp'] = self.time
+        if side=='bid':
+            if self.bids.orderExists(order_update['idNum']):
+                self.bids.updateOrder(order_update)
+        elif side=='ask':
+            if self.asks.orderExists(order_update['idNum']):
+                self.asks.updateOrder(order_update)
+        else:
+            sys.exit('modifyOrder() given neither bid nor ask')
     
-    def getVolAtPrice(self):
-        pass
+    def getVolumeAtPrice(self, side, price):
+        price = self.clipPrice(price)
+        if side =='bid':
+            vol = 0
+            if self.bids.priceExists(price):
+                vol = self.bids.getPrice(price).volume
+            return vol
+        elif side=='ask':
+            vol = 0
+            if self.asks.priceExists(price):
+                vol = self.asks.getPrice(price).volume
+            return vol
+        else:
+            sys.exit('getVolumeAtPrice() given neither bid nor ask')
     
     def getBestBid(self):
-        pass
+        return self.bids.maxPrice()
     
     def getBestAsk(self):
-        pass
+        return self.asks.minPrice()
         
     def __str__(self):
         # Efficient string concat
@@ -222,68 +244,6 @@ class OrderBook(object):
                     break
         file_str.write("\n")
         return file_str.getvalue()
-    
-####################################
-########### For testing ############
-####################################
-the_lob = OrderBook()
-# create some limit orders
-some_asks = [{'side' : 'ask', 
-                'qty' : 5, 
-                'price' : 101,
-                'tid' : 100},
-               {'side' : 'ask', 
-                'qty' : 5, 
-                'price' : 103,
-                'tid' : 101},
-               {'side' : 'ask', 
-                'qty' : 5, 
-                'price' : 101,
-                'tid' : 102},
-               {'side' : 'ask', 
-                'qty' : 5, 
-                'price' : 101,
-                'tid' : 103},
-               ]
-some_bids = [{'side' : 'bid', 
-                'qty' : 5, 
-                'price' : 99,
-                'tid' : 100},
-               {'side' : 'bid', 
-                'qty' : 5, 
-                'price' : 98,
-                'tid' : 101},
-               {'side' : 'bid', 
-                'qty' : 5, 
-                'price' : 99,
-                'tid' : 102},
-               {'side' : 'bid', 
-                'qty' : 5, 
-                'price' : 97,
-                'tid' : 103},
-               ]
-some_orders =  some_asks+some_bids
-for order in some_orders:
-    the_lob.processOrder('limit', order, True)
-print "book before Cancel..."
-print the_lob
-the_lob.cancelOrder('ask', 3)
-print "book after Cancel..."
-print the_lob
-#market_order = {'timestamp' : 4, 
-#                'side' : 'bid', 
-#                'qty' : 11, 
-#                'tid' : 999}
-#trades = the_lob.processOrder(4, 'market', market_order, True)
-#print "\nbook after MO..."
-#print the_lob
-#print "\nResultant trades..."
-#import pprint
-#if trades:
-#    pprint.pprint(trades)
-#else:
-#    print "no trades"
-    
 
 
     

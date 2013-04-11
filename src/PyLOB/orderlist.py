@@ -57,7 +57,7 @@ class OrderList(object):
             self.tailOrder = prevOrder
     def moveTail(self, order):
         if order.prevOrder != None:
-            order.prevOrder.nextOrder = self.nextOrder
+            order.prevOrder.nextOrder = order.nextOrder
         else:
             # Update the head order
             self.headOrder = order.nextOrder
