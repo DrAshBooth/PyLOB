@@ -13,8 +13,7 @@ quote = {'timestamp' : 008,
          'tid' : xxx}
          
 Market Order:
-quote = {'timestamp' : 008, 
-         'side' : 'ask', 
+quote = {'side' : 'ask', 
          'qty' : 6, 
          'tid' : xxx}
          
@@ -177,7 +176,7 @@ class OrderBook(object):
         self.updateTime()
         if side=='bid':
             if self.bids.orderExists(idNum):
-                self.asks.removeOrderById(idNum)
+                self.bids.removeOrderById(idNum)
         elif side=='ask':
             if self.asks.orderExists(idNum):
                 self.asks.removeOrderById(idNum)
