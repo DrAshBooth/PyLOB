@@ -1,7 +1,7 @@
 '''
 Created on Apr 11, 2013
 
-@author: ASh Booth
+@author: Ash Booth
 '''
 
 if __name__ == '__main__':
