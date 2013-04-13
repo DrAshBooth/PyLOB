@@ -11,11 +11,14 @@ class OrderList(object):
         self.length = 0
         self.volume = 0    # Total share volume
         self.last = None
+        
     def __len__(self):
         return self.length
+    
     def __iter__(self):
         self.last = self.headOrder
         return self
+    
     def next(self):
         if self.last == None:
             raise StopIteration
@@ -23,8 +26,10 @@ class OrderList(object):
             returnVal = self.last
             self.last = self.last.nextOrder
             return returnVal
+        
     def getHeadOrder(self):
         return self.headOrder
+    
     def appendOrder(self, order):
         if len(self) == 0:
             order.nextOrder = None
@@ -38,6 +43,7 @@ class OrderList(object):
             self.tailOrder = order
         self.length += 1
         self.volume += order.qty
+        
     def removeOrder(self, order):
         self.volume -= order.qty
         self.length -= 1
@@ -55,6 +61,7 @@ class OrderList(object):
         elif prevOrder != None:
             prevOrder.nextOrder = None
             self.tailOrder = prevOrder
+            
     def moveTail(self, order):
         if order.prevOrder != None:
             order.prevOrder.nextOrder = order.nextOrder
@@ -67,6 +74,7 @@ class OrderList(object):
         self.tailOrder = order
         order.prevOrder = self.tailOrder
         order.nextOrder = None
+        
     def __str__(self):
         from cStringIO import StringIO
         file_str = StringIO()

@@ -12,13 +12,13 @@ if __name__ == '__main__':
     
     from PyLOB import OrderBook
     
-    # create a LOB object
+    # Create a LOB object
     lob = OrderBook()
     
     ########### Limit Orders #############
     
-    # create some limit orders
-    some_orders = [{'side' : 'ask', 
+    # Create some limit orders
+    someOrders = [{'side' : 'ask', 
                     'qty' : 5, 
                     'price' : 101,
                     'tid' : 100},
@@ -53,44 +53,44 @@ if __name__ == '__main__':
                    ]
     
     # Add orders to LOB
-    ids = []
-    for order in some_orders:
+    for order in someOrders:
         trades, idNum = lob.processOrder('limit', order, False)
-        ids.append(idNum)
     
     # The current book may be viewed using a print
     print lob
     
     # Submitting a limit order that crosses the opposing best price will 
     # result in a trade.
-    crossing_limit_order = {'side' : 'bid', 
-                    'qty' : 2, 
-                    'price' : 102,
-                    'tid' : 109}
-    trades, idNum = lob.processOrder('limit', crossing_limit_order, False)
+    crossingLimitOrder = {'side' : 'bid', 
+                            'qty' : 2, 
+                            'price' : 102,
+                            'tid' : 109}
+    trades, idNum = lob.processOrder('limit', crossingLimitOrder, False)
     print "Trade occurs as incoming bid limit crosses best ask.."
     print trades
     print lob
     
-    # if a limit order crosses but is only partially matched, the remaining 
+    # If a limit order crosses but is only partially matched, the remaining 
     # volume will be placed in the book as an outstanding order
-    big_crossing_limit_order = {'side' : 'bid', 
-                    'qty' : 50, 
-                    'price' : 102,
-                    'tid' : 110}
-    trades, idNum = lob.processOrder('limit', big_crossing_limit_order, False)
-    print "Large incoming bid limit crosses best ask. Remaining volume is placed in the book.."
+    bigCrossingLimitOrder = {'side' : 'bid', 
+                                'qty' : 50, 
+                                'price' : 102,
+                                'tid' : 110}
+    trades, idNum = lob.processOrder('limit', bigCrossingLimitOrder, False)
+    print "Large incoming bid limit crosses best ask.\
+           Remaining volume is placed in the book.."
     print lob
     
     ############# Market Orders ##############
     
     # Market orders only require that the user specifies a side (bid
     # or ask), a quantity and their unique tid.
-    market_order = {'side' : 'ask', 
+    marketOrder = {'side' : 'ask', 
                     'qty' : 40, 
                     'tid' : 111}
-    trades, idNum = lob.processOrder('market', market_order, False)
-    print "A limit order takes the specified volume from the inside of the book, regardless of price"
+    trades, idNum = lob.processOrder('market', marketOrder, False)
+    print "A limit order takes the specified volume from the\
+            inside of the book, regardless of price" 
     print "A market ask for 40 results in.."
     print lob
     
@@ -109,5 +109,5 @@ if __name__ == '__main__':
                     'price' : 99,
                     'tid' : 100})
     print "book after modify..."
-
+    print lob
     
