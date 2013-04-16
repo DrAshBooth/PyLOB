@@ -138,7 +138,7 @@ class OrderBook(object):
         return trades
     
     def processLimitOrder(self, quote, verbose):
-        idNum = None
+        orderInBook = None
         trades = []
         qtyToTrade = quote['qty']
         side = quote['side']
@@ -149,35 +149,35 @@ class OrderBook(object):
                    qtyToTrade > 0):
                 bestPriceAsks = self.asks.minPriceList()
                 qtyToTrade, newTrades = self.processOrderList('ask', 
-                                                                 bestPriceAsks, 
-                                                                 qtyToTrade, 
-                                                                 quote, verbose)
+                                                              bestPriceAsks, 
+                                                              qtyToTrade, 
+                                                              quote, verbose)
                 trades += newTrades
             # If volume remains, add to book
             if qtyToTrade > 0:
-                idNum = self.nextQuoteID
-                quote['idNum'] = idNum
+                quote['idNum'] = self.nextQuoteID
                 quote['qty'] = qtyToTrade
                 self.bids.insertOrder(quote)
+                orderInBook = quote
         elif side == 'ask':
             while (self.bids and 
                    price < self.bids.maxPrice() and 
                    qtyToTrade > 0):
                 bestPriceBids = self.bids.maxPriceList()
                 qtyToTrade, newTrades = self.processOrderList('bid', 
-                                                                 bestPriceBids, 
-                                                                 qtyToTrade, 
-                                                                 quote, verbose)
+                                                              bestPriceBids, 
+                                                              qtyToTrade, 
+                                                              quote, verbose)
                 trades += newTrades
             # If volume remains, add to book
             if qtyToTrade > 0:
-                idNum = self.nextQuoteID
-                quote['idNum'] = idNum
+                quote['idNum'] = self.nextQuoteID
                 quote['qty'] = qtyToTrade
                 self.asks.insertOrder(quote)
+                orderInBook = quote
         else:
             sys.exit('processLimitOrder() given neither bid nor ask')
-        return trades, idNum
+        return trades, orderInBook
 
     def cancelOrder(self, side, idNum):
         self.updateTime()
@@ -244,8 +244,8 @@ class OrderBook(object):
             for entry in self.tape:
                 if num < 5:
                     fileStr.write(str(entry['qty']) + " @ " + 
-                                   str(entry['price']) + 
-                                   " (" + str(entry['timestamp']) + ")\n")
+                                  str(entry['price']) + 
+                                  " (" + str(entry['timestamp']) + ")\n")
                     num += 1
                 else:
                     break
