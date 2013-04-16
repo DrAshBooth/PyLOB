@@ -30,7 +30,8 @@ class OrderBook(object):
     def updateTime(self):
         self.time+=1
     
-    def processOrder(self, orderType, quote, verbose):
+    def processOrder(self, quote, verbose):
+        orderType = quote['type']
         idNum = None
         self.updateTime()
         if quote['qty'] <= 0:
@@ -189,8 +190,9 @@ class OrderBook(object):
         else:
             sys.exit('cancelOrder() given neither bid nor ask')
     
-    def modifyOrder(self, side, idNum, orderUpdate):
+    def modifyOrder(self, idNum, orderUpdate):
         self.updateTime()
+        side = orderUpdate['side']
         orderUpdate['idNum'] = idNum
         orderUpdate['timestamp'] = self.time
         if side == 'bid':

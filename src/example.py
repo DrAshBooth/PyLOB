@@ -18,35 +18,43 @@ if __name__ == '__main__':
     ########### Limit Orders #############
     
     # Create some limit orders
-    someOrders = [{'side' : 'ask', 
+    someOrders = [{'type' : 'limit', 
+                   'side' : 'ask', 
                     'qty' : 5, 
                     'price' : 101,
                     'tid' : 100},
-                   {'side' : 'ask', 
+                   {'type' : 'limit', 
+                    'side' : 'ask', 
                     'qty' : 5, 
                     'price' : 103,
                     'tid' : 101},
-                   {'side' : 'ask', 
+                   {'type' : 'limit', 
+                    'side' : 'ask', 
                     'qty' : 5, 
                     'price' : 101,
                     'tid' : 102},
-                   {'side' : 'ask', 
+                   {'type' : 'limit', 
+                    'side' : 'ask', 
                     'qty' : 5, 
                     'price' : 101,
                     'tid' : 103},
-                   {'side' : 'bid', 
+                   {'type' : 'limit', 
+                    'side' : 'bid', 
                     'qty' : 5, 
                     'price' : 99,
                     'tid' : 100},
-                   {'side' : 'bid', 
+                   {'type' : 'limit', 
+                    'side' : 'bid', 
                     'qty' : 5, 
                     'price' : 98,
                     'tid' : 101},
-                   {'side' : 'bid', 
+                   {'type' : 'limit', 
+                    'side' : 'bid', 
                     'qty' : 5, 
                     'price' : 99,
                     'tid' : 102},
-                   {'side' : 'bid', 
+                   {'type' : 'limit', 
+                    'side' : 'bid', 
                     'qty' : 5, 
                     'price' : 97,
                     'tid' : 103},
@@ -54,29 +62,31 @@ if __name__ == '__main__':
     
     # Add orders to LOB
     for order in someOrders:
-        trades, idNum = lob.processOrder('limit', order, False)
+        trades, idNum = lob.processOrder(order, False)
     
     # The current book may be viewed using a print
     print lob
     
     # Submitting a limit order that crosses the opposing best price will 
     # result in a trade.
-    crossingLimitOrder = {'side' : 'bid', 
-                            'qty' : 2, 
-                            'price' : 102,
-                            'tid' : 109}
-    trades, idNum = lob.processOrder('limit', crossingLimitOrder, False)
+    crossingLimitOrder = {'type' : 'limit', 
+                          'side' : 'bid', 
+                          'qty' : 2, 
+                          'price' : 102,
+                          'tid' : 109}
+    trades, idNum = lob.processOrder(crossingLimitOrder, False)
     print "Trade occurs as incoming bid limit crosses best ask.."
     print trades
     print lob
     
     # If a limit order crosses but is only partially matched, the remaining 
     # volume will be placed in the book as an outstanding order
-    bigCrossingLimitOrder = {'side' : 'bid', 
-                                'qty' : 50, 
-                                'price' : 102,
-                                'tid' : 110}
-    trades, idNum = lob.processOrder('limit', bigCrossingLimitOrder, False)
+    bigCrossingLimitOrder = {'type' : 'limit', 
+                             'side' : 'bid', 
+                             'qty' : 50, 
+                             'price' : 102,
+                             'tid' : 110}
+    trades, idNum = lob.processOrder(bigCrossingLimitOrder, False)
     print "Large incoming bid limit crosses best ask.\
            Remaining volume is placed in the book.."
     print lob
@@ -85,10 +95,11 @@ if __name__ == '__main__':
     
     # Market orders only require that the user specifies a side (bid
     # or ask), a quantity and their unique tid.
-    marketOrder = {'side' : 'ask', 
-                    'qty' : 40, 
-                    'tid' : 111}
-    trades, idNum = lob.processOrder('market', marketOrder, False)
+    marketOrder = {'type' : 'market', 
+                   'side' : 'ask', 
+                   'qty' : 40, 
+                   'tid' : 111}
+    trades, idNum = lob.processOrder(marketOrder, False)
     print "A limit order takes the specified volume from the\
             inside of the book, regardless of price" 
     print "A market ask for 40 results in.."
@@ -104,7 +115,7 @@ if __name__ == '__main__':
     ########### Modifying Orders #############
     
     # Orders can be modified by submitting a new order with an old idNum
-    lob.modifyOrder('bid', 5, {'side' : 'bid', 
+    lob.modifyOrder(5, {'side' : 'bid', 
                     'qty' : 14, 
                     'price' : 99,
                     'tid' : 100})
