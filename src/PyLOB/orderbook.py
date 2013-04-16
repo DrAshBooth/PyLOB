@@ -89,20 +89,25 @@ class OrderBook(object):
             if verbose: print('>>> TRADE \nt=%d $%f n=%d p1=%d p2=%d' % 
                               (self.time, tradedPrice, tradedQty, 
                                counterparty, quote['tid']))
+            
+            transactionRecord = {'timestamp': self.time,
+                                      'price': tradedPrice,
+                                      'qty': tradedQty, 
+                                      'qty': tradedQty}
             if side == 'bid':
-                transactionRecord = {'timestamp': self.time,
-                                      'price': tradedPrice,
-                                      'qty': tradedQty, 
-                                      'party1': [counterparty, 'bid'],
-                                      'party2': [quote['tid'], 'ask'],
-                                      'qty': tradedQty}
+                transactionRecord['party1'] = [counterparty, 
+                                               'bid', 
+                                               headOrder.idNum]
+                transactionRecord['party2'] = [quote['tid'], 
+                                               'ask',
+                                               None]
             else:
-                transactionRecord = {'timestamp': self.time,
-                                      'price': tradedPrice,
-                                      'qty': tradedQty, 
-                                      'party1': [counterparty, 'ask'],
-                                      'party2': [quote['tid'], 'bid'],
-                                      'qty': tradedQty}
+                transactionRecord['party1'] = [counterparty, 
+                                               'ask', 
+                                               headOrder.idNum]
+                transactionRecord['party2'] = [quote['tid'], 
+                                               'bid',
+                                               None]
             self.tape.append(transactionRecord)
             trades.append(transactionRecord)
         return qtyToTrade, trades
