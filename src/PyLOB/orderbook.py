@@ -32,7 +32,7 @@ class OrderBook(object):
     
     def processOrder(self, quote, fromData, verbose):
         orderType = quote['type']
-        idNum = None
+        orderInBook = None
         self.updateTime()
         if quote['qty'] <= 0:
             sys.exit('processLimitOrder() given order of qty <= 0')
