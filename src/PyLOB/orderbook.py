@@ -228,6 +228,16 @@ class OrderBook(object):
         return self.asks.minPrice()
     def getWorstAsk(self):
         return self.asks.maxPrice()
+    
+    def tapeDump(self, fname, fmode, tmode):
+            dumpfile = open(fname, fmode)
+            for tapeitem in self.tape:
+                dumpfile.write('%s, %s, %s\n' % (tapeitem['time'], 
+                                                 tapeitem['price'], 
+                                                 tapeitem['qty']))
+            dumpfile.close()
+            if tmode == 'wipe':
+                    self.tape = []
         
     def __str__(self):
         fileStr = StringIO()
