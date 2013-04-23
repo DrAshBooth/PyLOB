@@ -62,7 +62,7 @@ if __name__ == '__main__':
     
     # Add orders to LOB
     for order in someOrders:
-        trades, idNum = lob.processOrder(order, False)
+        trades, idNum = lob.processOrder(order, False, False)
     
     # The current book may be viewed using a print
     print lob
@@ -74,7 +74,7 @@ if __name__ == '__main__':
                           'qty' : 2, 
                           'price' : 102,
                           'tid' : 109}
-    trades, idNum = lob.processOrder(crossingLimitOrder, False)
+    trades, orderInBook = lob.processOrder(crossingLimitOrder, False, False)
     print "Trade occurs as incoming bid limit crosses best ask.."
     print trades
     print lob
@@ -86,7 +86,7 @@ if __name__ == '__main__':
                              'qty' : 50, 
                              'price' : 102,
                              'tid' : 110}
-    trades, idNum = lob.processOrder(bigCrossingLimitOrder, False)
+    trades, orderInBook = lob.processOrder(bigCrossingLimitOrder, False, False)
     print "Large incoming bid limit crosses best ask.\
            Remaining volume is placed in the book.."
     print lob
@@ -99,7 +99,7 @@ if __name__ == '__main__':
                    'side' : 'ask', 
                    'qty' : 40, 
                    'tid' : 111}
-    trades, idNum = lob.processOrder(marketOrder, False)
+    trades, idNum = lob.processOrder(marketOrder, False, False)
     print "A limit order takes the specified volume from the\
             inside of the book, regardless of price" 
     print "A market ask for 40 results in.."

@@ -30,22 +30,22 @@ class OrderBook(object):
     def updateTime(self):
         self.time+=1
     
-    def processOrder(self, quote, verbose):
+    def processOrder(self, quote, fromData, verbose):
         orderType = quote['type']
         idNum = None
         self.updateTime()
         if quote['qty'] <= 0:
             sys.exit('processLimitOrder() given order of qty <= 0')
-        self.nextQuoteID += 1
+        if not fromData: self.nextQuoteID += 1
         quote['timestamp'] = self.time
         if orderType=='market':
             trades = self.processMarketOrder(quote, verbose)
         elif orderType=='limit':
             quote['price'] = self.clipPrice(quote['price'])
-            trades, idNum = self.processLimitOrder(quote, verbose)
+            trades, orderInBook = self.processLimitOrder(quote, fromData, verbose)
         else:
             sys.exit("processOrder() given neither 'market' nor 'limit'")
-        return trades, idNum
+        return trades, orderInBook
     
     def processOrderList(self, side, orderlist, 
                          qtyStillToTrade, quote, verbose):
@@ -136,7 +136,7 @@ class OrderBook(object):
             sys.exit('processMarketOrder() received neither "bid" nor "ask"')
         return trades
     
-    def processLimitOrder(self, quote, verbose):
+    def processLimitOrder(self, quote, fromData, verbose):
         orderInBook = None
         trades = []
         qtyToTrade = quote['qty']
@@ -154,7 +154,8 @@ class OrderBook(object):
                 trades += newTrades
             # If volume remains, add to book
             if qtyToTrade > 0:
-                quote['idNum'] = self.nextQuoteID
+                if not fromData:
+                    quote['idNum'] = self.nextQuoteID
                 quote['qty'] = qtyToTrade
                 self.bids.insertOrder(quote)
                 orderInBook = quote
@@ -170,7 +171,8 @@ class OrderBook(object):
                 trades += newTrades
             # If volume remains, add to book
             if qtyToTrade > 0:
-                quote['idNum'] = self.nextQuoteID
+                if not fromData:
+                    quote['idNum'] = self.nextQuoteID
                 quote['qty'] = qtyToTrade
                 self.asks.insertOrder(quote)
                 orderInBook = quote
