@@ -77,14 +77,22 @@ class OrderTree(object):
         del self.orderMap[idNum]
         
     def maxPrice(self):
-        return self.priceTree.max_key()
+        if self.lobDepth > 0:
+            return self.priceTree.max_key()
+        else: return None
     
     def minPrice(self):
-        return self.priceTree.min_key()
+        if self.lobDepth > 0:
+            return self.priceTree.min_key()
+        else: return None
     
     def maxPriceList(self):
-        return self.getPrice(self.maxPrice())
+        if self.lobDepth > 0:
+            return self.getPrice(self.maxPrice())
+        else: return None
     
     def minPriceList(self):
-        return self.getPrice(self.minPrice())
+        if self.lobDepth > 0:
+            return self.getPrice(self.minPrice())
+        else: return None
 
