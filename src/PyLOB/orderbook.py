@@ -93,7 +93,8 @@ class OrderBook(object):
             
             transactionRecord = {'timestamp': self.time,
                                  'price': tradedPrice,
-                                 'qty': tradedQty}
+                                 'qty': tradedQty,
+                                 'time': self.time}
             if side == 'bid':
                 transactionRecord['party1'] = [counterparty, 
                                                'bid', 
