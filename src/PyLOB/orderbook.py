@@ -13,13 +13,13 @@ from cStringIO import StringIO
 from ordertree import OrderTree
 
 class OrderBook(object):
-    def __init__(self):
+    def __init__(self, tick_size = 0.0001):
         self.tape = deque(maxlen=None) # Index [0] is most recent trade
         self.bids = OrderTree()
         self.asks = OrderTree()
         self.lastTick = None
         self.lastTimestamp = 0
-        self.tickSize = 0.0001
+        self.tickSize = tick_size
         self.time = 0
         self.nextQuoteID = 0
         
