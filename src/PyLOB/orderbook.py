@@ -33,11 +33,14 @@ class OrderBook(object):
     def processOrder(self, quote, fromData, verbose):
         orderType = quote['type']
         orderInBook = None
-        self.updateTime()
+        if fromData:
+            self.time = quote['timestamp']
+        else:
+            self.updateTime()
+            quote['timestamp'] = self.time
         if quote['qty'] <= 0:
             sys.exit('processLimitOrder() given order of qty <= 0')
         if not fromData: self.nextQuoteID += 1
-        quote['timestamp'] = self.time
         if orderType=='market':
             trades = self.processMarketOrder(quote, verbose)
         elif orderType=='limit':
@@ -181,8 +184,11 @@ class OrderBook(object):
             sys.exit('processLimitOrder() given neither bid nor ask')
         return trades, orderInBook
 
-    def cancelOrder(self, side, idNum):
-        self.updateTime()
+    def cancelOrder(self, side, idNum, time = None):
+        if time:
+            self.time = time
+        else:
+            self.updateTime()
         if side == 'bid':
             if self.bids.orderExists(idNum):
                 self.bids.removeOrderById(idNum)
@@ -192,8 +198,11 @@ class OrderBook(object):
         else:
             sys.exit('cancelOrder() given neither bid nor ask')
     
-    def modifyOrder(self, idNum, orderUpdate):
-        self.updateTime()
+    def modifyOrder(self, idNum, orderUpdate, time=None):
+        if time:
+            self.time = time
+        else:
+            self.updateTime()
         side = orderUpdate['side']
         orderUpdate['idNum'] = idNum
         orderUpdate['timestamp'] = self.time
