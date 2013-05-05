@@ -44,6 +44,8 @@ class OrderTree(object):
         return idNum in self.orderMap
     
     def insertOrder(self, quote):
+        if self.orderExists(quote['idNum']):
+            self.removeOrderById(quote['idNum'])
         self.nOrders += 1
         if quote['price'] not in self.priceMap:
             self.createPrice(quote['price'])
