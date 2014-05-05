@@ -148,7 +148,7 @@ class OrderBook(object):
         price = quote['price']
         if side == 'bid':
             while (self.asks and 
-                   price > self.asks.minPrice() and 
+                   price >= self.asks.minPrice() and 
                    qtyToTrade > 0):
                 bestPriceAsks = self.asks.minPriceList()
                 qtyToTrade, newTrades = self.processOrderList('ask', 
@@ -165,7 +165,7 @@ class OrderBook(object):
                 orderInBook = quote
         elif side == 'ask':
             while (self.bids and 
-                   price < self.bids.maxPrice() and 
+                   price <= self.bids.maxPrice() and 
                    qtyToTrade > 0):
                 bestPriceBids = self.bids.maxPriceList()
                 qtyToTrade, newTrades = self.processOrderList('bid', 
