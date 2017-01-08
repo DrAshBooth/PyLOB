@@ -71,8 +71,8 @@ class OrderList(object):
         order.nextOrder.prevOrder = order.prevOrder
         # Set the previous tail order's next order to this order
         self.tailOrder.nextOrder = order
-        self.tailOrder = order
         order.prevOrder = self.tailOrder
+        self.tailOrder = order
         order.nextOrder = None
         
     def __str__(self):
