@@ -63,6 +63,7 @@ class OrderTree(object):
             orderList.removeOrder(order)
             if len(orderList) == 0:
                 self.removePrice(order.price) 
+            del self.orderMap[order.idNum]
             self.insertOrder(orderUpdate)
         else:
             # Quantity changed
