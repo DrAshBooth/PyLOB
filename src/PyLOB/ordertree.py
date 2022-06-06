@@ -5,8 +5,8 @@ Created on Mar 27, 2013
 '''
 
 from BinTrees import RBTree
-from orderlist import OrderList
-from order import Order
+from .orderlist import OrderList
+from .order import Order
 
 class OrderTree(object):
     def __init__(self):

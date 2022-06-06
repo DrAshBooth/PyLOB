@@ -8,9 +8,9 @@ Created on Mar 28, 2013
 import sys
 import math
 from collections import deque
-from cStringIO import StringIO
+from io import StringIO
 
-from ordertree import OrderTree
+from .ordertree import OrderTree
 
 class OrderBook(object):
     def __init__(self, tick_size = 0.0001):

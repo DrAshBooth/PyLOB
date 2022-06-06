@@ -9,7 +9,7 @@
 # License: LGPLv3
 
  
-from treemixin import TreeMixin
+from .treemixin import TreeMixin
 
 __all__ = ['RBTree']
 

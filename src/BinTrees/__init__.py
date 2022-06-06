@@ -1,1 +1,1 @@
-from rbtree import RBTree 
+from .rbtree import RBTree 

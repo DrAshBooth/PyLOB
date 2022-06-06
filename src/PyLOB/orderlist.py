@@ -19,7 +19,7 @@ class OrderList(object):
         self.last = self.headOrder
         return self
     
-    def next(self):
+    def __next__(self):
         if self.last == None:
             raise StopIteration
         else:
@@ -76,7 +76,7 @@ class OrderList(object):
         order.nextOrder = None
         
     def __str__(self):
-        from cStringIO import StringIO
+        from io import StringIO
         file_str = StringIO()
         for order in self:
             file_str.write("%s\n" % str(order))
