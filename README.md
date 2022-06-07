@@ -9,7 +9,7 @@ It is written in Python, single-threaded and opperates a standard price-time-pri
 
 Requirements:
 =============
-To ensure easy distribution and use I've tried to ensure that there are no requirements other than a standard python install. The code for the RBTrees was taken directly from the bintrees library and is implemented in pure python. This is to improve portability and ensure easy of use for all. Credit to Julienne Walker ( http://eternallyconfuzzled.com/jsw_home.aspx ) for the great algorithms.
+To ensure easy distribution and use I've tried to ensure that there are no requirements other than a standard python3 install. The code for the RBTrees was taken directly from the bintrees library and is implemented in pure python. This is to improve portability and ensure easy of use for all. Credit to Julienne Walker ( http://eternallyconfuzzled.com/jsw_home.aspx ) for the great algorithms.
 
 Check the Wiki!
 ===============
