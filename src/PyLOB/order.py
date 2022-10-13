@@ -6,7 +6,7 @@ Created on Mar 20, 2013
 
 class Order(object):
     def __init__(self, quote, orderList):
-        self.timestamp = int(quote['timestamp'])
+        self.timestamp = quote['timestamp']
         self.qty = int(quote['qty'])
         self.price = quote['price']
         self.idNum = quote['idNum']
@@ -29,4 +29,4 @@ class Order(object):
         self.qty = newQty
 
     def __str__(self):
-        return "%s\t@\t%.4f\tt=%d" % (self.qty, self.price, self.timestamp)
+        return "%s\t@\t%.4f\tt=%s" % (self.qty, self.price, self.timestamp)
