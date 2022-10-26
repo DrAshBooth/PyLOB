@@ -45,10 +45,10 @@ class OrderList(object):
         self.volume += order.qty
         
     def removeOrder(self, order):
+        if len(self) <= 0:
+            return
         self.volume -= order.qty
         self.length -= 1
-        if len(self) == 0:
-            return
         # Remove from list of orders
         nextOrder = order.nextOrder
         prevOrder = order.prevOrder
