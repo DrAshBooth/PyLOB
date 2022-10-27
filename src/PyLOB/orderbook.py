@@ -9,19 +9,25 @@ import sys
 import math
 from collections import deque
 from io import StringIO
+import os, inspect
 
 from .ordertree import OrderTree
 
 class OrderBook(object):
-    def __init__(self, tick_size = 0.0001):
+    back_compatibility = False
+    
+    def __init__(self, tick_size = 0.0001, **kw):
         self.tape = deque(maxlen=None) # Index [0] is most recent trade
         self.bids = OrderTree()
         self.asks = OrderTree()
         self.lastTick = None
+        self.lastBidPrice = None
+        self.lastAskPrice = None
         self.lastTimestamp = 0
         self.tickSize = tick_size
         self.time = 0
         self.nextQuoteID = 0
+
         
     def clipPrice(self, price):
         """ Clips the price according to the ticksize """
@@ -38,18 +44,32 @@ class OrderBook(object):
         else:
             self.updateTime()
             quote['timestamp'] = self.time
+            self.nextQuoteID += 1
+            quote['idNum'] = self.nextQuoteID
+        
         if quote['qty'] <= 0:
-            sys.exit('processLimitOrder() given order of qty <= 0')
-        if not fromData: self.nextQuoteID += 1
+            sys.exit('processOrder() given order of qty <= 0')
+
+        if quote.get('price'):
+            if quote['side'] == 'ask':
+                self.lastAskPrice = quote['price']
+            elif quote['side'] == 'bid':
+                self.lastBidPrice = quote['price']
+            else:
+                sys.exit("processOrder() given neither 'ask' nor 'bid'")
+            quote['price'] = self.clipPrice(quote['price'])
+        else:
+            quote['price'] = None
+
         if orderType=='market':
             trades = self.processMarketOrder(quote, verbose)
         elif orderType=='limit':
-            quote['price'] = self.clipPrice(quote['price'])
-            trades, orderInBook = self.processLimitOrder(quote, fromData, verbose)
+            trades, orderInBook = self.processLimitOrder(quote, verbose)
         else:
             sys.exit("processOrder() given neither 'market' nor 'limit'")
         return trades, orderInBook
-    
+
+
     def processOrderList(self, side, orderlist, 
                          qtyStillToTrade, quote, verbose):
         '''
@@ -63,6 +83,9 @@ class OrderBook(object):
             headOrder = orderlist.getHeadOrder()
             tradedPrice = headOrder.price
             counterparty = headOrder.tid
+            # Prevent self trading
+            if counterparty == quote['tid']:
+                continue
             if qtyToTrade < headOrder.qty:
                 tradedQty = qtyToTrade
                 # Amend book order
@@ -90,7 +113,7 @@ class OrderBook(object):
                     self.asks.removeOrderById(headOrder.idNum)
                 # We need to keep eating into volume at this price
                 qtyToTrade -= tradedQty
-            if verbose: print('>>> TRADE \nt=%d $%f n=%d p1=%d p2=%d' % 
+            if verbose: print('>>> TRADE \nt=%s $%f n=%d p1=%d p2=%d' % 
                               (self.time, tradedPrice, tradedQty, 
                                counterparty, quote['tid']))
             
@@ -128,6 +151,11 @@ class OrderBook(object):
                                                                  qtyToTrade, 
                                                                  quote, verbose)
                 trades += newTrades
+            # If volume remains, add to book
+            if not self.back_compatibility and qtyToTrade > 0:
+                quote['qty'] = qtyToTrade
+                self.bids.insertOrder(quote)
+                orderInBook = quote
         elif side == 'ask':
             while qtyToTrade > 0 and self.bids: 
                 bestPriceBids = self.bids.maxPriceList()
@@ -136,11 +164,16 @@ class OrderBook(object):
                                                                  qtyToTrade, 
                                                                  quote, verbose)
                 trades += newTrades
+            # If volume remains, add to book
+            if not self.back_compatibility and qtyToTrade > 0:
+                quote['qty'] = qtyToTrade
+                self.asks.insertOrder(quote)
+                orderInBook = quote
         else:
             sys.exit('processMarketOrder() received neither "bid" nor "ask"')
         return trades
     
-    def processLimitOrder(self, quote, fromData, verbose):
+    def processLimitOrder(self, quote, verbose):
         orderInBook = None
         trades = []
         qtyToTrade = quote['qty']
@@ -158,8 +191,6 @@ class OrderBook(object):
                 trades += newTrades
             # If volume remains, add to book
             if qtyToTrade > 0:
-                if not fromData:
-                    quote['idNum'] = self.nextQuoteID
                 quote['qty'] = qtyToTrade
                 self.bids.insertOrder(quote)
                 orderInBook = quote
@@ -175,8 +206,6 @@ class OrderBook(object):
                 trades += newTrades
             # If volume remains, add to book
             if qtyToTrade > 0:
-                if not fromData:
-                    quote['idNum'] = self.nextQuoteID
                 quote['qty'] = qtyToTrade
                 self.asks.insertOrder(quote)
                 orderInBook = quote
@@ -198,7 +227,27 @@ class OrderBook(object):
         else:
             sys.exit('cancelOrder() given neither bid nor ask')
     
-    def modifyOrder(self, idNum, orderUpdate, time=None):
+    # return whether comparedPrice has better matching chance than price
+    def betterPrice(self, side, price, comparedPrice):
+        if price is None and comparedPrice is not None:
+            return False
+        if price is not None and comparedPrice is None:
+            return True
+        if side == 'bid':
+            return (price < comparedPrice)
+        elif side == 'ask':
+            return (price > comparedPrice)
+        else:
+            sys.exit('betterPrice() given neither bid nor ask')
+    
+    def orderGetSide(self, idNum):
+        if self.bids.orderExists(idNum):
+            return 'bid'
+        if self.asks.orderExists(idNum):
+            return 'ask'
+        return None
+
+    def modifyOrder(self, idNum, orderUpdate, time=None, verbose=False):
         if time:
             self.time = time
         else:
@@ -206,14 +255,31 @@ class OrderBook(object):
         side = orderUpdate['side']
         orderUpdate['idNum'] = idNum
         orderUpdate['timestamp'] = self.time
+
+        ret = [], orderUpdate
         if side == 'bid':
             if self.bids.orderExists(orderUpdate['idNum']):
-                self.bids.updateOrder(orderUpdate)
+                order = self.bids.getOrder(idNum)
+                orderUpdate['type'] = order.order_type
+                if not self.back_compatibility and \
+                        self.betterPrice(side, order.price, orderUpdate['price']):
+                    self.bids.removeOrderById(idNum)
+                    ret = self.processOrder(orderUpdate, True, verbose)
+                else:
+                    self.bids.updateOrder(orderUpdate)
         elif side == 'ask':
-            if self.asks.orderExists(orderUpdate['idNum']):
-                self.asks.updateOrder(orderUpdate)
+            if not self.back_compatibility and \
+                    self.asks.orderExists(orderUpdate['idNum']):
+                order = self.asks.getOrder(idNum)
+                orderUpdate['type'] = order.order_type
+                if self.betterPrice(side, order.price, orderUpdate['price']):
+                    self.asks.removeOrderById(idNum)
+                    ret = self.processOrder(orderUpdate, True, verbose)
+                else:
+                    self.asks.updateOrder(orderUpdate)
         else:
             sys.exit('modifyOrder() given neither bid nor ask')
+        return ret
     
     def getVolumeAtPrice(self, side, price):
         price = self.clipPrice(price)
@@ -263,7 +329,7 @@ class OrderBook(object):
         if self.tape != None and len(self.tape) > 0:
             num = 0
             for entry in self.tape:
-                if num < 5:
+                if num < 5 or True:
                     fileStr.write(str(entry['qty']) + " @ " + 
                                   str(entry['price']) + 
                                   " (" + str(entry['timestamp']) + ")\n")

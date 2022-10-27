@@ -14,6 +14,7 @@ if __name__ == '__main__':
     
     # Create a LOB object
     lob = OrderBook()
+    lob.back_compatibility = 0
     
     ########### Limit Orders #############
     
@@ -100,7 +101,7 @@ if __name__ == '__main__':
                    'qty' : 40, 
                    'tid' : 111}
     trades, idNum = lob.processOrder(marketOrder, False, False)
-    print("A limit order takes the specified volume from the\
+    print("A market order takes the specified volume from the\
             inside of the book, regardless of price") 
     print("A market ask for 40 results in..")
     print(lob)
@@ -121,4 +122,25 @@ if __name__ == '__main__':
                     'tid' : 100})
     print("book after modify...")
     print(lob)
+
+    lob.modifyOrder(5, {'side' : 'bid', 
+                    'qty' : 14, 
+                    'price' : 103.2,
+                    'tid' : 100})
+    print("book after improve bid price. will process the order")
+    
+    print(lob)
+
+    ############# Outstanding Market Orders ##############
+    # this loops forever in the compatibility mode.
+    # though after my patches it works ok, i didn't find the bug.
+    # my next version will use a db, for more extensive activity.
+    marketOrder = {'type' : 'market', 
+                   'side' : 'ask', 
+                   'qty' : 40, 
+                   'tid' : 111}
+    trades, idNum = lob.processOrder(marketOrder, False, False)
+    print("A market ask for 40 should take all the bids and keep the remainder in the book")
+    print(lob)
+    
     

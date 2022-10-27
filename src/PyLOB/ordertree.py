@@ -91,10 +91,10 @@ class OrderTree(object):
     def maxPriceList(self):
         if self.lobDepth > 0:
             return self.getPrice(self.maxPrice())
-        else: return None
+        else: return []
     
     def minPriceList(self):
         if self.lobDepth > 0:
             return self.getPrice(self.minPrice())
-        else: return None
+        else: return []
 

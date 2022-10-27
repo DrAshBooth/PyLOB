@@ -11,6 +11,7 @@ class Order(object):
         self.price = quote['price']
         self.idNum = quote['idNum']
         self.tid = quote['tid']
+        self.order_type = quote['type']
         self.nextOrder = None
         self.prevOrder = None
         self.orderList = orderList
@@ -29,4 +30,4 @@ class Order(object):
         self.qty = newQty
 
     def __str__(self):
-        return "%s\t@\t%.4f\tt=%s" % (self.qty, self.price, self.timestamp)
+        return "%s\t@\t%s\tt=%s" % (self.qty, self.price, self.timestamp)
