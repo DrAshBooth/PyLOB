@@ -14,19 +14,22 @@ import os, inspect
 from .ordertree import OrderTree
 
 class OrderBook(object):
-    back_compatibility = False
-    
-    def __init__(self, tick_size = 0.0001, **kw):
+    def __init__(self, db=None, tick_size = 0.0001):
         self.tape = deque(maxlen=None) # Index [0] is most recent trade
         self.bids = OrderTree()
         self.asks = OrderTree()
         self.lastTick = None
-        self.lastBidPrice = None
-        self.lastAskPrice = None
+        self.lastPrice = None
         self.lastTimestamp = 0
         self.tickSize = tick_size
         self.time = 0
         self.nextQuoteID = 0
+        self.db = db
+        location = os.path.dirname(inspect.getabsfile(inspect.currentframe()))
+        ext = '.sql'
+        queries = [fname.rsplit('.', 1)[0] for fname in os.listdir(location) if fname.endswith(ext)]
+        for query in queries:
+            setattr(self, query, open(os.path.join(location, query + ext), 'r').read())
 
         
     def clipPrice(self, price):
@@ -50,16 +53,21 @@ class OrderBook(object):
         if quote['qty'] <= 0:
             sys.exit('processOrder() given order of qty <= 0')
 
+        if quote['side'] not in ('ask', 'bid'):
+            sys.exit("processOrder() given neither 'ask' nor 'bid'")
+
         if quote.get('price'):
-            if quote['side'] == 'ask':
-                self.lastAskPrice = quote['price']
-            elif quote['side'] == 'bid':
-                self.lastBidPrice = quote['price']
-            else:
-                sys.exit("processOrder() given neither 'ask' nor 'bid'")
             quote['price'] = self.clipPrice(quote['price'])
         else:
             quote['price'] = None
+
+        if self.db and not quote.get('no_db'):
+            crsr = self.db.cursor()
+            crsr.execute('begin transaction')
+            crsr.execute(self.insert_order, quote)
+            quote['order_id'] = crsr.lastrowid
+            self.processMatchesDB(quote, crsr, verbose)
+            crsr.execute('commit')
 
         if orderType=='market':
             trades = self.processMarketOrder(quote, verbose)
@@ -69,6 +77,30 @@ class OrderBook(object):
             sys.exit("processOrder() given neither 'market' nor 'limit'")
         return trades, orderInBook
 
+
+    def processMatchesDB(self, quote, crsr, verbose):
+        quote.update(
+            lastprice=self.lastPrice,
+        )
+        qtyToExec = quote['qty']
+#        print(quote, self.matches)
+        matches = crsr.execute(self.matches, quote).fetchall()
+        trades = list()
+        for match in matches:
+            if qtyToExec <= 0:
+                break
+            bid_order, ask_order, counterparty, price, qty = match
+            qty = min(qty, qtyToExec)
+            qtyToExec -= qty
+            trade = bid_order, ask_order, self.time, price, qty
+            self.lastPrice = price
+            trades.append(trade)
+            if verbose: print('>>> TRADE \nt=%s $%f n=%d p1=%d p2=%d' % 
+                              (self.time, price, qty,
+                               counterparty, quote['tid']))
+            #crsr.execute(self.insert_trade, trade)
+        crsr.executemany(self.insert_trade, trades)
+        return trades, quote
 
     def processOrderList(self, side, orderlist, 
                          qtyStillToTrade, quote, verbose):
@@ -117,6 +149,7 @@ class OrderBook(object):
                               (self.time, tradedPrice, tradedQty, 
                                counterparty, quote['tid']))
             
+            self.lastPrice = tradedPrice
             transactionRecord = {'timestamp': self.time,
                                  'price': tradedPrice,
                                  'qty': tradedQty,
@@ -152,7 +185,7 @@ class OrderBook(object):
                                                                  quote, verbose)
                 trades += newTrades
             # If volume remains, add to book
-            if not self.back_compatibility and qtyToTrade > 0:
+            if qtyToTrade > 0:
                 quote['qty'] = qtyToTrade
                 self.bids.insertOrder(quote)
                 orderInBook = quote
@@ -165,7 +198,7 @@ class OrderBook(object):
                                                                  quote, verbose)
                 trades += newTrades
             # If volume remains, add to book
-            if not self.back_compatibility and qtyToTrade > 0:
+            if qtyToTrade > 0:
                 quote['qty'] = qtyToTrade
                 self.asks.insertOrder(quote)
                 orderInBook = quote
@@ -226,6 +259,11 @@ class OrderBook(object):
                 self.asks.removeOrderById(idNum)
         else:
             sys.exit('cancelOrder() given neither bid nor ask')
+        if self.db:
+            crsr = self.db.cursor()
+            crsr.execute('begin transaction')
+            crsr.execute(self.cancel_order, (1, idNum, side))
+            crsr.execute('commit')
     
     # return whether comparedPrice has better matching chance than price
     def betterPrice(self, side, price, comparedPrice):
@@ -241,6 +279,10 @@ class OrderBook(object):
             sys.exit('betterPrice() given neither bid nor ask')
     
     def orderGetSide(self, idNum):
+        if self.db:
+            crsr = self.db.cursor()
+            row = crsr.execute(self.find_order, (idNum,)).fetchone()
+            return row[0] if row else None
         if self.bids.orderExists(idNum):
             return 'bid'
         if self.asks.orderExists(idNum):
@@ -260,25 +302,43 @@ class OrderBook(object):
         if side == 'bid':
             if self.bids.orderExists(orderUpdate['idNum']):
                 order = self.bids.getOrder(idNum)
-                orderUpdate['type'] = order.order_type
-                if not self.back_compatibility and \
-                        self.betterPrice(side, order.price, orderUpdate['price']):
+                if self.betterPrice(side, order.price, orderUpdate['price']):
                     self.bids.removeOrderById(idNum)
+                    orderUpdate['type'] = order.order_type
+                    orderUpdate['no_db'] = True
                     ret = self.processOrder(orderUpdate, True, verbose)
                 else:
                     self.bids.updateOrder(orderUpdate)
         elif side == 'ask':
-            if not self.back_compatibility and \
-                    self.asks.orderExists(orderUpdate['idNum']):
+            if self.asks.orderExists(orderUpdate['idNum']):
                 order = self.asks.getOrder(idNum)
-                orderUpdate['type'] = order.order_type
                 if self.betterPrice(side, order.price, orderUpdate['price']):
                     self.asks.removeOrderById(idNum)
+                    orderUpdate['type'] = order.order_type
+                    orderUpdate['no_db'] = True
                     ret = self.processOrder(orderUpdate, True, verbose)
                 else:
                     self.asks.updateOrder(orderUpdate)
         else:
             sys.exit('modifyOrder() given neither bid nor ask')
+        if self.db:
+            crsr = self.db.cursor()
+            crsr.execute('begin transaction')
+            row = crsr.execute(self.find_order, (idNum,)).fetchone()
+            if row:
+                side, instrument, price, qty, fulfilled, cancel, order_id, order_type = row
+                orderUpdate.update(
+                    type=order_type,
+                    order_id=order_id,
+                    instrument=instrument,
+                )
+                if orderUpdate['price']:
+                    orderUpdate['price'] = self.clipPrice(orderUpdate['price'])
+                crsr.execute(self.modify_order, orderUpdate)
+                if self.betterPrice(side, price, orderUpdate['price']):
+                    ret = self.processOrder(orderUpdate, True, verbose)
+                    self.processMatchesDB(orderUpdate, crsr, verbose)
+            crsr.execute('commit')
         return ret
     
     def getVolumeAtPrice(self, side, price):
@@ -316,15 +376,26 @@ class OrderBook(object):
                     self.tape = []
         
     def __str__(self):
+        if self.db:
+            crsr = self.db.cursor()
+
         fileStr = StringIO()
         fileStr.write("------ Bids -------\n")
         if self.bids != None and len(self.bids) > 0:
             for k, v in self.bids.priceTree.items(reverse=True):
                 fileStr.write('%s' % v)
+            if self.db:
+                for bid in crsr.execute(self.active_orders, dict(side='bid', direction=-1)):
+                    idNum, qty, fulfilled, price, event_dt = bid
+                    fileStr.write('%s-%s @ %s t=%s\n' % (qty, fulfilled, price, event_dt))
         fileStr.write("\n------ Asks -------\n")
         if self.asks != None and len(self.asks) > 0:
             for k, v in self.asks.priceTree.items():
                 fileStr.write('%s' % v)
+            if self.db:
+                for ask in crsr.execute(self.active_orders, dict(side='ask', direction=1)):
+                    idNum, qty, fulfilled, price, event_dt = ask
+                    fileStr.write('%s-%s @ %s t=%s\n' % (qty, fulfilled, price, event_dt))
         fileStr.write("\n------ Trades ------\n")
         if self.tape != None and len(self.tape) > 0:
             num = 0
@@ -336,6 +407,9 @@ class OrderBook(object):
                     num += 1
                 else:
                     break
+            if self.db:
+                for trade in crsr.execute(self.select_trades):
+                    fileStr.write(repr(trade)+'\n')
         fileStr.write("\n")
         return fileStr.getvalue()
 
