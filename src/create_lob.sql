@@ -89,7 +89,8 @@ create index order_idnum on trade_order (idNum asc);
 
 create view best_quotes as
 select 
-    order_id, idNum, side.side as side, price, qty-fulfilled as qty, 
+    order_id, idNum, side.side as side, price, 
+    qty, fulfilled, qty-fulfilled as available, 
     event_dt, instrument, trade_order.trader, allow_self_matching, 
     matching, matching_order
 from trade_order
@@ -268,7 +269,7 @@ create view trade_detail as
 select 
     'trade', trade.qty, trade.price, 
     case when bidorder.price is null or askorder.price is null or bidorder.price >= askorder.price 
-    then '+' else '-'
+    then '👍' else '👎'
     end as matches,
     bidorder.side, bidorder.trader, bidorder.idNum, bidorder.qty, bidorder.price, bidorder.fulfilled, 
     askorder.side, askorder.trader, askorder.idNum, askorder.qty, askorder.price, askorder.fulfilled 
@@ -280,6 +281,7 @@ inner join trade_order as askorder on askorder.order_id=trade.ask_order
 create table event (
     reqId integer,
     method text,
+    callback text,
     unique(reqId) on conflict replace
 );
 
@@ -287,6 +289,7 @@ create table event_arg (
     reqId integer,
     arg text,
     val text,
+    convertor text,
     unique(reqId, arg) on conflict replace,
     foreign key(reqId) references event(reqId) on delete cascade
 );

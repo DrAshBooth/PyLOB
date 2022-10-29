@@ -117,8 +117,7 @@ if __name__ == '__main__':
                           'price' : 102,
                           'tid' : 109}
     trades, orderInBook = lob.processOrder(crossingLimitOrder, False, False)
-    print("Trade occurs as incoming bid limit crosses best ask..")
-    print(trades)
+    print("Trade occurs as incoming bid limit crosses best ask..", crossingLimitOrder)
     print(lob)
     
     # If a limit order crosses but is only partially matched, the remaining 
@@ -131,7 +130,7 @@ if __name__ == '__main__':
                              'tid' : 110}
     trades, orderInBook = lob.processOrder(bigCrossingLimitOrder, False, False)
     print("Large incoming bid limit crosses best ask.\
-           Remaining volume is placed in the book..")
+           Remaining volume is placed in the book..", bigCrossingLimitOrder)
     print(lob)
     
     ############# Market Orders ##############
@@ -146,7 +145,7 @@ if __name__ == '__main__':
     trades, idNum = lob.processOrder(marketOrder, False, False)
     print("A market order takes the specified volume from the\
             inside of the book, regardless of price") 
-    print("A market ask for 40 results in..")
+    print("A market ask for 40 results in..", marketOrder)
     print(lob)
     
     ############ Cancelling Orders #############
@@ -159,18 +158,20 @@ if __name__ == '__main__':
     ########### Modifying Orders #############
     
     # Orders can be modified by submitting a new order with an old idNum
-    lob.modifyOrder(5, {'side' : 'bid', 
+    modifyOrder5 = {'side' : 'bid', 
                     'qty' : 14, 
                     'price' : 99,
-                    'tid' : 100})
+                    'tid' : 100}
+    lob.modifyOrder(5, modifyOrder5)
     print("book after increase amount. will be put as end of queue")
     
     print(lob)
     
-    lob.modifyOrder(5, {'side' : 'bid', 
+    modifyOrder5 = {'side' : 'bid', 
                     'qty' : 14, 
                     'price' : 103.2,
-                    'tid' : 100})
+                    'tid' : 100}
+    lob.modifyOrder(5, modifyOrder5)
     print("book after improve bid price. will process the order")
     
     print(lob)
@@ -185,7 +186,7 @@ if __name__ == '__main__':
                    'qty' : 40, 
                    'tid' : 111}
     trades, idNum = lob.processOrder(marketOrder, False, False)
-    print("A market ask for 40 should take all the bids and keep the remainder in the book")
+    print("A market ask for 40 should take all the bids and keep the remainder in the book", marketOrder)
     print(lob)
     
     if lob_connection:
