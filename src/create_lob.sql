@@ -267,7 +267,7 @@ END;
 
 create view trade_detail as
 select 
-    'trade', trade.qty, trade.price, 
+    'trade', trade.qty, trade.price, bidorder.instrument,
     case when bidorder.price is null or askorder.price is null or bidorder.price >= askorder.price 
     then '👍' else '👎'
     end as matches,

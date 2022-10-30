@@ -1,2 +1,5 @@
 
-select * from  trade_detail;
+select * 
+from trade_detail
+where instrument=:instrument
+

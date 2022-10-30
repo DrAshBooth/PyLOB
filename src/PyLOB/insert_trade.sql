@@ -6,4 +6,4 @@ insert into trade (
     price,
     qty
 )
-values (?, ?, ?, ?, ?);
+values (?, ?, ?, ?, ?)

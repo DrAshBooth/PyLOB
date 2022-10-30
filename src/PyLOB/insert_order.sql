@@ -18,5 +18,5 @@ values (
     :price,
     :idNum,
     :tid
-);
+)
 

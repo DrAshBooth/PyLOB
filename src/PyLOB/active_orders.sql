@@ -1,5 +1,5 @@
 
-select idNum, qty, fulfilled, price, event_dt 
+select idNum, qty, fulfilled, price, event_dt, instrument
 from best_quotes
 where side=:side
--- order should be inserted
+-- order by statement should be appended

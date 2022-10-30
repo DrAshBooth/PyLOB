@@ -1,4 +1,5 @@
 
 update trade_order 
 set cancel=?
-where idNum=? and side=?;
+--from (select
+where idNum=? and side=?
