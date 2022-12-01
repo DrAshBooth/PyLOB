@@ -17,7 +17,7 @@ class OrderBook(object):
 
     def __init__(self, db, tick_size = 0.0001):
         self.lastTick = None
-        self.lastPrice = None
+        self.lastPrice = dict()
         self.lastTimestamp = 0
         self.tickSize = tick_size
         self.rounder = int(math.log10(1 / self.tickSize))
@@ -77,8 +77,9 @@ class OrderBook(object):
 
 
     def processMatchesDB(self, quote, crsr, verbose):
+        instrument = quote['instrument']
         quote.update(
-            lastprice=self.lastPrice,
+            lastprice=self.lastPrice.get(instrument),
         )
         qtyToExec = quote['qty']
         sql_matches = self.matches + self.best_quotes_order_asc
@@ -93,12 +94,14 @@ class OrderBook(object):
             qty = min(available, qtyToExec)
             qtyToExec -= qty
             trade = bid_order, ask_order, self.time, price, qty
-            self.lastPrice = price
             trades.append(trade)
             if verbose: print('>>> TRADE \nt=%s $%f n=%d p1=%d p2=%d' % 
                               (self.time, price, qty,
                                counterparty, quote['tid']))
-        crsr.executemany(self.insert_trade, trades)
+        if trades:
+            crsr.executemany(self.insert_trade, trades)
+            self.lastPrice[instrument] = price
+            crsr.execute(self.set_lastprice, dict(instrument=instrument, lastprice=price))
         return trades, quote
 
     def cancelOrder(self, side, idNum, time = None):

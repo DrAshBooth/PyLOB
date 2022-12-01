@@ -37,13 +37,14 @@ if __name__ == '__main__':
             insert into trader (tid, name) values (110, '110');
             insert into trader (tid, name) values (111, '111');
             update trader 
-                set commission_per_unit=0.01,
+                set 
                     commission_min=2.5,
-                    commission_max=1000
+                    commission_max_percnt=1,
+                    commission_per_unit=0.01
             ;
-            insert into instrument (symbol, currency) values ('%s', 'USD');
+            insert into instrument (symbol, currency) values ('%(instrument)s', 'USD');
             commit;
-        """ % instrument)
+        """ % dict(instrument=instrument))
     
     # Create a LOB object
     lob = OrderBook(db=lob_connection)

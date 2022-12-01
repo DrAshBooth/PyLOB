@@ -1,6 +1,6 @@
 
 select 
-    sum(available) as volume
+    coalesce(sum(available), 0) as volume
 from best_quotes 
 where 
     instrument=:instrument and 

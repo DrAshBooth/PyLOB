@@ -6,17 +6,21 @@ begin transaction;
 create table trader (
     tid integer not null primary key,
     name text,
+    currency text,
     -- commission calculations in the currency of the instrument
     commission_per_unit real default(0),
     commission_min real default(0),
     commission_max real default(0),
-    allow_self_matching integer default(1)
+	commission_max_percnt real default(0),
+    allow_self_matching integer default(0),
+    foreign key(currency) references instrument(symbol)
 ) -- strict
 ;
 
 create table instrument (
     symbol text unique,
-    currency text
+    currency text,
+    lastprice real
 ) -- strict
 ;
 
@@ -78,6 +82,7 @@ create table trade_order (
     trader integer, -- trader
     active integer default(1),
     cancel integer default(0),
+    commission real, -- calculate on fulfill or on cancel, else nullify
     foreign key(side) references side(side),
     foreign key(trader) references trader(tid),
     foreign key(instrument) references instrument(symbol)
@@ -107,10 +112,14 @@ order by
 
 create view order_detail as
 select 
-    order_id, instrument, currency, order_type, side, event_dt, 
+    order_id, instrument, instrument.currency, order_type, side, event_dt, 
     qty, fulfilled, price, idNum, trader, active, cancel, 
-    min(commission_max, max(commission_min, commission_per_unit * qty)) as commission, 
-    currency as commission_currency
+    -- the commission in case the entire order would be executed
+    case when active=1 
+    then commission 
+    else min(commission_max, max(commission_min, commission_per_unit * qty)) 
+    end as commission, 
+    instrument.currency as commission_currency
 from trade_order
 inner join instrument on trade_order.instrument=instrument.symbol
 inner join trader on trader.tid=trade_order.trader
@@ -134,6 +143,51 @@ BEGIN
     from instrument 
     where instrument.symbol=new.instrument 
     on conflict do nothing;
+END;
+
+CREATE TRIGGER order_commission
+    AFTER UPDATE OF cancel, fulfilled ON trade_order
+BEGIN
+    update trade_order
+    set commission=
+        case when new.fulfilled>0
+        then min(
+            trader.commission_max, max(trader.commission_min, trader.commission_per_unit * new.fulfilled))
+        else null
+        end
+    from (
+        select commission_max, commission_min, commission_per_unit
+        from trader
+        where trader.tid=new.trader
+    ) as trader
+    where trade_order.order_id=new.order_id and old.cancel=0;
+    update trader_balance
+    set amount=amount - (
+        case when new.fulfilled>0
+        then 
+            min(
+                trader.commission_max, 
+                max(trader.commission_min, trader.commission_per_unit * new.fulfilled)
+            ) - (
+            case when old.fulfilled>0
+            then
+            min(
+                trader.commission_max, 
+                max(trader.commission_min, trader.commission_per_unit * old.fulfilled)
+            )
+            else 0
+            end
+            )
+        else 0
+        end
+        )
+    from (
+        select commission_max, commission_min, commission_per_unit, instrument.currency
+        from trader
+        inner join instrument on instrument.symbol=new.instrument
+        where trader.tid=new.trader
+    ) as trader
+    where trader_balance.trader=new.trader and trader_balance.instrument=trader.currency and old.cancel=0;
 END;
 
 create table trade (
@@ -271,8 +325,8 @@ select
     case when bidorder.price is null or askorder.price is null or bidorder.price >= askorder.price 
     then '👍' else '👎'
     end as matches,
-    bidorder.side, bidorder.trader, bidorder.idNum, bidorder.qty, bidorder.price, bidorder.fulfilled, 
-    askorder.side, askorder.trader, askorder.idNum, askorder.qty, askorder.price, askorder.fulfilled 
+    'bid' as bid, bidorder.trader, bidorder.idNum, bidorder.qty, bidorder.price, bidorder.fulfilled, 
+    'ask' as ask, askorder.trader, askorder.idNum, askorder.qty, askorder.price, askorder.fulfilled 
 from trade
 inner join trade_order as bidorder on bidorder.order_id=trade.bid_order 
 inner join trade_order as askorder on askorder.order_id=trade.ask_order 
@@ -280,8 +334,8 @@ inner join trade_order as askorder on askorder.order_id=trade.ask_order
 
 create table event (
     reqId integer,
-    method text,
-    callback text,
+    handler text, -- method on lob that will handle. it will handle using the args
+    callback text, -- method to invoke on trigger
     unique(reqId) on conflict replace
 );
 
