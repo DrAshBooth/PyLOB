@@ -1,0 +1,94 @@
+
+<!DOCTYPE html>
+<html>
+<body>
+<table border='1'><tr><th colspan="7">table: trader</th></tr>
+<tr><th>tid</th><th>name</th><th>currency</th><th>commission_per_unit</th><th>commission_min</th><th>commission_max</th><th>allow_self_matching</th></tr>
+<tr><td>100</td><td>100</td><td>null</td><td>0.01</td><td>2.5</td><td>1000.0</td><td>0</td></tr>
+<tr><td>101</td><td>101</td><td>null</td><td>0.01</td><td>2.5</td><td>1000.0</td><td>0</td></tr>
+<tr><td>102</td><td>102</td><td>null</td><td>0.01</td><td>2.5</td><td>1000.0</td><td>0</td></tr>
+<tr><td>103</td><td>103</td><td>null</td><td>0.01</td><td>2.5</td><td>1000.0</td><td>0</td></tr>
+<tr><td>104</td><td>104</td><td>null</td><td>0.01</td><td>2.5</td><td>1000.0</td><td>0</td></tr>
+<tr><td>105</td><td>105</td><td>null</td><td>0.01</td><td>2.5</td><td>1000.0</td><td>0</td></tr>
+<tr><td>106</td><td>106</td><td>null</td><td>0.01</td><td>2.5</td><td>1000.0</td><td>0</td></tr>
+<tr><td>107</td><td>107</td><td>null</td><td>0.01</td><td>2.5</td><td>1000.0</td><td>0</td></tr>
+<tr><td>108</td><td>108</td><td>null</td><td>0.01</td><td>2.5</td><td>1000.0</td><td>0</td></tr>
+<tr><td>109</td><td>109</td><td>null</td><td>0.01</td><td>2.5</td><td>1000.0</td><td>0</td></tr></table>
+<table border='1'><tr><th colspan="3">table: instrument</th></tr>
+<tr><th>symbol</th><th>currency</th><th>lastprice</th></tr>
+<tr><td>USD</td><td>null</td><td>null</td></tr>
+<tr><td>FAKE</td><td>USD</td><td>98.0</td></tr></table>
+<table border='1'><tr><th colspan="3">table: trader_balance</th></tr>
+<tr><th>trader</th><th>instrument</th><th>amount</th></tr>
+<tr><td>100</td><td>FAKE</td><td>9.0</td></tr>
+<tr><td>100</td><td>USD</td><td>-931.2</td></tr>
+<tr><td>101</td><td>FAKE</td><td>0.0</td></tr>
+<tr><td>101</td><td>USD</td><td>20.0</td></tr>
+<tr><td>102</td><td>FAKE</td><td>0.0</td></tr>
+<tr><td>102</td><td>USD</td><td>5.0</td></tr>
+<tr><td>103</td><td>FAKE</td><td>-5.0</td></tr>
+<tr><td>103</td><td>USD</td><td>502.5</td></tr>
+<tr><td>109</td><td>FAKE</td><td>2.0</td></tr>
+<tr><td>109</td><td>USD</td><td>-204.5</td></tr></table>
+<table border='1'><tr><th colspan="3">table: side</th></tr>
+<tr><th>side</th><th>matching</th><th>matching_order</th></tr>
+<tr><td>bid</td><td>ask</td><td>-1</td></tr>
+<tr><td>ask</td><td>bid</td><td>1</td></tr></table>
+<table border='1'><tr><th colspan="13">table: trade_order</th></tr>
+<tr><th>order_id</th><th>instrument</th><th>order_type</th><th>side</th><th>event_dt</th><th>qty</th><th>fulfilled</th><th>price</th><th>idNum</th><th>trader</th><th>active</th><th>cancel</th><th>commission</th></tr>
+<tr><td>1</td><td>FAKE</td><td>limit</td><td>ask</td><td>1</td><td>5</td><td>5</td><td>101.0</td><td>1</td><td>100</td><td>1</td><td>0</td><td>2.5</td></tr>
+<tr><td>2</td><td>FAKE</td><td>limit</td><td>ask</td><td>2</td><td>5</td><td>5</td><td>103.0</td><td>2</td><td>101</td><td>1</td><td>0</td><td>2.5</td></tr>
+<tr><td>3</td><td>FAKE</td><td>limit</td><td>ask</td><td>3</td><td>5</td><td>5</td><td>101.0</td><td>3</td><td>102</td><td>1</td><td>0</td><td>2.5</td></tr>
+<tr><td>4</td><td>FAKE</td><td>limit</td><td>ask</td><td>4</td><td>5</td><td>5</td><td>101.0</td><td>4</td><td>103</td><td>1</td><td>0</td><td>2.5</td></tr>
+<tr><td>5</td><td>FAKE</td><td>limit</td><td>bid</td><td>13</td><td>14</td><td>14</td><td>103.2</td><td>5</td><td>100</td><td>1</td><td>0</td><td>2.5</td></tr>
+<tr><td>6</td><td>FAKE</td><td>limit</td><td>bid</td><td>6</td><td>5</td><td>5</td><td>98.0</td><td>6</td><td>101</td><td>1</td><td>0</td><td>2.5</td></tr>
+<tr><td>7</td><td>FAKE</td><td>limit</td><td>bid</td><td>7</td><td>5</td><td>5</td><td>99.0</td><td>7</td><td>102</td><td>1</td><td>0</td><td>2.5</td></tr>
+<tr><td>8</td><td>FAKE</td><td>limit</td><td>bid</td><td>8</td><td>5</td><td>0</td><td>97.0</td><td>8</td><td>103</td><td>1</td><td>1</td><td>null</td></tr>
+<tr><td>9</td><td>FAKE</td><td>limit</td><td>bid</td><td>9</td><td>2</td><td>2</td><td>102.0</td><td>9</td><td>109</td><td>1</td><td>0</td><td>2.5</td></tr>
+<tr><td>10</td><td>FAKE</td><td>limit</td><td>bid</td><td>10</td><td>50</td><td>50</td><td>102.0</td><td>10</td><td>110</td><td>1</td><td>0</td><td>2.5</td></tr></table>
+<table border='1'><tr><th colspan="13">view: best_quotes</th></tr>
+<tr><th>order_id</th><th>idNum</th><th>side</th><th>price</th><th>qty</th><th>fulfilled</th><th>available</th><th>event_dt</th><th>instrument</th><th>trader</th><th>allow_self_matching</th><th>matching</th><th>matching_order</th></tr>
+<tr><td>12</td><td>12</td><td>ask</td><td>null</td><td>40</td><td>16</td><td>24</td><td>15</td><td>FAKE</td><td>111</td><td>0</td><td>bid</td><td>1</td></tr></table>
+<table border='1'><tr><th colspan="15">view: order_detail</th></tr>
+<tr><th>order_id</th><th>instrument</th><th>currency</th><th>order_type</th><th>side</th><th>event_dt</th><th>qty</th><th>fulfilled</th><th>price</th><th>idNum</th><th>trader</th><th>active</th><th>cancel</th><th>commission</th><th>commission_currency</th></tr>
+<tr><td>1</td><td>FAKE</td><td>USD</td><td>limit</td><td>ask</td><td>1</td><td>5</td><td>5</td><td>101.0</td><td>1</td><td>100</td><td>1</td><td>0</td><td>2.5</td><td>USD</td></tr>
+<tr><td>2</td><td>FAKE</td><td>USD</td><td>limit</td><td>ask</td><td>2</td><td>5</td><td>5</td><td>103.0</td><td>2</td><td>101</td><td>1</td><td>0</td><td>2.5</td><td>USD</td></tr>
+<tr><td>3</td><td>FAKE</td><td>USD</td><td>limit</td><td>ask</td><td>3</td><td>5</td><td>5</td><td>101.0</td><td>3</td><td>102</td><td>1</td><td>0</td><td>2.5</td><td>USD</td></tr>
+<tr><td>4</td><td>FAKE</td><td>USD</td><td>limit</td><td>ask</td><td>4</td><td>5</td><td>5</td><td>101.0</td><td>4</td><td>103</td><td>1</td><td>0</td><td>2.5</td><td>USD</td></tr>
+<tr><td>5</td><td>FAKE</td><td>USD</td><td>limit</td><td>bid</td><td>13</td><td>14</td><td>14</td><td>103.2</td><td>5</td><td>100</td><td>1</td><td>0</td><td>2.5</td><td>USD</td></tr>
+<tr><td>6</td><td>FAKE</td><td>USD</td><td>limit</td><td>bid</td><td>6</td><td>5</td><td>5</td><td>98.0</td><td>6</td><td>101</td><td>1</td><td>0</td><td>2.5</td><td>USD</td></tr>
+<tr><td>7</td><td>FAKE</td><td>USD</td><td>limit</td><td>bid</td><td>7</td><td>5</td><td>5</td><td>99.0</td><td>7</td><td>102</td><td>1</td><td>0</td><td>2.5</td><td>USD</td></tr>
+<tr><td>8</td><td>FAKE</td><td>USD</td><td>limit</td><td>bid</td><td>8</td><td>5</td><td>0</td><td>97.0</td><td>8</td><td>103</td><td>1</td><td>1</td><td>null</td><td>USD</td></tr>
+<tr><td>9</td><td>FAKE</td><td>USD</td><td>limit</td><td>bid</td><td>9</td><td>2</td><td>2</td><td>102.0</td><td>9</td><td>109</td><td>1</td><td>0</td><td>2.5</td><td>USD</td></tr>
+<tr><td>10</td><td>FAKE</td><td>USD</td><td>limit</td><td>bid</td><td>10</td><td>50</td><td>50</td><td>102.0</td><td>10</td><td>110</td><td>1</td><td>0</td><td>2.5</td><td>USD</td></tr></table>
+<table border='1'><tr><th colspan="7">table: trade</th></tr>
+<tr><th>trade_id</th><th>bid_order</th><th>ask_order</th><th>event_dt</th><th>price</th><th>qty</th><th>idNum</th></tr>
+<tr><td>1</td><td>9</td><td>1</td><td>9</td><td>101.0</td><td>2</td><td>null</td></tr>
+<tr><td>2</td><td>10</td><td>1</td><td>10</td><td>101.0</td><td>3</td><td>null</td></tr>
+<tr><td>3</td><td>10</td><td>3</td><td>10</td><td>101.0</td><td>5</td><td>null</td></tr>
+<tr><td>4</td><td>10</td><td>4</td><td>10</td><td>101.0</td><td>5</td><td>null</td></tr>
+<tr><td>5</td><td>10</td><td>11</td><td>11</td><td>102.0</td><td>37</td><td>null</td></tr>
+<tr><td>6</td><td>5</td><td>11</td><td>11</td><td>99.0</td><td>3</td><td>null</td></tr>
+<tr><td>7</td><td>5</td><td>2</td><td>14</td><td>103.0</td><td>5</td><td>null</td></tr>
+<tr><td>8</td><td>5</td><td>12</td><td>15</td><td>103.2</td><td>6</td><td>null</td></tr>
+<tr><td>9</td><td>7</td><td>12</td><td>15</td><td>99.0</td><td>5</td><td>null</td></tr>
+<tr><td>10</td><td>6</td><td>12</td><td>15</td><td>98.0</td><td>5</td><td>null</td></tr></table>
+<table border='1'><tr><th colspan="17">view: trade_detail</th></tr>
+<tr><th>'trade'</th><th>qty</th><th>price</th><th>instrument</th><th>matches</th><th>bid</th><th>trader</th><th>idNum</th><th>qty</th><th>price</th><th>fulfilled</th><th>ask</th><th>trader</th><th>idNum</th><th>qty</th><th>price</th><th>fulfilled</th></tr>
+<tr><td>trade</td><td>2</td><td>101.0</td><td>FAKE</td><td>👍</td><td>bid</td><td>109</td><td>9</td><td>2</td><td>102.0</td><td>2</td><td>ask</td><td>100</td><td>1</td><td>5</td><td>101.0</td><td>5</td></tr>
+<tr><td>trade</td><td>3</td><td>101.0</td><td>FAKE</td><td>👍</td><td>bid</td><td>110</td><td>10</td><td>50</td><td>102.0</td><td>50</td><td>ask</td><td>100</td><td>1</td><td>5</td><td>101.0</td><td>5</td></tr>
+<tr><td>trade</td><td>5</td><td>101.0</td><td>FAKE</td><td>👍</td><td>bid</td><td>110</td><td>10</td><td>50</td><td>102.0</td><td>50</td><td>ask</td><td>102</td><td>3</td><td>5</td><td>101.0</td><td>5</td></tr>
+<tr><td>trade</td><td>5</td><td>101.0</td><td>FAKE</td><td>👍</td><td>bid</td><td>110</td><td>10</td><td>50</td><td>102.0</td><td>50</td><td>ask</td><td>103</td><td>4</td><td>5</td><td>101.0</td><td>5</td></tr>
+<tr><td>trade</td><td>37</td><td>102.0</td><td>FAKE</td><td>👍</td><td>bid</td><td>110</td><td>10</td><td>50</td><td>102.0</td><td>50</td><td>ask</td><td>111</td><td>11</td><td>40</td><td>null</td><td>40</td></tr>
+<tr><td>trade</td><td>3</td><td>99.0</td><td>FAKE</td><td>👍</td><td>bid</td><td>100</td><td>5</td><td>14</td><td>103.2</td><td>14</td><td>ask</td><td>111</td><td>11</td><td>40</td><td>null</td><td>40</td></tr>
+<tr><td>trade</td><td>5</td><td>103.0</td><td>FAKE</td><td>👍</td><td>bid</td><td>100</td><td>5</td><td>14</td><td>103.2</td><td>14</td><td>ask</td><td>101</td><td>2</td><td>5</td><td>103.0</td><td>5</td></tr>
+<tr><td>trade</td><td>6</td><td>103.2</td><td>FAKE</td><td>👍</td><td>bid</td><td>100</td><td>5</td><td>14</td><td>103.2</td><td>14</td><td>ask</td><td>111</td><td>12</td><td>40</td><td>null</td><td>16</td></tr>
+<tr><td>trade</td><td>5</td><td>99.0</td><td>FAKE</td><td>👍</td><td>bid</td><td>102</td><td>7</td><td>5</td><td>99.0</td><td>5</td><td>ask</td><td>111</td><td>12</td><td>40</td><td>null</td><td>16</td></tr>
+<tr><td>trade</td><td>5</td><td>98.0</td><td>FAKE</td><td>👍</td><td>bid</td><td>101</td><td>6</td><td>5</td><td>98.0</td><td>5</td><td>ask</td><td>111</td><td>12</td><td>40</td><td>null</td><td>16</td></tr></table>
+<table border='1'><tr><th colspan="3">table: event</th></tr>
+<tr><th>reqId</th><th>handler</th><th>callback</th></tr></table>
+<table border='1'><tr><th colspan="4">table: event_arg</th></tr>
+<tr><th>reqId</th><th>arg</th><th>val</th><th>convertor</th></tr></table>
+</body>
+</html>
+
