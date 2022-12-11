@@ -104,7 +104,7 @@ class OrderBook(object):
             crsr.execute(self.set_lastprice, dict(instrument=instrument, lastprice=price))
         return trades, quote
 
-    def cancelOrder(self, side, idNum, time = None):
+    def cancelOrder(self, side, idNum, time=None):
         if time:
             self.time = time
         else:
@@ -112,7 +112,7 @@ class OrderBook(object):
         
         crsr = self.db.cursor()
         crsr.execute('begin transaction')
-        crsr.execute(self.cancel_order, (1, idNum, side))
+        crsr.execute(self.cancel_order, dict(cancel=1, idNum=idNum, side=side))
         crsr.execute('commit')
     
     # return whether comparedPrice has better matching chance than price

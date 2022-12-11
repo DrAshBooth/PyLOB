@@ -3,30 +3,31 @@
 
 begin transaction;
 
-create table trader (
+create table if not exists trader (
     tid integer not null primary key,
     name text,
     currency text,
     -- commission calculations in the currency of the instrument
     commission_per_unit real default(0),
     commission_min real default(0),
-    commission_max real default(0),
-	commission_max_percnt real default(0),
+    commission_max_percnt real default(0),
     allow_self_matching integer default(0),
     foreign key(currency) references instrument(symbol)
 ) -- strict
 ;
 
-create table instrument (
+create table if not exists instrument (
     symbol text unique,
     currency text,
     lastprice real
 ) -- strict
 ;
 
-insert into instrument (symbol, currency) values ('USD', null);
+insert into instrument (symbol, currency) 
+values ('USD', null) 
+on conflict do nothing;
 
-create table trader_balance (
+create table if not exists trader_balance (
     trader integer, -- trader
     instrument text,
     amount real default(0),
@@ -36,37 +37,38 @@ create table trader_balance (
 ) -- strict
 ;
 
-create table side (
+create table if not exists side (
     side text primary key,
     matching text,
     matching_order integer
 ) -- strict
 ;
 
-insert into side (side, matching, matching_order) values 
+insert into side (side, matching, matching_order) 
+values 
     ('bid', 'ask', -1),
     ('ask', 'bid', 1)
-;
+on conflict do nothing;
 
-CREATE TRIGGER SIDE_DELETE_LOCK
+create trigger if not exists SIDE_DELETE_LOCK
     BEFORE DELETE ON side
 BEGIN
-    select RAISE (ABORT, 'side may not be changed');
+    select RAISE (ABORT, 'side may not be deleted');
 END;
 
-CREATE TRIGGER SIDE_INSERT_LOCK
+create trigger if not exists SIDE_INSERT_LOCK
     BEFORE INSERT ON side
 BEGIN
-    select RAISE (ABORT, 'side may not be changed');
+    select RAISE (ABORT, 'side may not be inserted');
 END;
 
-CREATE TRIGGER SIDE_UPDATE_LOCK
+create trigger if not exists SIDE_UPDATE_LOCK
     BEFORE UPDATE ON side
 BEGIN
-    select RAISE (ABORT, 'side may not be changed');
+    select RAISE (ABORT, 'side may not be updated');
 END;
 
-create table trade_order (
+create table if not exists trade_order (
     order_id integer primary key,
     instrument text,
     order_type text, -- currently limit / market
@@ -82,17 +84,19 @@ create table trade_order (
     trader integer, -- trader
     active integer default(1),
     cancel integer default(0),
-    commission real, -- calculate on fulfill or on cancel, else nullify
+    fulfill_price real default(0),
+    commission real not null default(0), -- calculate on fulfill or on cancel, else nullify
     foreign key(side) references side(side),
     foreign key(trader) references trader(tid),
     foreign key(instrument) references instrument(symbol)
 ) -- STRICT
 ;
 
-create index order_priority on trade_order (side, instrument, price asc, event_dt asc);
-create index order_idnum on trade_order (idNum asc);
+create index if not exists order_priority 
+	on trade_order (side, instrument, price asc, event_dt asc);
+create index if not exists order_idnum on trade_order (idNum asc);
 
-create view best_quotes as
+create view if not exists best_quotes as
 select 
     order_id, idNum, side.side as side, price, 
     qty, fulfilled, qty-fulfilled as available, 
@@ -110,14 +114,16 @@ order by
     event_dt asc
 ;
 
-create view order_detail as
+create view if not exists order_detail as
 select 
     order_id, instrument, instrument.currency, order_type, side, event_dt, 
     qty, fulfilled, price, idNum, trader, active, cancel, 
     -- the commission in case the entire order would be executed
     case when active=1 
     then commission 
-    else min(commission_max, max(commission_min, commission_per_unit * qty)) 
+    else min(
+    	commission_max_percnt * price * qty / 100, 
+    	max(commission_min, commission_per_unit * qty)) 
     end as commission, 
     instrument.currency as commission_currency
 from trade_order
@@ -125,72 +131,56 @@ inner join instrument on trade_order.instrument=instrument.symbol
 inner join trader on trader.tid=trade_order.trader
 ;
 
-CREATE TRIGGER order_lock
+create trigger if not exists order_lock
     BEFORE UPDATE OF order_type, order_id, idNum, instrument, side ON trade_order
 BEGIN
     select RAISE (ABORT, 'fields: order_type, order_id, idNum, instrument, side may not be changed');
 END;
 
-CREATE TRIGGER order_insert
+create trigger if not exists order_insert
     AFTER INSERT ON trade_order
 BEGIN
     -- ensure trader has balance for instrument and instrument.currency
-    insert into trader_balance (trader, instrument, amount) 
-    select new.trader, new.instrument, 0 
+    insert into trader_balance (trader, instrument) 
+    select new.trader, new.instrument 
     on conflict do nothing;
-    insert into trader_balance (trader, instrument, amount) 
-    select new.trader, instrument.currency, 0 
+    insert into trader_balance (trader, instrument) 
+    select new.trader, instrument.currency 
     from instrument 
     where instrument.symbol=new.instrument 
     on conflict do nothing;
 END;
 
-CREATE TRIGGER order_commission
-    AFTER UPDATE OF cancel, fulfilled ON trade_order
+create trigger if not exists order_commission
+    AFTER UPDATE OF cancel, fulfilled, fulfill_price ON trade_order
 BEGIN
     update trade_order
-    set commission=
-        case when new.fulfilled>0
-        then min(
-            trader.commission_max, max(trader.commission_min, trader.commission_per_unit * new.fulfilled))
-        else null
-        end
+    set commission=min(
+        trader.commission_max_percnt * new.fulfill_price / 100, 
+        max(trader.commission_min, trader.commission_per_unit * new.fulfilled)
+    )
     from (
-        select commission_max, commission_min, commission_per_unit
+        select commission_max_percnt, commission_min, commission_per_unit
         from trader
         where trader.tid=new.trader
     ) as trader
-    where trade_order.order_id=new.order_id and old.cancel=0;
-    update trader_balance
-    set amount=amount - (
-        case when new.fulfilled>0
-        then 
-            min(
-                trader.commission_max, 
-                max(trader.commission_min, trader.commission_per_unit * new.fulfilled)
-            ) - (
-            case when old.fulfilled>0
-            then
-            min(
-                trader.commission_max, 
-                max(trader.commission_min, trader.commission_per_unit * old.fulfilled)
-            )
-            else 0
-            end
-            )
-        else 0
-        end
-        )
-    from (
-        select commission_max, commission_min, commission_per_unit, instrument.currency
-        from trader
-        inner join instrument on instrument.symbol=new.instrument
-        where trader.tid=new.trader
-    ) as trader
-    where trader_balance.trader=new.trader and trader_balance.instrument=trader.currency and old.cancel=0;
+    where trade_order.order_id=new.order_id and old.cancel=0 and new.fulfilled>0;
 END;
 
-create table trade (
+create trigger if not exists trader_commission
+    AFTER UPDATE OF commission ON trade_order
+BEGIN
+    update trader_balance
+    set amount=amount - (new.commission - old.commission)
+    from (
+        select instrument.currency
+        from instrument 
+        where instrument.symbol=new.instrument
+    ) as instrument
+    where trader_balance.trader=new.trader and trader_balance.instrument=instrument.currency;
+END;
+
+create table if not exists trade (
     trade_id integer primary key, 
     bid_order integer,
     ask_order integer,
@@ -203,19 +193,21 @@ create table trade (
 ) -- STRICT
 ;
 
-CREATE TRIGGER trade_lock
+create trigger if not exists trade_lock
     BEFORE UPDATE OF qty, price, bid_order, ask_order ON trade
 BEGIN
     select RAISE (ABORT, 'fields: qty, price, bid_order, ask_order may not be changed');
 END;
 
-CREATE TRIGGER trade_insert
+create trigger if not exists trade_insert
     AFTER INSERT ON trade
 BEGIN
     -- increase order fulfillment
     update trade_order 
-    set fulfilled=fulfilled + new.qty
+    set fulfilled=fulfilled + new.qty,
+    	fulfill_price=fulfill_price + new.qty * new.price
     where idNum in (new.bid_order, new.ask_order);
+    
     -- bid balance increases by qty instrument
     update trader_balance
     set amount=trader_balance.amount + bid_order.amount 
@@ -227,6 +219,7 @@ BEGIN
     where 
         trader_balance.trader=bid_order.trader and
         trader_balance.instrument=bid_order.instrument;
+    
     -- ask balance increases by qty * price instrument.currency
     update trader_balance
     set amount=trader_balance.amount + ask_order.amount 
@@ -239,6 +232,7 @@ BEGIN
     where 
         trader_balance.trader=ask_order.trader and
         trader_balance.instrument=ask_order.instrument;
+    
     -- ask balance decreases by qty instrument
     update trader_balance
     set amount=trader_balance.amount - ask_order.amount 
@@ -250,6 +244,7 @@ BEGIN
     where 
         trader_balance.trader=ask_order.trader and
         trader_balance.instrument=ask_order.instrument;
+    
     -- bid balance decreases by qty * price instrument.currency
     update trader_balance
     set amount=trader_balance.amount - bid_order.amount 
@@ -264,12 +259,13 @@ BEGIN
         trader_balance.instrument=bid_order.instrument;
 END;
 
-CREATE TRIGGER trade_delete
+create trigger if not exists trade_delete
     AFTER DELETE ON trade
 BEGIN
     -- decrease order fulfillment
     update trade_order 
-    set fulfilled=fulfilled - new.qty
+    set fulfilled=fulfilled - new.qty,
+    	fulfill_price=fulfill_price - new.qty * new.price
     where order_id in (new.bid_order, new.ask_order);
     -- bid balance decreases by qty instrument
     update trader_balance
@@ -319,7 +315,7 @@ BEGIN
         trader_balance.instrument=bid_order.instrument;
 END;
 
-create view trade_detail as
+create view if not exists trade_detail as
 select 
     'trade', trade.qty, trade.price, bidorder.instrument,
     case when bidorder.price is null or askorder.price is null or bidorder.price >= askorder.price 
@@ -332,14 +328,14 @@ inner join trade_order as bidorder on bidorder.order_id=trade.bid_order
 inner join trade_order as askorder on askorder.order_id=trade.ask_order 
 ;
 
-create table event (
+create table if not exists event (
     reqId integer,
     handler text, -- method on lob that will handle. it will handle using the args
     callback text, -- method to invoke on trigger
     unique(reqId) on conflict replace
 );
 
-create table event_arg (
+create table if not exists event_arg (
     reqId integer,
     arg text,
     val text,

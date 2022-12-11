@@ -8,43 +8,41 @@ see the wiki @ https://github.com/ab24v07/PyLOB/wiki
 
 '''
 
-if __name__ == '__main__':
-    
-    from PyLOB import OrderBook
-    
-    import sqlite3
-    
+from PyLOB import OrderBook
+
+import sqlite3
+
+def main():
     sqlite3.enable_callback_tracebacks(True)
     lob_connection = sqlite3.connect("lob.db")
     lob_connection.isolation_level = None
     #lob_connection.set_trace_callback(print)
     #lob_connection = None
     instrument = 'FAKE'
+    one_trader = """
+    insert into trader (tid, name) values (%(tid)d, '%(name)s') 
+    on conflict do nothing;"""
+    insert_traders = [one_trader.strip() % dict(tid=n, name=str(n)) for n in range(100, 112)]
     if lob_connection:
         lob_connection.executescript("""
             begin transaction;
             PRAGMA foreign_keys=1;
-            insert into trader (tid, name) values (100, '100');
-            insert into trader (tid, name) values (101, '101');
-            insert into trader (tid, name) values (102, '102');
-            insert into trader (tid, name) values (103, '103');
-            insert into trader (tid, name) values (104, '104');
-            insert into trader (tid, name) values (105, '105');
-            insert into trader (tid, name) values (106, '106');
-            insert into trader (tid, name) values (107, '107');
-            insert into trader (tid, name) values (108, '108');
-            insert into trader (tid, name) values (109, '109');
-            insert into trader (tid, name) values (110, '110');
-            insert into trader (tid, name) values (111, '111');
+            %(insert_traders)s
             update trader 
                 set 
                     commission_min=2.5,
                     commission_max_percnt=1,
                     commission_per_unit=0.01
             ;
-            insert into instrument (symbol, currency) values ('%(instrument)s', 'USD');
+            insert into instrument (symbol, currency) 
+            values ('%(instrument)s', 'USD')
+            on conflict do nothing;
             commit;
-        """ % dict(instrument=instrument))
+        """ % dict(
+        	instrument=instrument, 
+        	insert_traders='\n'.join(insert_traders),
+        )
+        )
     
     # Create a LOB object
     lob = OrderBook(db=lob_connection)
@@ -193,4 +191,7 @@ if __name__ == '__main__':
     
     if lob_connection:
         lob.db.close()
-    
+
+if __name__ == '__main__':
+    main()
+
