@@ -14,6 +14,17 @@ V (sum of qty x price over its fills), the commission SHALL equal
 owning trader's configured `commission_max_percnt`, `commission_min`, and
 `commission_per_unit`. An order with no fills SHALL carry zero commission.
 
+The percentage cap SHALL bind ahead of the floor: where
+`max_pct x V / 100 < min_commission`, the commission is the cap, not the
+floor. `min_commission` is a floor on the per-unit charge only, not on the
+order's commission.
+
+Commission SHALL be computed in floating-point with no rounding or currency
+quantization step; the contract is the exact value of the formula, and
+acceptance tests SHALL compare within a floating-point tolerance rather than
+for bit equality. Any rounding to currency precision is a future,
+explicitly-specified feature.
+
 #### Scenario: Floor dominates a small fill
 
 - **WHEN** a trader with min=2.5, max_pct=1, per_unit=0.01 fills 5 @ 101
