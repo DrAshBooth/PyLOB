@@ -206,7 +206,7 @@ BEGIN
     update trade_order 
     set fulfilled=fulfilled + new.qty,
     	fulfill_price=fulfill_price + new.qty * new.price
-    where idNum in (new.bid_order, new.ask_order);
+    where order_id in (new.bid_order, new.ask_order);
     
     -- bid balance increases by qty instrument
     update trader_balance
@@ -248,62 +248,6 @@ BEGIN
     -- bid balance decreases by qty * price instrument.currency
     update trader_balance
     set amount=trader_balance.amount - bid_order.amount 
-    from (
-        select trader, instrument.currency as instrument, new.qty * new.price as amount
-        from trade_order 
-        inner join instrument on instrument.symbol=trade_order.instrument
-        where trade_order.order_id=new.bid_order
-    ) as bid_order
-    where 
-        trader_balance.trader=bid_order.trader and
-        trader_balance.instrument=bid_order.instrument;
-END;
-
-create trigger if not exists trade_delete
-    AFTER DELETE ON trade
-BEGIN
-    -- decrease order fulfillment
-    update trade_order 
-    set fulfilled=fulfilled - new.qty,
-    	fulfill_price=fulfill_price - new.qty * new.price
-    where order_id in (new.bid_order, new.ask_order);
-    -- bid balance decreases by qty instrument
-    update trader_balance
-    set amount=trader_balance.amount - bid_order.qty 
-    from (
-        select trader, instrument, new.qty 
-        from trade_order 
-        where trade_order.order_id=new.bid_order
-    ) as bid_order
-    where 
-        trader_balance.trader=bid_order.trader and
-        trader_balance.instrument=bid_order.instrument;
-    -- ask balance decreases by qty * price instrument.currency
-    update trader_balance
-    set amount=trader_balance.amount - ask_order.amount 
-    from (
-        select trader, instrument.currency as instrument, new.qty * new.price as amount
-        from trade_order 
-        inner join instrument on instrument.symbol=trade_order.instrument
-        where trade_order.order_id=new.ask_order
-    ) as ask_order
-    where 
-        trader_balance.trader=ask_order.trader and
-        trader_balance.instrument=ask_order.instrument;
-    -- ask balance increases by qty instrument
-    update trader_balance
-    set amount=trader_balance.amount + ask_order.qty 
-    from (
-        select trader, instrument, new.qty 
-        from trade_order 
-        where trade_order.order_id=new.ask_order
-    ) as bid_order
-    where 
-        trader_balance.trader=ask_order.trader and
-        trader_balance.instrument=ask_order.instrument;
-    -- bid balance increases by qty * price instrument.currency
-    update trader_balance
-    set amount=trader_balance.amount + bid_order.amount 
     from (
         select trader, instrument.currency as instrument, new.qty * new.price as amount
         from trade_order 
