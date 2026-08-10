@@ -9,6 +9,8 @@ user-invocable: true
 
 Gives a repository four things coding agents need: a planning system, a durable decision log, a deterministic definition of done, and a work queue.
 
+The four pieces form one pipeline: OpenSpec plans a change → the maintainer approves it and has its tasks converted into beads (dependencies mirroring task order) → coding agents pick work off the `bd ready` frontier → `./verify` gates every bead close. OpenSpec is planning-only; its apply workflow is never used. This operating model is the default this skill installs, and Phase 6 writes it into CLAUDE.md.
+
 **This skill runs only when the user invokes it with `/agentic-repo-setup`.** It is never auto-triggered. It installs global tooling, writes files at the repo root, and depends on a user interview in Phase 1, so the timing is the user's to choose. If it appears relevant to the conversation but has not been invoked, say so and stop; do not read this file and run the phases manually.
 
 Run the phases in order. Each has a halt condition. The phases are ordered by dependency, not by importance, so do not reorder them: `./verify`, `bd remember`, and `brain/` all depend on what comes out of Phase 1.
@@ -273,7 +275,9 @@ bd remember "entry point: <path from Phase 1>"
 
 Nothing about goals, roadmap, strategy, architecture, or intent. Those belong in `openspec/project.md`, `docs/adr/`, and `brain/` respectively. Beads compacts old memory over time, so anything durable stored here degrades by design.
 
-**Create no beads.**
+**Create no beads.** The queue starts empty by design: beads are born from
+approved OpenSpec changes when the maintainer asks for the conversion, not
+ad-hoc. The `bd ready` frontier is the hand-off point to coding agents.
 
 ---
 
@@ -289,8 +293,15 @@ Keep it short. A bloated CLAUDE.md is a known failure mode: when real rules sit 
 ## Planning
 
 Planning happens in OpenSpec. Do not start implementation from a chat message.
-Propose a change (`openspec/changes/<id>/`), get it reviewed, then implement.
+Propose a change (`openspec/changes/<id>/`) and get it reviewed.
 Standing project constraints live in `openspec/project.md`.
+
+**OpenSpec is planning-only in this repo. Never run the apply workflow**
+(`/opsx:apply` / the openspec-apply-change skill). After a change's artifacts
+are approved, its tasks are converted into beads (with dependencies mirroring
+task order), and implementation happens by agents picking work from `bd ready`.
+The maintainer drives the conversion; do not create beads from a change without
+being asked.
 
 ## Definition of done
 

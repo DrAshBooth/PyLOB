@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# ./verify — the definition of done for this repo.
+# Exit 0 means done. Any non-zero exit means not done.
+set -euo pipefail
+cd "$(dirname "$0")"
+
+# Pinned until pyproject.toml lands; then this moves into uv dev dependencies.
+RUFF="uvx ruff@0.9.10"
+
+start=$(date +%s)
+fail=0
+
+stage() {
+  local name="$1"; shift
+  echo "== $name"
+  if ! "$@"; then
+    echo "!! $name FAILED"
+    fail=1
+  fi
+}
+
+# Run example.py against a scratch copy of src/ with a freshly built schema.
+# The committed src/lob.db is never touched.
+smoke() {
+  local tmp rc=0
+  tmp=$(mktemp -d "${TMPDIR:-/tmp}/pylob-smoke.XXXXXX")
+  cp -R src/. "$tmp/"
+  rm -f "$tmp/lob.db"
+  (
+    cd "$tmp"
+    python3 - <<'EOF'
+import sqlite3
+
+conn = sqlite3.connect("lob.db")
+conn.executescript(open("create_lob.sql").read())
+conn.close()
+EOF
+    python3 example.py > /dev/null
+  ) || rc=$?
+  rm -rf "$tmp"
+  return $rc
+}
+
+# === checks: do not add to this block without asking the user first ===
+stage "format" $RUFF format --check src
+stage "lint"   $RUFF check src
+stage "smoke"  smoke
+# === end checks ===
+
+echo "verify: $(( $(date +%s) - start ))s"
+if [ "$fail" -ne 0 ]; then
+  echo "verify: FAILED"
+  exit 1
+fi
+echo "verify: OK"
