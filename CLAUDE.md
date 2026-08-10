@@ -1,0 +1,43 @@
+@AGENTS.md
+
+## Planning
+
+Planning happens in OpenSpec. Do not start implementation from a chat message.
+Propose a change (`openspec/changes/<id>/`) and get it reviewed.
+Standing project constraints live in the `context:` block of `openspec/config.yaml`.
+
+**OpenSpec is planning-only in this repo. Never run the apply workflow**
+(`/opsx:apply` / the openspec-apply-change skill). After a change's artifacts
+are approved, its tasks are converted into beads (with dependencies mirroring
+task order), and implementation happens by agents picking work from `bd ready`.
+The maintainer drives the conversion; do not create beads from a change without
+being asked.
+
+## Definition of done
+
+`./verify` from the repo root. Exit 0 means done. Nothing ships that has not passed it.
+
+`./verify` is the contract, not a suggestion. Never add a check to it without asking
+the user first.
+
+Note: this repo's `./verify` script supersedes the built-in `/verify` skill.
+Run the script; do not infer a separate build-and-run recipe.
+
+## Decision records
+
+`docs/adr/` holds architectural decision records. `docs/adr/README.md` is the index.
+Read the index before proposing a change; read the individual ADR only if it is relevant.
+
+Write a new ADR when a decision:
+- constrains a change proposal not yet written, or
+- rejects an option (rejections leave no other trace), or
+- supersedes an existing ADR (supersede, never edit in place)
+
+Otherwise the rationale stays in that change's `design.md`. Reconcile ADRs at archive
+time, not proposal time.
+
+## Issue tracking
+
+See AGENTS.md for bd usage. Do not close a bead until `./verify` passes; closing a bead
+releases its blockers into `bd ready`, so a premature close puts other agents to work on
+unverified foundations.

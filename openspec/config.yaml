@@ -1,0 +1,34 @@
+schema: spec-driven
+
+# Standing project constraints. Every change proposal must respect these.
+# Fixed constraints and conventions only — aspirations live in brain/ and ADRs.
+context: |
+  PyLOB is a simulation-for-research limit order book: price-time priority,
+  market/limit orders with add/cancel/update, single-threaded, zero-latency
+  assumption. It is a library consumed by people running LOB simulations.
+
+  Fixed constraints:
+  - Python >= 3.11. uv manages Python versions and dependencies.
+  - Toolchain: ruff (format + lint), pytest. mypy joins once the code is typed.
+  - Packaging: setup.cfg/setup.py migrate to pyproject.toml (decided, not yet done).
+  - Distribution: public GitHub repo, MIT licence, installable from GitHub.
+    No PyPI publishing (the pylob name is held by an unrelated package).
+  - Single instrument, single currency.
+  - The current public API (OrderBook.processOrder(dict, fromData, verbose),
+    cancelOrder, modifyOrder, getVolumeAtPrice, getBest*/getWorst*) is kept
+    unless it proves a limiter of performance or clarity; changing it needs an ADR.
+  - Matching is moving to an in-memory engine (ADR-0001, accepted 2026-08-10):
+    price-time priority in one layer behind the existing public API. SQLite is
+    retained only as an optional off-hot-path recording/analytics sink. Never
+    put SQL in the matching path. The legacy SQL engine stays in tree as a
+    cross-check oracle until the in-memory engine passes the same test suite.
+
+  Definition of done: ./verify at the repo root exits 0. Performance work is in
+  scope but benchmarks stay out of ./verify.
+
+  Out of scope: multi-instrument, multi-currency, PyPI publishing.
+
+  Conventions:
+  - Architectural decision records live in docs/adr/; read the index before proposing.
+  - src/ layout; the package is src/PyLOB with SQL files loaded as attributes.
+  - Never mutate the committed src/lob.db; smoke tests run against a scratch copy.
