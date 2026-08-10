@@ -2,3 +2,7 @@ __pycache__/
 .project
 .pydevproject
 *.egg-info
+.DS_Store
+
+# Claude Code: skills are tracked, per-session scratch is not
+.claude/worktrees/
