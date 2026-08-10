@@ -41,3 +41,20 @@ time, not proposal time.
 See AGENTS.md for bd usage. Do not close a bead until `./verify` passes; closing a bead
 releases its blockers into `bd ready`, so a premature close puts other agents to work on
 unverified foundations.
+
+Landing rule: a bead is closed only when its work is merged to master and `./verify`
+is green there. An agent without merge authority leaves the bead `in_progress` and
+hands off with the PR link. A group of sequential beads may share one branch and PR,
+closing together after the merge.
+
+Beads titled `MAINTAINER GATE` (labeled `human`) are the maintainer's to act on —
+agents must not claim them. List them with `bd human list`. In the handoff, say if
+closing a bead has unblocked any `human`-labeled bead.
+
+Beads are the execution source of truth. Each change's `tasks.md` is frozen planning
+input: do not tick its checkboxes as beads close; reconcile at archive time.
+
+Triage for discoveries made mid-bead: behavior that violates an already-ratified spec
+is a bug — file a `bug` bead and link it to the bead that found it. Anything that
+would change a ratified contract or add a capability needs an OpenSpec delta; propose
+it and stop — the maintainer converts approved changes into beads.
