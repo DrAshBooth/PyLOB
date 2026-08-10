@@ -85,7 +85,7 @@ class OrderBook(object):
         quote.update(
             lastprice=self.lastPrice.get(instrument),
         )
-        qtyToExec = quote["qty"]
+        qtyToExec = quote["qty"] - quote.get("fulfilled", 0)
         sql_matches = self.matches + self.best_quotes_order_asc
         matches = crsr.execute(sql_matches, quote).fetchall()
         trades = list()
@@ -160,6 +160,7 @@ class OrderBook(object):
                 type=order_type,
                 order_id=order_id,
                 instrument=instrument,
+                fulfilled=fulfilled,
             )
             if orderUpdate.get("price"):
                 orderUpdate["price"] = self.clipPrice(orderUpdate["price"])
