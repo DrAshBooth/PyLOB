@@ -1,12 +1,16 @@
-"""The in-memory book: order store, price levels, and tick quantization.
+"""The in-memory matching engine: the book, the crossing loop, the ledgers.
 
-ADR-0001 moved matching out of SQLite and into this module. Everything the
-matching loop needs to be fast and deterministic lives here -- the structures,
-the identifier rules, and the price grid -- and nothing here matches. The
-crossing loop, cancel/modify, and the ledgers build on top of this file.
+ADR-0001 moved matching out of SQLite and into this module. Everything an
+order's life touches is here -- the structures, the identifier rules, the
+price grid, the crossing loop, cancel and modify, and the running balances --
+because one code path owning eligibility, allocation and accounting is the
+whole point of the move.
 
 No SQL. This module must never import `sqlite3`: a sink is optional and lives
-behind `events.EventSink`, so the engine has to be complete without one.
+behind `events.EventSink`, so the engine has to be complete without one. It
+follows that a caller with no sink still learns what happened: a submission
+returns its `Trade` list, and `Filled` -- the recorder's view of the same
+executions -- is built only when someone is recording.
 
 The structures
 --------------
@@ -90,23 +94,72 @@ and quantizes 100.03 to 100.0 on a 0.05 tick. Here the grid is real -- divide
 by the tick, round to an integer, multiply back -- carried out in `decimal` so
 that 0.05 is a twentieth and not 0.05000000000000000277. The float that comes
 back is the nearest double to the exact decimal multiple.
+
+Matching
+--------
+
+`submit` is one submission end to end: accept, cross, then rest or cancel the
+remainder. The crossing loop walks the opposite side best-price-first and each
+level front-to-back, so (price, priority) is the entirety of the matching
+order, and every execution prices at the **maker's** limit -- the resting
+order named terms and the arriving one took them.
+
+Two rules bend the walk, and both are book state rather than special cases:
+
+- a market order carries no price, crosses every level, and is cancelled the
+  moment liquidity runs out (`order-lifecycle`: immediate-or-cancel, never
+  rests) -- `Order.resting` makes that structural rather than remembered;
+- a resting order of the taker's own trader is **skipped, not consumed**,
+  unless that trader has `allow_self_matching`. It keeps its place, its
+  quantity and its `fulfilled`, and the walk carries on past it
+  (`trader-balances`). `BookSide.match_levels` therefore hands levels out one
+  at a time and puts back what the caller did not empty, so a level nobody
+  was allowed to trade with does not stop the walk at the top of the book.
+
+A modify that changes price re-enters the same loop with the resting order as
+the taker, which is why every fill goes through `BookSide.fill` on *both*
+sides: the taker may itself be in the book, and its level's cached volume has
+to stay honest either way.
+
+The ledgers
+-----------
+
+Commissions and balances are computed here, not in a sink (design.md decision
+3): online PnL is a required feature and a sink is optional, so `order.
+commission` and `balance()` cannot depend on one being attached.
+
+Commission is a function of an order's *cumulative* fills, recomputed from
+(Q, V) on every execution, and only the difference is charged
+(`commission_for` is the one implementation of the formula; `Filled` carries
+both the new total and the increment so a sink never re-derives it). The
+percentage cap binds ahead of the floor, and nothing is rounded or quantized
+to currency precision -- the contract is the exact value of the formula.
+
+Balances track; they do not gate. No margin check, no sufficient-funds check,
+negative balances permitted and recorded on both sides. That absence is a
+requirement of `trader-balances`, not an omission: a well-meaning funds check
+here would break short-selling research workloads.
 """
 
 from __future__ import annotations
 
 import heapq
 from collections.abc import Iterator
+from contextlib import closing
 from dataclasses import dataclass, field
 from decimal import ROUND_HALF_EVEN, Context, Decimal
 from functools import lru_cache
-from typing import Final
+from typing import Any, Final
 
 from .events import (
     Accepted,
+    Cancelled,
     CancelReason,
     Event,
     EventSink,
+    Filled,
     InstrumentConfigured,
+    Modified,
     OrderType,
     SessionStarted,
     Side,
@@ -120,7 +173,9 @@ __all__ = [
     "DuplicateOrderID",
     "UnknownOrder",
     "quantize_price",
+    "commission_for",
     "Order",
+    "Trade",
     "Trader",
     "PriceLevel",
     "BookSide",
@@ -286,6 +341,43 @@ class Order:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class Trade:
+    """One execution, as reported to whoever caused it.
+
+    The engine's answer to "what did my order just do", returned from `submit`
+    and `modifyOrder` and built whether or not a sink is attached. `Filled` is
+    the recorder's view of the same execution and carries the accounting a
+    sink needs; this carries what a caller needs to see a trade happen, and
+    the orders it names answer for the rest.
+
+    `price` is the maker's limit and `qty` this execution alone -- neither is
+    a cumulative total.
+    """
+
+    trade_id: int
+    timestamp: float
+    instrument: str
+    price: float
+    qty: int
+    #: Which side was the aggressor; the other side was resting.
+    taker_side: Side
+    bid_idNum: int
+    bid_tid: int
+    ask_idNum: int
+    ask_tid: int
+
+    @property
+    def taker_idNum(self) -> int:
+        """The aggressing order's identifier."""
+        return self.bid_idNum if self.taker_side is Side.BID else self.ask_idNum
+
+    @property
+    def maker_idNum(self) -> int:
+        """The resting order's identifier -- the one that set the price."""
+        return self.ask_idNum if self.taker_side is Side.BID else self.bid_idNum
+
+
 @dataclass(slots=True)
 class Trader:
     """A participant's standing configuration.
@@ -301,6 +393,30 @@ class Trader:
     commission_min: float = 0.0
     commission_max_percnt: float = 0.0
     commission_per_unit: float = 0.0
+
+
+def commission_for(trader: Trader, qty: int, value: float) -> float:
+    """`min(max_pct * V / 100, max(min_commission, per_unit * Q))`, exactly.
+
+    The `commissions` contract, in one place, over an order's *cumulative*
+    filled quantity `qty` and fill value `value` -- never over a single fill.
+    An order with no fills owes nothing, whatever the floor says.
+
+    The percentage cap binds ahead of the floor: where the cap comes out below
+    `min_commission` the commission is the cap, because `min_commission` is a
+    floor on the per-unit charge and not on the order's commission. That is
+    the interactive-brokers-style schedule this models, and it is the reason
+    the `max` is inside the `min` rather than wrapped around it.
+
+    No rounding, no currency quantization: the contract is the exact value of
+    the floating-point formula, and a `round(x, 2)` here would diverge two
+    engines while every acceptance test still passed.
+    """
+    if qty <= 0:
+        return 0.0
+    per_unit = max(trader.commission_min, trader.commission_per_unit * qty)
+    capped = trader.commission_max_percnt * value / 100.0
+    return min(capped, per_unit)
 
 
 class PriceLevel:
@@ -437,6 +553,53 @@ class BookSide:
             self._levels[price]
             for price in sorted(self._levels, reverse=self.side is Side.BID)
         ]
+
+    def crosses(self, level_price: float, price: float | None) -> bool:
+        """Would an opposite order priced at `price` trade at `level_price`?
+
+        `None` is a market order's price and crosses everything: it has named
+        no terms, so there are none to fail.
+        """
+        if price is None:
+            return True
+        if self.side is Side.BID:
+            return level_price >= price
+        return level_price <= price
+
+    def match_levels(self, price: float | None) -> Iterator[PriceLevel]:
+        """Levels an opposite order priced at `price` may trade with, best first.
+
+        The walk lifts each price off the best-price heap before handing over
+        its level and puts back the ones whose level survived. That is what
+        lets the caller *not* consume a level -- every order in it skipped by
+        the self-matching gate -- and still reach the next one: without it the
+        same untouchable price would be on top forever.
+
+        Only the caller's own filling removes a level. This yields; it does
+        not delete.
+
+        A `_compact` that fires mid-walk (some level emptying) rebuilds the
+        heap from the live levels and so re-adds a price the walk is holding,
+        which is then pushed a second time on the way out. The heaps hold
+        prices and tolerate duplicates by design, so that costs an entry and
+        nothing else.
+
+        Close the iterator -- `contextlib.closing`, or exhaust it -- or the
+        prices it walked past stay out of the heap until it is collected.
+        """
+        walked: list[float] = []
+        try:
+            while True:
+                best = self._peek(self._best, self._best_sign)
+                if best is None or not self.crosses(best, price):
+                    return
+                heapq.heappop(self._best)
+                walked.append(best)
+                yield self._levels[best]
+        finally:
+            for level_price in walked:
+                if level_price in self._levels:
+                    heapq.heappush(self._best, level_price * self._best_sign)
 
     @property
     def total_volume(self) -> int:
@@ -616,18 +779,20 @@ class InstrumentBook:
 
 
 class OrderBook:
-    """The in-memory book: instruments, traders, orders, and the counters.
-
-    This class owns the state and the invariants; the matching loop, cancel
-    and modify, and the ledgers are methods added on top of it. What is here
-    is what they all need:
+    """The engine: instruments, traders, orders, matching, and the ledgers.
 
     configuration
         `configure_instrument`, `configure_trader`, `clipPrice`
+    operations
+        `submit`, `cancelOrder`, `modifyOrder`, and `processOrder` -- the
+        legacy dict-quote shape, kept because the public API is a standing
+        constraint
     the store
         `create_order`, `order`, `orders`
     the book
-        `book`, `rest`, `snapshot`, and the `get*` queries
+        `book`, `rest`, `match`, `snapshot`, and the `get*` queries
+    the ledgers
+        `balance`, `holdings`
     the counters
         `next_priority`, `next_trade_id`, `next_seq`
     the sink
@@ -635,6 +800,10 @@ class OrderBook:
 
     Construction emits `SessionStarted`, so a stream always opens with the
     tick size a replay needs in order to quantize the same way.
+
+    Single-threaded and synchronous throughout. An operation is finished --
+    matched, rested or cancelled, balances moved, events emitted -- before it
+    returns, so there is no in-flight state for a caller to observe.
     """
 
     valid_types: Final = tuple(str(member) for member in OrderType)
@@ -655,6 +824,10 @@ class OrderBook:
         self._orders: dict[int, Order] = {}
         self._books: dict[str, InstrumentBook] = {}
         self._traders: dict[int, Trader] = {}
+        #: (tid, symbol) -> amount, where a symbol is an instrument or a
+        #: currency: both are things a trader holds, and holding -5 of either
+        #: is a position the ledger records rather than a state it refuses.
+        self._balances: dict[tuple[int, str], float] = {}
 
         self._next_idNum = 1
         self._next_priority = 1
@@ -805,10 +978,7 @@ class OrderBook:
         side = _as_side(side)
         order_type = _as_order_type(order_type)
 
-        if not isinstance(qty, int) or isinstance(qty, bool):
-            raise InvalidOrder("quantity must be an integer, got %r" % (qty,))
-        if qty <= 0:
-            raise InvalidOrder("quantity must be positive, got %r" % (qty,))
+        _check_qty(qty)
 
         if order_type is OrderType.LIMIT:
             if price is None:
@@ -818,10 +988,7 @@ class OrderBook:
             working_price = None
 
         idNum = self._assign_idNum(idNum)
-        if timestamp is None:
-            self.time += 1
-        else:
-            self.time = timestamp
+        self._advance(timestamp)
 
         order = Order(
             idNum=idNum,
@@ -852,6 +1019,408 @@ class OrderBook:
                 )
             )
         return order
+
+    # -- operations --------------------------------------------------------
+
+    def submit(
+        self,
+        tid: int,
+        instrument: str,
+        side: Side | str,
+        order_type: OrderType | str,
+        qty: int,
+        price: float | None = None,
+        idNum: int | None = None,
+        timestamp: float | None = None,
+    ) -> tuple[Order, list[Trade]]:
+        """One submission end to end: accept, cross, then rest or cancel.
+
+        Returns the order and the executions it caused, in match order. The
+        order goes on answering for itself afterwards -- `fulfilled`,
+        `commission`, `resting` -- so a caller needs nothing else to see what
+        became of it.
+
+        What is left over rests only if it may: a limit order joins the back
+        of its price level, a market order's remainder is cancelled, because
+        `order-lifecycle` makes market orders immediate-or-cancel.
+
+        Emission order is `Accepted`, then one `Filled` per execution, then
+        the `Cancelled` of an IOC remainder -- the order the transitions
+        happened in.
+        """
+        order = self.create_order(
+            tid=tid,
+            instrument=instrument,
+            side=side,
+            order_type=order_type,
+            qty=qty,
+            price=price,
+            idNum=idNum,
+            timestamp=timestamp,
+        )
+        trades = self.match(order)
+        if order.remaining > 0:
+            if order.order_type is OrderType.MARKET:
+                self._cancel(order, CancelReason.IOC_REMAINDER)
+            else:
+                self.rest(order)
+        return order, trades
+
+    def processOrder(
+        self, quote: dict[str, Any], fromData: bool = False, verbose: bool = False
+    ) -> tuple[list[Trade], dict[str, Any]]:
+        """`submit` in the legacy dict-quote shape: quote in, `(trades, quote)` out.
+
+        Kept because the public API is a standing constraint. The quote is
+        updated in place with the identifier, timestamp and quantized working
+        price the engine assigned -- callers read those back out of it.
+
+        `fromData` is the replay path: the quote's own `idNum` and `timestamp`
+        are used as given instead of being assigned.
+        """
+        order, trades = self.submit(
+            tid=quote["tid"],
+            instrument=quote["instrument"],
+            side=quote["side"],
+            order_type=quote["type"],
+            qty=quote["qty"],
+            price=quote.get("price"),
+            idNum=quote.get("idNum") if fromData else None,
+            timestamp=quote.get("timestamp") if fromData else None,
+        )
+        quote["idNum"] = order.idNum
+        quote["timestamp"] = order.timestamp
+        quote["price"] = order.price
+        if verbose:
+            _report(trades, order.tid)
+        return trades, quote
+
+    def cancelOrder(
+        self, side: Side | str | None, idNum: int, time: float | None = None
+    ) -> Order:
+        """Take one order out of the book at its owner's request.
+
+        Every way of naming an order that does not exist raises rather than
+        no-ops (`order-lifecycle`; lob-0rb, where the legacy engine's silent
+        no-op is how a caller loses an order it believes it cancelled): an
+        unknown identifier, a `side` that is not the order's, an order already
+        cancelled, and an order with nothing left to cancel. Nothing changes
+        before the last of those checks passes -- not even the clock.
+
+        `side` may be `None` to address the order by identifier alone.
+
+        Commission already charged on the filled part stays charged
+        (`commissions`: cancelling does not refund), which is why `Cancelled`
+        carries no commission field: nothing moves.
+        """
+        order = self.require_order(idNum)
+        if side is not None and _as_side(side) is not order.side:
+            raise InvalidOrder(
+                "order %r is a %s, not a %s" % (idNum, order.side, _as_side(side))
+            )
+        if order.cancelled:
+            raise InvalidOrder("order %r is already cancelled" % (idNum,))
+        if order.filled:
+            raise InvalidOrder("order %r is fully filled, nothing to cancel" % (idNum,))
+        self._advance(time)
+        self._cancel(order, CancelReason.REQUESTED)
+        return order
+
+    def modifyOrder(
+        self,
+        idNum: int,
+        orderUpdate: dict[str, Any],
+        time: float | None = None,
+        verbose: bool = False,
+    ) -> tuple[list[Trade], dict[str, Any]]:
+        """Change a resting order's price or quantity (legacy dict shape, kept).
+
+        `orderUpdate` states `side`, `qty` and `price`. All three keys are
+        required -- a missing one is an `InvalidOrder` naming it, never a
+        `KeyError` from inside the engine (lob-crf: the legacy engine leaked a
+        `sqlite3.ProgrammingError` here). `qty` or `price` given as `None`
+        means *leave that one alone*.
+
+        `price=None` is emphatically not "become a market order": the legacy
+        engine read it that way and matched a limit order at 99 against an ask
+        at 105 while keeping 99 as its stored price (lob-crf). An order that
+        named a limit keeps it until someone names a different one.
+
+        The rules, all from `order-lifecycle`:
+
+        - a `side` that is not the order's raises, and the order is unchanged;
+        - a quantity below what is already fulfilled clamps up to it, which
+          finishes the order -- reported as `Modified` with the clamped
+          quantity, not as a cancellation;
+        - a price change or a quantity increase costs time priority: the order
+          goes to the back of its (possibly new) level with a fresh stamp. A
+          pure quantity decrease keeps its place and its stamp.
+
+        `Modified` is emitted after the change and before any fills the new
+        price causes, so a sink applying events in order never sees a fill
+        against a stale price.
+        """
+        order = self.require_order(idNum)
+        side = _required(orderUpdate, "side", idNum)
+        qty = _required(orderUpdate, "qty", idNum)
+        price = _required(orderUpdate, "price", idNum)
+
+        if _as_side(side) is not order.side:
+            raise InvalidOrder(
+                "order %r is a %s, not a %s" % (idNum, order.side, _as_side(side))
+            )
+        if order.cancelled:
+            raise InvalidOrder("order %r is cancelled" % (idNum,))
+        if order.order_type is not OrderType.LIMIT:
+            raise InvalidOrder("order %r is a market order and never rested" % (idNum,))
+        if qty is not None:
+            _check_qty(qty)
+
+        prev_price, prev_qty = order.price, order.qty
+        new_price = prev_price if price is None else self.clipPrice(price)
+        new_qty = max(prev_qty if qty is None else qty, order.fulfilled)
+        reprioritized = new_price != prev_price or new_qty > prev_qty
+
+        self._advance(time)
+        side_book = self.book(order.instrument).side(order.side)
+        if reprioritized:
+            if order.resting:
+                side_book.remove(order)
+            order.price = new_price
+            order.qty = new_qty
+            order.priority = self.next_priority()
+        else:
+            # The passive half: `resize` is the one path that changes a
+            # resting order's quantity without moving it in the queue.
+            side_book.resize(order, new_qty)
+
+        if self.recording:
+            self.emit(
+                Modified(
+                    seq=self.next_seq(),
+                    timestamp=self.time,
+                    idNum=order.idNum,
+                    tid=order.tid,
+                    instrument=order.instrument,
+                    side=order.side,
+                    price=order.price,
+                    qty=order.qty,
+                    fulfilled=order.fulfilled,
+                    prev_price=prev_price,
+                    prev_qty=prev_qty,
+                    priority=order.priority,
+                    reprioritized=reprioritized,
+                )
+            )
+
+        trades: list[Trade] = []
+        if reprioritized:
+            # The order is out of the book, so it crosses as a taker like any
+            # arriving order -- and, like one, only what survives goes back in.
+            trades = self.match(order)
+            if order.remaining > 0:
+                self.rest(order)
+        if verbose:
+            _report(trades, order.tid)
+        return trades, orderUpdate
+
+    # -- matching ----------------------------------------------------------
+
+    def match(self, taker: Order) -> list[Trade]:
+        """Trade `taker` against the opposite side as far as it is entitled to.
+
+        Levels best-price-first, orders within a level front-to-back: (price,
+        priority) and nothing else. Each execution prices at the maker's
+        limit, and `taker.remaining` bounds the whole walk, so an order with
+        fills already against it trades only what it has left
+        (`order-matching`).
+
+        Resting orders of the taker's own trader are stepped over unless that
+        trader allows self-matching -- untouched, still in the book, still at
+        the front of their level.
+
+        `taker` may itself be resting: that is a repriced modify, and it is
+        why the taker's own side is filled through `BookSide.fill` rather than
+        by touching `fulfilled` directly.
+        """
+        trades: list[Trade] = []
+        book = self.book(taker.instrument)
+        makers = book.opposite(taker.side)
+        if taker.cancelled or taker.remaining <= 0 or not makers:
+            return trades
+        takers = book.side(taker.side)
+        gated = not self.trader(taker.tid).allow_self_matching
+        with closing(makers.match_levels(taker.price)) as levels:
+            for level in levels:
+                # Orders skipped by the gate stay at the front of the level,
+                # so the cursor steps past them rather than the level being
+                # re-read from the top.
+                skipped = 0
+                while taker.remaining > 0:
+                    maker = _at(level, skipped)
+                    if maker is None:
+                        break
+                    if gated and maker.tid == taker.tid:
+                        skipped += 1
+                        continue
+                    trades.append(
+                        self._execute(book, taker, takers, maker, makers, level.price)
+                    )
+                if taker.remaining <= 0:
+                    break
+        return trades
+
+    def _execute(
+        self,
+        book: InstrumentBook,
+        taker: Order,
+        takers: BookSide,
+        maker: Order,
+        makers: BookSide,
+        price: float,
+    ) -> Trade:
+        """One execution: fill both orders, charge both, move four balances."""
+        qty = min(taker.remaining, maker.remaining)
+        makers.fill(maker, qty)
+        takers.fill(taker, qty)
+
+        value = qty * price
+        taker_delta = self._charge(taker, value)
+        maker_delta = self._charge(maker, value)
+        book.last_price = price
+
+        if taker.side is Side.BID:
+            bid, ask = taker, maker
+            bid_delta, ask_delta = taker_delta, maker_delta
+        else:
+            bid, ask = maker, taker
+            bid_delta, ask_delta = maker_delta, taker_delta
+        self._settle(book, bid, ask, qty, value, bid_delta, ask_delta)
+
+        trade_id = self.next_trade_id()
+        if self.recording:
+            self.emit(
+                Filled(
+                    seq=self.next_seq(),
+                    timestamp=self.time,
+                    instrument=book.symbol,
+                    trade_id=trade_id,
+                    price=price,
+                    qty=qty,
+                    taker_side=taker.side,
+                    bid_idNum=bid.idNum,
+                    bid_tid=bid.tid,
+                    bid_fulfilled=bid.fulfilled,
+                    bid_value=bid.value,
+                    bid_commission=bid.commission,
+                    bid_commission_delta=bid_delta,
+                    ask_idNum=ask.idNum,
+                    ask_tid=ask.tid,
+                    ask_fulfilled=ask.fulfilled,
+                    ask_value=ask.value,
+                    ask_commission=ask.commission,
+                    ask_commission_delta=ask_delta,
+                )
+            )
+        return Trade(
+            trade_id=trade_id,
+            timestamp=self.time,
+            instrument=book.symbol,
+            price=price,
+            qty=qty,
+            taker_side=taker.side,
+            bid_idNum=bid.idNum,
+            bid_tid=bid.tid,
+            ask_idNum=ask.idNum,
+            ask_tid=ask.tid,
+        )
+
+    def _cancel(self, order: Order, reason: CancelReason) -> None:
+        """Take `order` out of the book and record why it left.
+
+        Shared by the caller's cancel and by the engine's own cancellation of
+        an IOC remainder; `reason` is what tells a replayer which of the two
+        it is re-issuing and which it re-derives.
+        """
+        if order.resting:
+            self.book(order.instrument).side(order.side).remove(order)
+        remaining = order.remaining
+        order.cancelled = True
+        order.cancel_reason = reason
+        if self.recording:
+            self.emit(
+                Cancelled(
+                    seq=self.next_seq(),
+                    timestamp=self.time,
+                    idNum=order.idNum,
+                    tid=order.tid,
+                    instrument=order.instrument,
+                    side=order.side,
+                    price=order.price,
+                    fulfilled=order.fulfilled,
+                    remaining=remaining,
+                    reason=reason,
+                )
+            )
+
+    # -- the ledgers -------------------------------------------------------
+
+    def balance(self, tid: int, symbol: str) -> float:
+        """`tid`'s holding of `symbol` -- an instrument or a currency.
+
+        Zero before any movement, and freely negative afterwards: balances
+        record what happened and gate nothing (`trader-balances`).
+        """
+        return self._balances.get((tid, symbol), 0.0)
+
+    def holdings(self) -> Iterator[tuple[int, str, float]]:
+        """Every `(tid, symbol, amount)` the ledger has moved."""
+        for (tid, symbol), amount in self._balances.items():
+            yield tid, symbol, amount
+
+    def _charge(self, order: Order, value: float) -> float:
+        """Add one fill to `order`'s totals; return the commission increment.
+
+        Cumulative recompute, not per-fill accrual: the formula is applied to
+        the order's whole (Q, V) and only the difference is charged. Two fills
+        of 3 then 2 @ 100 under min=2.5 charge 2.5 in total, not 5.0 -- the
+        second fill's increment is zero.
+        """
+        order.value += value
+        charged = commission_for(self.trader(order.tid), order.fulfilled, order.value)
+        delta = charged - order.commission
+        order.commission = charged
+        return delta
+
+    def _settle(
+        self,
+        book: InstrumentBook,
+        bid: Order,
+        ask: Order,
+        qty: int,
+        value: float,
+        bid_delta: float,
+        ask_delta: float,
+    ) -> None:
+        """The four movements of one trade, and the two commission debits.
+
+        The rule stated once in `PyLOB.events` and applied here and in every
+        sink. Commission settles in the instrument's currency, so an
+        instrument with no declared currency moves its own leg and nothing
+        else -- the fill is still recorded and the currency leg is recoverable
+        from it.
+        """
+        self._credit(bid.tid, book.symbol, float(qty))
+        self._credit(ask.tid, book.symbol, -float(qty))
+        if book.currency is None:
+            return
+        self._credit(bid.tid, book.currency, -(value + bid_delta))
+        self._credit(ask.tid, book.currency, value - ask_delta)
+
+    def _credit(self, tid: int, symbol: str, amount: float) -> None:
+        """Move one balance. No check of any kind: this records, it does not vet."""
+        key = (tid, symbol)
+        self._balances[key] = self._balances.get(key, 0.0) + amount
 
     # -- the book ----------------------------------------------------------
 
@@ -968,6 +1537,19 @@ class OrderBook:
 
     # -- internals ---------------------------------------------------------
 
+    def _advance(self, timestamp: float | None) -> float:
+        """Move the clock on by one, or to the caller's value on the replay path.
+
+        Every operation stamps its events with `self.time`, so this is what
+        makes the fills and the IOC cancellation of a submission carry that
+        submission's timestamp. Recorded data, never a sort key.
+        """
+        if timestamp is None:
+            self.time += 1
+        else:
+            self.time = timestamp
+        return self.time
+
     def _assign_idNum(self, idNum: int | None) -> int:
         """Allocate or accept an identifier, keeping it unique for all time.
 
@@ -988,6 +1570,66 @@ class OrderBook:
         if idNum >= self._next_idNum:
             self._next_idNum = idNum + 1
         return idNum
+
+
+def _check_qty(qty: int) -> None:
+    """A quantity the engine will work with, or an `InvalidOrder` saying why not.
+
+    `order-lifecycle`: an invalid submission raises a library exception and
+    the API never terminates the host process -- the legacy engine called
+    `sys.exit` here (lob-ihv). `bool` is excluded because `True` is an `int`
+    and an order for `True` units is a mistake, not a quantity.
+    """
+    if not isinstance(qty, int) or isinstance(qty, bool):
+        raise InvalidOrder("quantity must be an integer, got %r" % (qty,))
+    if qty <= 0:
+        raise InvalidOrder("quantity must be positive, got %r" % (qty,))
+
+
+def _required(update: dict[str, Any], field_name: str, idNum: int) -> Any:
+    """One field of a modification, or an `InvalidOrder` naming what is missing.
+
+    A modification states what the order should now be, so the fields it can
+    change are named even when they do not change -- `None` says "leave this
+    one alone". Absence is a malformed update and is refused as one, rather
+    than defaulting to something the caller did not ask for (lob-crf).
+    """
+    try:
+        return update[field_name]
+    except KeyError:
+        raise InvalidOrder(
+            "modifying order %r needs a %r (None leaves it unchanged)"
+            % (idNum, field_name)
+        ) from None
+
+
+def _at(level: PriceLevel, index: int) -> Order | None:
+    """The `index`-th order in `level`'s queue, or None past the end.
+
+    Matching looks past the front only to step over orders the self-matching
+    gate skipped, so `index` is 0 for every fill of an ordinary workload and
+    this is `first()` with an offset rather than a scan.
+    """
+    if index == 0:
+        return level.first()
+    for position, order in enumerate(level):
+        if position == index:
+            return order
+    return None
+
+
+def _report(trades: list[Trade], tid: int) -> None:
+    """Print one line per trade, in the legacy engine's format.
+
+    `verbose` output is read by eyeballs and by nothing else; keeping the
+    shape keeps example output free of gratuitous diff noise.
+    """
+    for trade in trades:
+        counterparty = trade.ask_tid if trade.taker_side is Side.BID else trade.bid_tid
+        print(
+            ">>> TRADE \nt=%s $%f n=%d p1=%d p2=%d"
+            % (trade.timestamp, trade.price, trade.qty, counterparty, tid)
+        )
 
 
 def _as_side(side: Side | str) -> Side:
