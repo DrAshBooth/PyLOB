@@ -22,20 +22,25 @@ stage() {
 # Run example.py against a scratch copy of src/ with a freshly built schema.
 # The committed src/lob.db is never touched.
 smoke() {
-  local tmp rc=0
+  local tmp py rc=0
+  # Resolve the project interpreter before cd-ing away: `uv run` inside the
+  # scratch dir would look for a project there and miss this one. Without
+  # this the smoke stage runs whatever python3 is on PATH, which need not be
+  # the version uv.lock pins for the other stages.
+  py=$(uv run python -c 'import sys; print(sys.executable)') || return $?
   tmp=$(mktemp -d "${TMPDIR:-/tmp}/pylob-smoke.XXXXXX")
   cp -R src/. "$tmp/"
   rm -f "$tmp/lob.db"
   (
     cd "$tmp"
-    python3 - <<'EOF'
+    "$py" - <<'EOF'
 import sqlite3
 
 conn = sqlite3.connect("lob.db")
 conn.executescript(open("create_lob.sql").read())
 conn.close()
 EOF
-    python3 example.py > /dev/null
+    "$py" example.py > /dev/null
   ) || rc=$?
   rm -rf "$tmp"
   return $rc
