@@ -13,6 +13,11 @@ the engine under test, and the suite is run once per registered engine.
 import pytest
 
 
+# --------------------------------------------------------------------------
+# Requirement: Market orders are immediate-or-cancel
+# --------------------------------------------------------------------------
+
+
 def test_trades_price_at_the_maker(engine):
     """Market orders are immediate-or-cancel / Trades price at the maker."""
     engine.limit("ask", 3, 101, tid=100)
@@ -39,3 +44,273 @@ def test_market_remainder_is_cancelled(engine):
     assert taker.cancelled
     assert not taker.resting
     assert engine.snapshot("bid") == ()
+
+
+@pytest.mark.engine_xfail(
+    "legacy",
+    "lob-0bl: with no opposite-side liquidity the legacy engine rests the "
+    "whole market order instead of cancelling it",
+)
+def test_market_order_on_an_empty_opposite_side(engine):
+    """Market orders are immediate-or-cancel / Market order on an empty opposite side."""
+    engine.limit("bid", 4, 99, tid=100)
+    before = engine.snapshot("bid")
+
+    taker = engine.market("bid", 6, tid=101)
+
+    assert taker.trades == ()
+    assert taker.fulfilled == 0
+    assert taker.cancelled
+    assert not taker.resting
+    # The book is untouched: the market order left no entry of its own, and
+    # the resting bid is exactly where it was.
+    assert engine.snapshot("bid") == before
+    assert engine.snapshot("ask") == ()
+
+
+# --------------------------------------------------------------------------
+# Requirement: Order identifiers are unique and stable
+# --------------------------------------------------------------------------
+
+
+def test_cancel_targets_exactly_one_order(engine):
+    """Order identifiers are unique and stable / Cancel targets exactly one order."""
+    first = engine.limit("bid", 5, 100, tid=100)
+    second = engine.limit("bid", 5, 100, tid=101)
+    third = engine.limit("bid", 5, 100, tid=102)
+
+    engine.cancel(second)
+
+    assert second.cancelled
+    assert not second.resting
+    assert not first.cancelled and first.resting
+    assert not third.cancelled and third.resting
+    assert [entry.idNum for entry in engine.snapshot("bid")] == [
+        first.idNum,
+        third.idNum,
+    ]
+
+
+@pytest.mark.engine_xfail(
+    "legacy",
+    "lob-0rb: the legacy engine silently no-ops on a cancel for an identifier "
+    "no order has",
+)
+def test_cancel_with_an_unknown_identifier_raises(engine):
+    """Order identifiers are unique and stable / Unknown identifier raises."""
+    resting = engine.limit("bid", 5, 100, tid=100)
+    before = engine.snapshot("bid")
+
+    with pytest.raises(Exception):
+        engine.cancel(resting.idNum + 4242, side="bid")
+
+    assert engine.snapshot("bid") == before
+
+
+@pytest.mark.engine_xfail(
+    "legacy",
+    "lob-0rb: the legacy engine silently no-ops on a modify for an identifier "
+    "no order has",
+)
+def test_modify_with_an_unknown_identifier_raises(engine):
+    """Order identifiers are unique and stable / Unknown identifier raises."""
+    resting = engine.limit("bid", 5, 100, tid=100)
+    before = engine.snapshot("bid")
+
+    with pytest.raises(Exception):
+        engine.modify(resting.idNum + 4242, qty=3, price=100, side="bid")
+
+    assert engine.snapshot("bid") == before
+
+
+@pytest.mark.engine_xfail(
+    "legacy",
+    "lob-7e7: the legacy engine's idNum counter (`nextQuoteID`) starts from 0 "
+    "on every construction and is never seeded from the database, so the "
+    "first order after a reload reuses the first identifier ever issued",
+)
+def test_identifiers_stay_unique_across_a_reload(engine):
+    """Order identifiers are unique and stable / requirement statement.
+
+    "unique within the book's lifetime, including across reloads of persisted
+    state" -- the clause has no scenario of its own, and `reopen()` is the
+    fixture surface for it.
+    """
+    first = engine.limit("bid", 5, 100, tid=100)
+    issued = first.idNum
+
+    engine.reopen()
+    later = engine.limit("bid", 3, 99, tid=101)
+
+    assert later.idNum != issued
+    assert [entry.idNum for entry in engine.snapshot("bid")] == [issued, later.idNum]
+
+
+@pytest.mark.engine_xfail(
+    "legacy",
+    "lob-a17: the legacy engine accepts a second order carrying an idNum "
+    "already in the book -- `trade_order.idNum` has a plain index, not a "
+    "unique one -- so two orders answer to one identifier",
+)
+def test_externally_supplied_duplicate_identifier_is_rejected(engine):
+    """Order identifiers are unique and stable / Externally supplied duplicate is rejected."""
+    engine.limit("bid", 5, 100, tid=100, idNum=7, timestamp=1)
+
+    with pytest.raises(Exception):
+        engine.limit("bid", 3, 99, tid=101, idNum=7, timestamp=2)
+
+    assert [(entry.idNum, entry.qty) for entry in engine.snapshot("bid")] == [(7, 5)]
+
+
+# --------------------------------------------------------------------------
+# Requirement: Invalid submissions raise library exceptions
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("qty", [0, -3])
+@pytest.mark.engine_xfail(
+    "legacy",
+    "lob-ihv: the legacy engine calls sys.exit on an invalid submission "
+    "instead of raising a library exception",
+)
+def test_non_positive_quantity_raises(engine, qty):
+    """Invalid submissions raise library exceptions / Non-positive quantity."""
+    engine.limit("ask", 5, 101, tid=100)
+    before = engine.snapshot("ask")
+
+    # An `Exception`, not a `BaseException`: a library error the caller can
+    # catch, never a process exit.
+    with pytest.raises(Exception):
+        engine.limit("bid", qty, 101, tid=101)
+
+    assert engine.snapshot("ask") == before
+    assert engine.trades() == ()
+
+
+# --------------------------------------------------------------------------
+# Requirement: Modify is validated and priority-aware
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.engine_xfail(
+    "legacy",
+    "lob-0rb: the legacy engine silently no-ops on a modify addressed with "
+    "the wrong side",
+)
+def test_modify_with_a_side_mismatch_raises(engine):
+    """Modify is validated and priority-aware / Side mismatch raises."""
+    resting = engine.limit("bid", 5, 100, tid=100)
+
+    with pytest.raises(Exception):
+        engine.modify(resting, qty=9, side="ask")
+
+    assert resting.side == "bid"
+    assert resting.qty == 5
+    assert resting.price == 100
+    assert resting.resting
+
+
+def test_quantity_reduced_below_fills_clamps(engine):
+    """Modify is validated and priority-aware / Quantity reduced below fills clamps."""
+    resting = engine.limit("bid", 10, 100, tid=100)
+    engine.limit("ask", 6, 100, tid=101)
+    assert resting.fulfilled == 6
+
+    engine.modify(resting, qty=4)
+
+    assert resting.qty == 6
+    assert resting.fulfilled == 6
+    assert not resting.resting
+    assert engine.snapshot("bid") == ()
+
+
+@pytest.mark.engine_xfail(
+    "legacy",
+    "lob-pn3: the legacy engine keeps event_dt on a price change, so a "
+    "round trip away from the price and back keeps the original time priority",
+)
+def test_price_change_loses_time_priority(engine):
+    """Modify is validated and priority-aware / Price change loses time priority."""
+    first = engine.limit("bid", 5, 100, tid=100)
+    second = engine.limit("bid", 5, 100, tid=101)
+    assert [entry.idNum for entry in engine.snapshot("bid")] == [
+        first.idNum,
+        second.idNum,
+    ]
+
+    engine.modify(first, price=99)
+    engine.modify(first, price=100)
+
+    assert [entry.idNum for entry in engine.snapshot("bid")] == [
+        second.idNum,
+        first.idNum,
+    ]
+
+
+def test_quantity_decrease_keeps_time_priority(engine):
+    """Modify is validated and priority-aware / Quantity decrease keeps time priority."""
+    first = engine.limit("bid", 8, 100, tid=100)
+    second = engine.limit("bid", 5, 100, tid=101)
+
+    engine.modify(first, qty=3)
+
+    assert first.qty == 3
+    assert [entry.idNum for entry in engine.snapshot("bid")] == [
+        first.idNum,
+        second.idNum,
+    ]
+
+    # ... and priority is the matching order, not just the listing order.
+    taker = engine.limit("ask", 3, 100, tid=102)
+    assert [trade.bid for trade in taker.trades] == [first.idNum]
+
+
+# --------------------------------------------------------------------------
+# Requirement: Price-time priority is deterministic
+# --------------------------------------------------------------------------
+
+
+def _replay_same_timestamp(engine):
+    """Two asks at one price carrying one timestamp, then a taker for one of them.
+
+    The identifiers descend (200 then 100) so that an engine ordering by
+    identifier rather than by arrival gets the opposite answer.
+    """
+    first = engine.limit("ask", 3, 101, tid=100, idNum=200, timestamp=17)
+    second = engine.limit("ask", 3, 101, tid=101, idNum=100, timestamp=17)
+    taker = engine.market("bid", 3, tid=102)
+    return first, second, taker
+
+
+def test_same_timestamp_arrivals_keep_arrival_order(engine_factory):
+    """Price-time priority is deterministic / Same-timestamp arrivals keep arrival order."""
+    # "on every replay": the same replay on two independent books has to reach
+    # the same answer, so a tie cannot be left to whatever order the storage
+    # happens to return.
+    for _ in range(2):
+        first, second, taker = _replay_same_timestamp(engine_factory())
+
+        assert [(trade.ask, trade.qty) for trade in taker.trades] == [(first.idNum, 3)]
+        assert first.fulfilled == 3
+        assert second.fulfilled == 0
+
+
+# --------------------------------------------------------------------------
+# Requirement: Prices are quantized to the tick
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.engine_xfail(
+    "legacy",
+    "lob-5rt.2: the legacy engine quantizes with round(price, "
+    "int(log10(1/tick_size))), which is decimal-only -- tick 0.05 gives "
+    "rounder=1 and clips 100.03 to 100.0",
+)
+def test_non_decimal_tick(engine_factory):
+    """Prices are quantized to the tick / Non-decimal tick."""
+    engine = engine_factory(tick_size=0.05)
+
+    resting = engine.limit("bid", 5, 100.03, tid=100)
+
+    assert resting.price == pytest.approx(100.05)
+    assert [entry.price for entry in engine.snapshot("bid")] == [pytest.approx(100.05)]
