@@ -39,7 +39,6 @@ committed `src/lob.db` is never opened.
 """
 
 import sqlite3
-import sys
 from dataclasses import dataclass
 from importlib.util import find_spec
 from itertools import count
@@ -47,16 +46,10 @@ from pathlib import Path
 from typing import Callable, NamedTuple, Optional
 
 import pytest
+from PyLOB import OrderBook
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SRC = REPO_ROOT / "src"
-
-# `tests/conftest.py` does this too; repeating it keeps this module importable
-# on its own terms rather than by ancestor-conftest side effect.
-if str(SRC) not in sys.path:
-    sys.path.insert(0, str(SRC))
-
-from PyLOB import OrderBook  # noqa: E402  (import needs the sys.path above)
 
 SCHEMA = SRC / "create_lob.sql"
 

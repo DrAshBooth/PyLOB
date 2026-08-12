@@ -4,9 +4,8 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-# Pinned until pyproject.toml lands; then these move into uv dev dependencies.
-RUFF="uvx ruff@0.9.10"
-PYTEST="uvx pytest@8.3.5"
+# Tool versions come from uv.lock (dev dependency group); `uv run` syncs the
+# environment first, so a clean checkout needs nothing but uv on PATH.
 
 start=$(date +%s)
 fail=0
@@ -43,11 +42,9 @@ EOF
 }
 
 # === checks: do not add to this block without asking the user first ===
-stage "format" $RUFF format --check src
-stage "lint"   $RUFF check src
-# -o addopts= overrides setup.cfg's [tool:pytest] --cov pylob, which needs
-# pytest-cov and an installed package; drop it once pyproject.toml lands.
-stage "test"   $PYTEST -q -o addopts= tests
+stage "format" uv run ruff format --check src
+stage "lint"   uv run ruff check src
+stage "test"   uv run pytest -q tests
 stage "smoke"  smoke
 # === end checks ===
 

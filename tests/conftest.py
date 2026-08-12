@@ -1,8 +1,10 @@
 """Shared pytest fixtures for the PyLOB test suite.
 
-The package is not installed, so `src/` is prepended to `sys.path` here --
-resolved from this file, never from the current working directory, so the
-suite runs the same from anywhere.
+`PyLOB` is imported from the installed package -- `uv sync` installs the
+project in editable mode, so the suite runs against the working tree without
+any `sys.path` surgery. `create_lob.sql` is not package data, so it is still
+resolved from the repo root relative to this file, never from the current
+working directory.
 
 Every book is backed by a fresh sqlite *file* under pytest's `tmp_path`,
 built from `src/create_lob.sql`. A file (rather than `:memory:`) is how the
@@ -11,19 +13,14 @@ inspection. The committed `src/lob.db` is never opened, read or written.
 """
 
 import sqlite3
-import sys
 from itertools import count
 from pathlib import Path
 
 import pytest
+from PyLOB import OrderBook
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SRC = REPO_ROOT / "src"
-
-if str(SRC) not in sys.path:
-    sys.path.insert(0, str(SRC))
-
-from PyLOB import OrderBook  # noqa: E402  (import needs the sys.path above)
 
 SCHEMA = SRC / "create_lob.sql"
 

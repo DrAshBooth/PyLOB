@@ -4,5 +4,8 @@ __pycache__/
 *.egg-info
 .DS_Store
 
+# uv: the environment is a build artifact, uv.lock is not (it is committed)
+.venv/
+
 # Claude Code: skills are tracked, per-session scratch is not
 .claude/worktrees/

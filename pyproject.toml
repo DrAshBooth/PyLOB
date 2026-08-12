@@ -1,0 +1,63 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+# Not published to PyPI: the `pylob` name there belongs to an unrelated
+# project. Install from GitHub -- see README.md.
+[project]
+name = "PyLOB"
+version = "0.1.0"
+description = "Fast limit order book simulation with price-time priority, for research"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE.md" }
+authors = [{ name = "Ash Booth" }]
+keywords = ["limit order book", "matching engine", "market simulation", "finance"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Office/Business :: Financial",
+    "Topic :: Scientific/Engineering",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/DrAshBooth/PyLOB"
+Repository = "https://github.com/DrAshBooth/PyLOB"
+Documentation = "https://github.com/DrAshBooth/PyLOB/wiki"
+Issues = "https://github.com/DrAshBooth/PyLOB/issues"
+
+# Pinned exactly: these are the versions ./verify enforced as `uvx ruff@0.9.10`
+# and `uvx pytest@8.3.5` before the tools moved into the lockfile.
+[dependency-groups]
+dev = ["ruff==0.9.10", "pytest==8.3.5"]
+
+# Ruff's defaults are what ./verify has been enforcing; they are written out
+# here so a future ruff release cannot change the rule set underneath us.
+# `line-length` carries over from setup.cfg's flake8 `max_line_length = 88`;
+# its E203/W503 ignores were black-compatibility workarounds with no ruff
+# equivalent (W503 does not exist in ruff, E203 is not in the default set).
+[tool.ruff]
+line-length = 88
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
+
+# Inherited from setup.cfg's [tool:pytest], minus its addopts: `--cov pylob`
+# needed pytest-cov and forced every caller to pass `-o addopts=`, and
+# `--verbose` fought ./verify's `-q`. `norecursedirs` named build dirs this
+# repo does not have.
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+# The engine loads every *.sql sibling of orderbook.py as an attribute at
+# import time, so the .sql files are package data, not build inputs: an
+# installed copy without them is broken. Listed explicitly rather than left to
+# the backend's default file selection.
+[tool.hatch.build.targets.wheel]
+sources = ["src"]
+include = ["src/PyLOB/**/*.py", "src/PyLOB/**/*.sql"]
