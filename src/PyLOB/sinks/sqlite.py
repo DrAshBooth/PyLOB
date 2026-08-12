@@ -57,15 +57,58 @@ performance knob and nothing else.
 Failure
 -------
 
-`consume` never raises: the sink is optional and may not take the engine down
-with it. A batch that fails to write is dropped (retrying a poison batch
-would grow the buffer without bound), the error is logged and remembered, and
-`close` re-raises it once the tail has been written -- losing data silently
-is the one outcome worse than losing the session.
+Losing data silently is the one outcome worse than losing the session, and
+nothing below relies on the process living long enough to be told.
 
-If the process dies with a partial buffer, the events since the last flush
-are lost and everything before them is durable. The log and the projections
-can never disagree: they commit together or not at all.
+`consume` does not raise on the engine's account: the sink is optional and may
+not take the engine down with it. The single exception is `consume` *after*
+`close`, which raises `RuntimeError` -- there is nowhere left to record, so
+accepting the event would be the silent discard this sink exists to prevent.
+
+A batch that fails to write is not dropped whole. The transaction rolls back
+and the sink re-attempts the same events one at a time, which is precisely
+what a `buffer_size=1` sink would have written (see Buffering) -- so the
+salvage path cannot produce a database the ordinary path could not. Whatever
+writes, writes. Whatever still fails is *recorded as lost* in `event_loss`,
+one row per contiguous run of missing `seq`, carrying the error that stopped
+it. One poison event costs one event rather than the 511 around it, and a
+failure that was merely transient costs nothing at all.
+
+`flush` raises if and only if events were lost, and remembers the error
+exactly as `consume` does. `close` re-raises it on *every* call, not merely
+the first, so a session that lost something cannot end quietly however many
+times it is closed.
+
+The file says so independently, which is the part that survives the process
+never reaching `close`. `check_log` -- which `read_events` runs before
+yielding anything -- refuses a log whose `seq` values do not run from 0
+without a gap, refuses one carrying any `event_loss` row, and refuses a
+`stream_version` or `user_version` this module does not implement. A
+recording that lost a batch, and a log truncated in the middle by anything
+else, cannot masquerade as a complete one.
+
+One loss remains undetectable from the file alone: a lost *tail*. If the
+process dies with a partial buffer, those events are gone and what survives
+is a complete contiguous prefix, indistinguishable from a session that ended
+there. That is the price of buffering, and it is the reason a loss on the
+write path leaves a marker rather than relying on the gap it makes.
+
+The log and the projections can never disagree: every write path -- whole
+batch and salvaged single event alike -- puts both in one transaction, so
+they commit together or not at all. Re-folding the recorded log into a fresh
+database reproduces the projections exactly, losses included.
+
+Durability
+----------
+
+WAL plus `synchronous = NORMAL` means a committed transaction survives the
+*process* dying. It does not promise to survive an OS crash or power loss,
+either of which may take the most recent commits with it -- the right trade
+for analytics data the engine never reads back, but not the same claim as
+"durable". WAL is also requested rather than guaranteed: some filesystems
+refuse it. The resulting mode is checked, warned about when it is not `wal`,
+and readable as `journal_mode`, because a durability story nobody verified is
+not one.
 
 Scope
 -----
@@ -73,8 +116,10 @@ Scope
 The sink records; it does not referee. Foreign keys are declared for
 documentation and left unenforced (SQLite's default), so a hand-built or
 truncated stream still records rather than erroring on the engine's behalf.
-One database per session -- `seq` is the log's primary key, so pointing a
-second session at a written file fails on the first flush.
+One database per session -- `seq` is the log's primary key, so a second
+session pointed at a written file cannot write an event: the first flush
+fails, every event of it fails again on salvage, and the whole batch is
+recorded as lost rather than half-merged into somebody else's history.
 """
 
 from __future__ import annotations
@@ -83,13 +128,16 @@ import json
 import logging
 import os
 import sqlite3
+import time
 from collections.abc import Iterable, Iterator, Sequence
+from contextlib import suppress
 from dataclasses import asdict, dataclass, field
 from itertools import groupby
 from typing import Any
 
 from ..events import (
     EVENT_BY_KIND,
+    STREAM_VERSION,
     Accepted,
     Cancelled,
     CancelReason,
@@ -104,7 +152,15 @@ from ..events import (
     is_replayable,
 )
 
-__all__ = ["SQLiteSink", "SCHEMA_VERSION", "SCHEMA", "decode_event", "read_events"]
+__all__ = [
+    "SQLiteSink",
+    "SCHEMA_VERSION",
+    "SCHEMA",
+    "EventLogError",
+    "check_log",
+    "decode_event",
+    "read_events",
+]
 
 _log = logging.getLogger(__name__)
 
@@ -112,7 +168,11 @@ _log = logging.getLogger(__name__)
 #: when a written database would be read wrongly by this module. Distinct from
 #: `events.STREAM_VERSION`, which versions what the engine emits: the same
 #: stream can be recorded by two schema versions.
-SCHEMA_VERSION = 1
+#:
+#: 2 added `event_loss` and `orders.currency`. A version-1 file has no way to
+#: say whether anything was lost, so it is refused rather than read as though
+#: an absent table meant an intact recording.
+SCHEMA_VERSION = 2
 
 #: Default events per transaction. Tuning only; design.md leaves the number to
 #: benchmark data, and the resulting database does not depend on it.
@@ -129,6 +189,22 @@ CREATE TABLE IF NOT EXISTS event (
     payload    TEXT    NOT NULL
 );
 CREATE INDEX IF NOT EXISTS event_kind ON event (kind);
+
+-- Events this sink accepted and could not write, so that a reader can see the
+-- hole without having watched the session die. One row per contiguous run of
+-- lost `seq`; `error` is what stopped the first event of the run. Every column
+-- is a value this module supplies, so recording a loss cannot itself fail on a
+-- constraint -- and the table has no primary key, so it cannot fail on a
+-- conflict either. Empty is the only state that means "nothing was lost".
+CREATE TABLE IF NOT EXISTS event_loss (
+    first_seq   INTEGER NOT NULL,
+    last_seq    INTEGER NOT NULL,
+    count       INTEGER NOT NULL,
+    -- Wall clock at the moment of the loss, not an event timestamp: the events
+    -- it describes are precisely the ones that are not here to be asked.
+    recorded_at REAL    NOT NULL,
+    error       TEXT    NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS session (
     seq            INTEGER PRIMARY KEY,
@@ -157,6 +233,11 @@ CREATE TABLE IF NOT EXISTS orders (
     idNum         INTEGER PRIMARY KEY,
     tid           INTEGER NOT NULL REFERENCES trader (tid),
     instrument    TEXT    NOT NULL REFERENCES instrument (symbol),
+    -- The instrument's currency as configured when this order was accepted.
+    -- Denormalised on purpose: commission is reported per currency, and the
+    -- instrument's current currency is the wrong answer for an order charged
+    -- before it changed. NULL when no `InstrumentConfigured` had arrived.
+    currency      TEXT,
     side          TEXT    NOT NULL,
     order_type    TEXT    NOT NULL,
     -- Quantized working price; NULL for a market order.
@@ -219,16 +300,22 @@ CREATE VIEW IF NOT EXISTS resting_order AS
 
 -- Commission charged per trader per currency. Per the `commissions` contract
 -- the charge is a function of an order's cumulative fills, so it sums over
--- orders, not over trades.
+-- orders, not over trades. The currency is the order's own, stamped when it
+-- was accepted: joining `instrument` would report every historical commission
+-- under whatever currency the instrument was last configured with.
 CREATE VIEW IF NOT EXISTS trader_commission AS
-    SELECT o.tid AS tid, i.currency AS currency, SUM(o.commission) AS commission
-    FROM orders o
-    JOIN instrument i ON i.symbol = o.instrument
-    GROUP BY o.tid, i.currency;
+    SELECT tid, currency, SUM(commission) AS commission
+    FROM orders
+    GROUP BY tid, currency;
 """
 
 _EVENT_INSERT = """
 INSERT INTO event (seq, kind, timestamp, replayable, payload)
+VALUES (?, ?, ?, ?, ?)
+"""
+
+_LOSS_INSERT = """
+INSERT INTO event_loss (first_seq, last_seq, count, recorded_at, error)
 VALUES (?, ?, ?, ?, ?)
 """
 
@@ -261,10 +348,10 @@ ON CONFLICT (tid) DO UPDATE SET
 """
 
 _ORDER_INSERT = """
-INSERT INTO orders (idNum, tid, instrument, side, order_type, price, qty,
-                    priority, status, accepted_seq, accepted_ts,
+INSERT INTO orders (idNum, tid, instrument, currency, side, order_type,
+                    price, qty, priority, status, accepted_seq, accepted_ts,
                     last_seq, last_ts)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?)
 """
 
 # `ELSE status` keeps a cancellation sticky: an order cancelled and then
@@ -357,6 +444,27 @@ def _runs(statements: Iterable[_Statement]) -> Iterator[tuple[str, list[_Params]
         yield sql, [params for _, params in group]
 
 
+def _gaps(lost: Iterable[tuple[int, str]]) -> list[tuple[int, int, int, str]]:
+    """Group lost `(seq, error)` pairs into contiguous runs of `seq`.
+
+    Returns `(first_seq, last_seq, count, error)` -- one `event_loss` row
+    each. A whole batch failing for one reason becomes a single row naming the
+    range rather than 512 rows naming the same error; scattered failures stay
+    separate, because a reader needs to know which `seq` are gone and not
+    merely how many. `error` is the one that stopped the run's first event:
+    they are almost always the same error, and the first is the one whose
+    cause is not yet obscured by the ones after it.
+    """
+    runs: list[tuple[int, int, int, str]] = []
+    for seq, message in lost:
+        if runs and seq == runs[-1][1] + 1:
+            first, _, count, error = runs[-1]
+            runs[-1] = (first, seq, count + 1, error)
+        else:
+            runs.append((seq, seq, 1, message))
+    return runs
+
+
 class SQLiteSink:
     """Records an event stream into a SQLite database, in batches.
 
@@ -395,10 +503,20 @@ class SQLiteSink:
         # isolation_level=None: no implicit transactions, so a flush is one
         # explicit BEGIN/COMMIT and nothing sits half-open between flushes.
         self._conn = sqlite3.connect(os.fspath(path), isolation_level=None)
-        self._conn.execute("PRAGMA journal_mode = WAL")
-        # NORMAL survives process death (the point of a recording sink); only
-        # an OS or power failure can lose a committed transaction, which is
-        # the right trade for analytics data the engine does not read back.
+        # The pragma reports the mode it actually got, and a filesystem may
+        # refuse WAL: read the answer rather than assume it.
+        row = self._conn.execute("PRAGMA journal_mode = WAL").fetchone()
+        self._journal_mode = str(row[0]).lower() if row else "unknown"
+        if self._journal_mode != "wal":
+            _log.warning(
+                "SQLiteSink asked for WAL and got journal_mode=%r: a reader "
+                "sharing the file may block, and the durability of a commit "
+                "is whatever this mode gives",
+                self._journal_mode,
+            )
+        # NORMAL survives process death (the point of a recording sink); an OS
+        # or power failure may still lose recent commits, which is the right
+        # trade for analytics data the engine does not read back.
         self._conn.execute("PRAGMA synchronous = NORMAL")
         self._check_schema_version()
         self._conn.executescript(SCHEMA)
@@ -406,37 +524,42 @@ class SQLiteSink:
     # -- the sink protocol -------------------------------------------------
 
     def consume(self, event: Event, /) -> None:
-        """Record one event. Never raises; see the module docstring.
+        """Record one event.
+
+        Does not raise on a write failure -- that is `flush`'s job, and the
+        engine must not care. Does raise if the sink is closed: the event
+        cannot be recorded, cannot be recovered, and cannot be reported at
+        `close` either, since `close` has already happened. Accepting it would
+        be exactly the silent discard this sink exists to prevent.
 
         The matching thread pays for one list append and, every `buffer_size`
         events, one transaction. Encoding happens in the flush, not here.
         """
+        if self._closed:
+            raise RuntimeError(
+                f"SQLiteSink is closed: it cannot record {type(event).__name__} "
+                f"at seq {event.seq}"
+            )
         self._buffer.append(event)
         if len(self._buffer) >= self._buffer_size:
-            try:
+            with suppress(Exception):  # `flush` has already remembered it
                 self.flush()
-            except Exception as exc:  # the engine must not care
-                if self._error is None:
-                    self._error = exc
-                _log.exception("SQLiteSink dropped a batch of events")
 
     def close(self) -> None:
         """Flush the tail and close the database. Idempotent.
 
-        Raises if anything was lost: the tail failing to write, or an earlier
-        batch that `consume` had to drop. A partial recording that reports
-        itself complete is worse than no recording.
+        Raises if anything was lost -- the tail failing to write, or an
+        earlier batch a `consume` could not salvage -- and raises it again on
+        every later call, because a second `close` that returns quietly is a
+        recording reporting itself complete when it is not.
         """
-        if self._closed:
-            return
-        self._closed = True
-        try:
-            self.flush()
-        except Exception as exc:
-            if self._error is None:
-                self._error = exc
-        finally:
-            self._conn.close()
+        if not self._closed:
+            self._closed = True
+            try:
+                with suppress(Exception):  # `flush` has already remembered it
+                    self.flush()
+            finally:
+                self._conn.close()
         if self._error is not None:
             raise self._error
 
@@ -445,15 +568,44 @@ class SQLiteSink:
     def flush(self) -> None:
         """Write everything buffered, in one transaction.
 
-        Unlike `consume`, this raises: a caller who asks for a flush wants to
-        know whether it happened. The buffer is cleared either way -- a batch
-        that cannot be written will not be written on the next attempt
-        either, and retaining it would grow the buffer without bound.
+        Raises if and only if events were lost -- and remembers the error, so
+        that `close` raises it too however this call's exception was handled.
+        A caller who asks for a flush wants to know whether it happened, and
+        the answer that matters is "is anything missing", not "did the fast
+        path work": a batch that failed and was then salvaged event by event
+        lost nothing and returns normally.
+
+        The buffer is cleared either way. What could not be written is
+        re-attempted immediately, one event at a time, and whatever still
+        fails is recorded in `event_loss`; putting it back in the buffer would
+        only grow it without bound against a write that cannot succeed.
         """
         if not self._buffer:
             return
         buffered, self._buffer = self._buffer, []
-        batch = self._fold(buffered)
+        memo = dict(self._currency)
+        try:
+            self._write(self._fold(buffered))
+        except Exception as exc:
+            # The fold's currency memo is projection state, so a write that
+            # did not commit must not leave it advanced: an
+            # `InstrumentConfigured` that is not in the log must not go on
+            # denominating later fills. Rewound here and re-applied by the
+            # salvage, one committed event at a time.
+            self._currency = memo
+            _log.warning(
+                "SQLiteSink could not write a batch of %d events (%s: %s); "
+                "re-attempting it one event at a time",
+                len(buffered),
+                type(exc).__name__,
+                exc,
+            )
+            if self._salvage(buffered):
+                self._remember(exc)
+                raise
+
+    def _write(self, batch: _Batch) -> None:
+        """Commit one folded batch: log rows and projections, or neither."""
         conn = self._conn
         conn.execute("BEGIN IMMEDIATE")
         try:
@@ -471,8 +623,95 @@ class SQLiteSink:
             conn.executemany(_EVENT_INSERT, batch.events)
             conn.execute("COMMIT")
         except BaseException:
-            conn.execute("ROLLBACK")
+            self._rollback()
             raise
+
+    def _rollback(self) -> None:
+        """Undo a failed write.
+
+        A rollback that itself fails is logged rather than raised: the write's
+        own error is the one worth reporting, and masking it with the failure
+        to clean up after it would hide what went wrong.
+        """
+        try:
+            self._conn.execute("ROLLBACK")
+        except Exception as exc:
+            _log.error("SQLiteSink could not roll back a failed write", exc_info=exc)
+
+    def _salvage(self, buffered: Sequence[Event]) -> int:
+        """Re-attempt a failed batch one event at a time. Returns events lost.
+
+        One transaction per event, which is what a `buffer_size=1` sink does
+        for the same events -- so this cannot write a database the ordinary
+        path could not, and it costs nothing on the path that works. A poison
+        event fails again here and only it is lost; a batch that failed for a
+        reason outside itself (a busy database, a full disk that has since
+        emptied) is written in full and nothing is lost at all.
+
+        What still fails is recorded in `event_loss` before returning, so the
+        hole is on disk whether or not this process reaches `close`.
+        """
+        lost: list[tuple[int, str]] = []
+        for event in buffered:
+            memo = dict(self._currency)
+            try:
+                self._write(self._fold([event]))
+            except Exception as exc:
+                self._currency = memo
+                lost.append((event.seq, f"{type(exc).__name__}: {exc}"))
+        if not lost:
+            _log.warning(
+                "SQLiteSink salvaged all %d events of the failed batch", len(buffered)
+            )
+            return 0
+        _log.error(
+            "SQLiteSink lost %d of %d events (seq %s); recording it in event_loss",
+            len(lost),
+            len(buffered),
+            ", ".join(str(seq) for seq, _ in lost[:10])
+            + ("..." if len(lost) > 10 else ""),
+        )
+        self._record_loss(lost)
+        return len(lost)
+
+    def _record_loss(self, lost: Sequence[tuple[int, str]]) -> None:
+        """Write the `event_loss` rows for events that could not be written.
+
+        Best effort by necessity: the reason the events did not write may well
+        stop the marker writing too. It is still attempted, because the case
+        it covers -- a process that never reaches `close` -- is the case where
+        nothing else will say anything.
+
+        A marker that cannot be written is logged and not remembered: the
+        caller remembers the error that lost the events, which is the more
+        useful of the two and the one `close` should raise.
+        """
+        now = time.time()
+        rows = [
+            (first, last, count, now, error)
+            for first, last, count, error in _gaps(lost)
+        ]
+        try:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                self._conn.executemany(_LOSS_INSERT, rows)
+                self._conn.execute("COMMIT")
+            except BaseException:
+                self._rollback()
+                raise
+        except Exception as exc:
+            _log.error(
+                "SQLiteSink could not record the loss of seq %d-%d",
+                rows[0][0],
+                rows[-1][1],
+                exc_info=exc,
+            )
+
+    def _remember(self, exc: Exception) -> None:
+        """Keep the first error a loss produced. `close` re-raises it."""
+        _log.error("SQLiteSink lost events", exc_info=exc)
+        if self._error is None:
+            self._error = exc
 
     def _fold(self, buffered: Sequence[Event]) -> _Batch:
         """Turn events into parameter rows. All encoding happens here."""
@@ -524,6 +763,10 @@ class SQLiteSink:
                             event.idNum,
                             event.tid,
                             event.instrument,
+                            # The currency in force now, so a later
+                            # reconfiguration cannot re-denominate the
+                            # commission this order has already been charged.
+                            self._currency.get(event.instrument),
                             event.side,
                             event.order_type,
                             event.price,
@@ -695,6 +938,25 @@ class SQLiteSink:
         """Events accepted but not yet written."""
         return len(self._buffer)
 
+    @property
+    def journal_mode(self) -> str:
+        """The journal mode this database actually got, lowercased.
+
+        `wal` on any filesystem that supports it, which is what the durability
+        note in the module docstring assumes. Anything else was refused, was
+        warned about at open time, and means that note does not apply.
+        """
+        return self._journal_mode
+
+    @property
+    def error(self) -> Exception | None:
+        """The first error a loss produced, or None if nothing was lost.
+
+        `close` raises this. Reading it is how a long-running session asks
+        whether its recording is still whole without ending.
+        """
+        return self._error
+
     def __enter__(self) -> SQLiteSink:
         return self
 
@@ -705,6 +967,103 @@ class SQLiteSink:
 # --------------------------------------------------------------------------
 # reading a recorded stream back
 # --------------------------------------------------------------------------
+
+
+class EventLogError(Exception):
+    """A recorded log is not a complete stream this module can read.
+
+    Raised for a hole in `seq`, for an `event_loss` row, for a `stream_version`
+    or schema `user_version` this module does not implement -- everything, in
+    short, that would otherwise let a partial recording be read as a whole one.
+    """
+
+
+def check_log(source: str | os.PathLike[str] | sqlite3.Connection) -> None:
+    """Raise `EventLogError` unless `source` is a complete, readable log.
+
+    The one place that decides whether a recording can be trusted, so that
+    every reader gets the same answer. `read_events` calls it; call it
+    directly to ask the question without reading the stream.
+
+    Four ways a file fails:
+
+    **The schema is not this one.** `PRAGMA user_version` must be
+    `SCHEMA_VERSION`. Checked first, because the rest of these queries assume
+    this module's tables.
+
+    **The sink recorded a loss.** Any `event_loss` row is a loss this sink
+    knew about, wherever in the stream it fell, and it is on disk without
+    anybody having to reach `close`. Checked before the arithmetic below,
+    because it is the same file failing with the reason attached.
+
+    **The log has a hole.** `seq` is the log's primary key and the engine
+    emits it from 0 without gaps, so a complete log has `min(seq) == 0` and
+    `max(seq) == count - 1`. Anything else lost events -- and this catches the
+    losses no marker could, the ones made after the fact by whatever edited,
+    truncated or partially copied the file. What it cannot see is a lost
+    *tail*, which is what the marker above is for.
+
+    **The stream is a version this module does not implement.**
+    `events.STREAM_VERSION` is bumped when an older stream would replay
+    *wrongly* rather than merely incompletely, which makes reading one a
+    silent-wrong-answer risk, not a compatibility inconvenience. Read from the
+    log's own `SessionStarted` payload rather than the `session` projection,
+    and out of the raw JSON rather than a decoded event, since decoding a
+    version whose fields have changed is the thing being guarded against.
+
+    An empty log passes: nothing was recorded and nothing is missing.
+    """
+    if isinstance(source, sqlite3.Connection):
+        _check_log(source)
+        return
+    conn = sqlite3.connect(os.fspath(source))
+    try:
+        _check_log(conn)
+    finally:
+        conn.close()
+
+
+def _check_log(conn: sqlite3.Connection) -> None:
+    version = conn.execute("PRAGMA user_version").fetchone()[0]
+    if version != SCHEMA_VERSION:
+        raise EventLogError(
+            f"database schema version {version} is not this module's "
+            f"version {SCHEMA_VERSION}"
+        )
+
+    # Before the arithmetic, because a loss the sink recorded comes with the
+    # error that caused it: the more specific diagnosis of the same file.
+    losses = conn.execute(
+        "SELECT first_seq, last_seq, count FROM event_loss ORDER BY first_seq"
+    ).fetchall()
+    if losses:
+        ranges = ", ".join(f"{first}-{last}" for first, last, _ in losses)
+        raise EventLogError(
+            f"the sink recorded losing {sum(row[2] for row in losses)} event(s) "
+            f"at seq {ranges}; see the event_loss table"
+        )
+
+    count, lowest, highest = conn.execute(
+        "SELECT COUNT(*), MIN(seq), MAX(seq) FROM event"
+    ).fetchone()
+    if count and (lowest != 0 or highest != count - 1):
+        raise EventLogError(
+            f"the event log is not contiguous from 0: {count} rows spanning "
+            f"seq {lowest}-{highest}, so {highest - lowest + 1 - count} event(s) "
+            f"are missing from the middle and {lowest} from the start"
+        )
+
+    row = conn.execute(
+        "SELECT payload FROM event WHERE kind = ? ORDER BY seq LIMIT 1",
+        (SessionStarted.KIND,),
+    ).fetchone()
+    if row is not None:
+        stream_version = json.loads(row[0]).get("stream_version")
+        if stream_version != STREAM_VERSION:
+            raise EventLogError(
+                f"the log records stream_version {stream_version!r}, and this "
+                f"module implements {STREAM_VERSION}"
+            )
 
 
 def decode_event(kind: str, payload: str) -> Event:
@@ -725,6 +1084,7 @@ def read_events(
     source: str | os.PathLike[str] | sqlite3.Connection,
     *,
     replayable_only: bool = False,
+    strict: bool = True,
 ) -> Iterator[Event]:
     """Yield a recorded stream in `seq` order.
 
@@ -736,18 +1096,39 @@ def read_events(
     made, without the fills and IOC cancels a replayed engine re-derives. It
     is the filter a replay wants, and it is the sanctioned rule rather than a
     second copy of it.
+
+    `strict` runs `check_log` before the first event and refuses an incomplete
+    or unreadable log, so a replay or a comparison cannot quietly be run
+    against a stream with a hole in it. Pass `strict=False` to read what
+    survived a damaged log -- the loss is logged as a warning instead, and the
+    events that are there are still exactly the events that were recorded.
+
+    Note that the checks run when iteration starts, not when this is called:
+    it is a generator.
+
+    The completeness check is on the whole log, never on the filtered view.
+    `replayable_only` skips fills, so the `seq` values it yields have gaps by
+    design and prove nothing about what is missing.
     """
     if isinstance(source, sqlite3.Connection):
-        yield from _read_events(source, replayable_only)
+        yield from _read_events(source, replayable_only, strict)
         return
     conn = sqlite3.connect(os.fspath(source))
     try:
-        yield from _read_events(conn, replayable_only)
+        yield from _read_events(conn, replayable_only, strict)
     finally:
         conn.close()
 
 
-def _read_events(conn: sqlite3.Connection, replayable_only: bool) -> Iterator[Event]:
+def _read_events(
+    conn: sqlite3.Connection, replayable_only: bool, strict: bool
+) -> Iterator[Event]:
+    try:
+        _check_log(conn)
+    except EventLogError:
+        if strict:
+            raise
+        _log.warning("reading a damaged event log", exc_info=True)
     sql = "SELECT kind, payload FROM event"
     if replayable_only:
         sql += " WHERE replayable = 1"
