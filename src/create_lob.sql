@@ -272,20 +272,4 @@ inner join trade_order as bidorder on bidorder.order_id=trade.bid_order
 inner join trade_order as askorder on askorder.order_id=trade.ask_order 
 ;
 
-create table if not exists event (
-    reqId integer,
-    handler text, -- method on lob that will handle. it will handle using the args
-    callback text, -- method to invoke on trigger
-    unique(reqId) on conflict replace
-);
-
-create table if not exists event_arg (
-    reqId integer,
-    arg text,
-    val text,
-    convertor text,
-    unique(reqId, arg) on conflict replace,
-    foreign key(reqId) references event(reqId) on delete cascade
-);
-
 commit;
