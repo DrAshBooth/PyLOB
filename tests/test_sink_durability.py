@@ -2,11 +2,11 @@
 
 The `SQLiteSink` docstring makes a promise -- "losing data silently is the one
 outcome worse than losing the session" -- and the 2026-08 engine review
-(`docs/engine-review-2026-08.md`) falsified it three ways. This suite is the
+(`docs/engine-review-2026-08.md`) falsified it four ways. This suite is the
 regression barrier for each, and for the reader-side checks that make a loss
 visible in the file rather than only in an exception nobody was there to see.
 
-The three verified defects, and the test that holds each down:
+The verified defects, and the test that holds each down:
 
     a failed `flush()` forgot its error, so `close()` returned cleanly over an
     empty file                          `test_a_failed_flush_is_remembered_*`
@@ -19,6 +19,17 @@ The three verified defects, and the test that holds each down:
     `close()` re-raised once and `consume` after `close` discarded everything
                                         `test_close_reraises_every_time`
                                         `test_consume_after_close_raises`
+
+    a killed process left a contiguous prefix that read as a complete shorter
+    session, because nothing was attempted, nothing failed, and nothing said
+    the session had ended            `test_a_killed_session_is_identifiable_*`
+                                        `test_a_cleanly_closed_log_is_not_*`
+
+The last one is the case the other three structurally cannot catch: there is
+no failure to record, so detection has to come from the *absence* of a mark
+that only a deliberate `close` writes. It is also the one where the data is
+good -- a prefix of real committed events -- which is why the suite asserts
+that it reads as suspect and not as corrupt.
 
 Two properties are asserted here rather than argued, because the fix touched
 the flush path that both rest on:
@@ -71,6 +82,7 @@ from PyLOB.sinks.sqlite import (
     DEFAULT_BUFFER_SIZE,
     SCHEMA_VERSION,
     EventLogError,
+    IncompleteLogError,
     SQLiteSink,
     check_log,
     read_events,
@@ -189,10 +201,15 @@ def workload(book, rng, n_ops=400):
 # reading a database back
 # --------------------------------------------------------------------------
 
-#: Every table the sink writes, with the key that puts it in a canonical
-#: order. Sorting by key rather than by rowid is what makes a comparison of
-#: two databases a comparison of their content: insertion order is the thing
-#: `buffer_size` is allowed to change, and the content is the thing it is not.
+#: Every table whose content two runs of the same workload must agree on,
+#: with the key that puts it in a canonical order. Sorting by key rather than
+#: by rowid is what makes a comparison of two databases a comparison of their
+#: content: insertion order is the thing `buffer_size` is allowed to change,
+#: and the content is the thing it is not.
+#:
+#: `session_end` is deliberately absent: it carries a wall clock, which no two
+#: runs share and which is not content. `ended()` reads the parts of it that
+#: are.
 TABLES = {
     "event": "seq",
     "event_loss": "first_seq",
@@ -237,6 +254,17 @@ def losses(path):
     try:
         return conn.execute(
             "SELECT first_seq, last_seq, count FROM event_loss ORDER BY first_seq"
+        ).fetchall()
+    finally:
+        conn.close()
+
+
+def ended(path):
+    """The `session_end` rows: `(last_seq, event_count)`. Empty means killed."""
+    conn = sqlite3.connect(path)
+    try:
+        return conn.execute(
+            "SELECT last_seq, event_count FROM session_end ORDER BY rowid"
         ).fetchall()
     finally:
         conn.close()
@@ -607,6 +635,189 @@ def test_a_closed_sink_stops_the_engine_rather_than_swallowing_its_events(tmp_pa
             qty=1,
             price=100.0,
         )
+
+
+# --------------------------------------------------------------------------
+# (d) a session that was killed rather than closed
+# --------------------------------------------------------------------------
+
+
+def killed_session(path, buffer_size=4, n_orders=20, close=False):
+    """Record `n_orders` and walk away without closing. Returns the sink.
+
+    What a killed process leaves behind: everything flushed is committed, and
+    whatever the buffer still held is gone with no trace of having existed.
+    Nothing was attempted and nothing failed, so there is no `event_loss` row
+    and the surviving `seq` run from 0 with no gap.
+    """
+    book, sink = build(path, buffer_size=buffer_size)
+    for index in range(n_orders):
+        book.submit(
+            tid=1 + index % 4,
+            instrument=INSTRUMENT,
+            side="bid",
+            order_type="limit",
+            qty=1,
+            price=round(100.0 - index * 0.01, 2),
+        )
+    if close:
+        book.close()
+    return sink
+
+
+def test_a_killed_session_is_identifiable_as_incomplete(tmp_path):
+    """The gap the two loss mechanisms structurally cannot see.
+
+    No `event_loss` row, because nothing was ever attempted. A contiguous
+    `seq` range from 0, because the events that made it are all there. So the
+    file reads as a complete *shorter* session, and somebody recording a run
+    to study afterwards would study a prefix believing it whole.
+
+    Only the absence of the `session_end` row distinguishes it, and a crash
+    cannot forge one.
+    """
+    path = tmp_path / "killed.db"
+    sink = killed_session(path)
+
+    assert sink.buffered > 0, "nothing was actually lost with the process"
+    assert losses(path) == [], "a killed process leaves no loss row: it is the point"
+    written = seqs(path)
+    assert written == list(range(len(written))), "and the survivors look intact"
+
+    with pytest.raises(IncompleteLogError) as refusal:
+        check_log(path)
+    assert "session_end" in str(refusal.value)
+    with pytest.raises(IncompleteLogError):
+        list(read_events(path))
+
+    # The prefix itself is good, and reading it is one flag away.
+    assert len(list(read_events(path, strict=False))) == len(written)
+
+
+def test_a_cleanly_closed_log_is_not_flagged(tmp_path):
+    """The same run, closed. Nothing about it is suspect."""
+    path = tmp_path / "closed.db"
+    sink = killed_session(path, close=True)
+
+    assert sink.buffered == 0
+    check_log(path)
+    written = seqs(path)
+    assert len(list(read_events(path))) == len(written)
+    assert ended(path) == [(written[-1], len(written))]
+
+
+def test_incomplete_is_a_distinguishable_state_not_corruption(tmp_path):
+    """Suspect and corrupt have to read differently to whoever hits them.
+
+    A killed run is normal and its data is good up to the cut; a log with a
+    hole in it is not. Both refuse by default, but a caller can tell them
+    apart by type -- and the recipe in `IncompleteLogError`'s docstring, for
+    reading a killed run while still refusing a damaged one, is what is
+    checked here.
+    """
+    unfinished = tmp_path / "unfinished.db"
+    killed_session(unfinished)
+
+    damaged = tmp_path / "damaged.db"
+    sink = SQLiteSink(damaged, buffer_size=32)
+    for event in stream(32, poison_at={7}):
+        sink.consume(event)
+    with pytest.raises(sqlite3.IntegrityError):
+        sink.close()
+
+    # Incompleteness is an EventLogError, so a caller who only wants whole
+    # sessions needs to know nothing about the distinction.
+    assert issubclass(IncompleteLogError, EventLogError)
+
+    def read_allowing_a_killed_run(path):
+        try:
+            check_log(path)
+        except IncompleteLogError:
+            pass  # a killed run; the prefix is good
+        return list(read_events(path, strict=False))
+
+    assert read_allowing_a_killed_run(unfinished)
+    with pytest.raises(EventLogError) as refusal:
+        read_allowing_a_killed_run(damaged)
+    assert not isinstance(refusal.value, IncompleteLogError), (
+        "a damaged log must not be mistaken for a merely unfinished one"
+    )
+
+
+def test_a_killed_session_that_also_lost_events_reports_the_loss(tmp_path):
+    """Corruption outranks incompleteness: the worse fact is the one reported.
+
+    Both are true of this file, and the loss is the one with an error attached
+    and the one that means the events are gone rather than merely unfinished.
+    """
+    path = tmp_path / "killed-lossy.db"
+    sink = SQLiteSink(path, buffer_size=4)
+    events = stream(12)
+    for index, event in enumerate(events):
+        if index == 4:
+            fail_next_batch(sink, 4)
+        sink.consume(event)
+    # Killed here: no close, so both an event_loss row and no session_end row.
+    assert losses(path) and ended(path) == []
+
+    with pytest.raises(EventLogError, match="event_loss") as refusal:
+        check_log(path)
+    assert not isinstance(refusal.value, IncompleteLogError)
+
+
+def test_the_end_row_is_written_even_when_events_were_lost(tmp_path):
+    """Ending deliberately and ending whole are separate facts.
+
+    A reader is owed both, so a lossy session that did reach `close` says so
+    -- otherwise "lost a batch" and "was killed" would be indistinguishable,
+    and they call for different responses.
+    """
+    path = tmp_path / "closed-lossy.db"
+    sink = SQLiteSink(path, buffer_size=8)
+    for event in stream(16, poison_at={3}):
+        sink.consume(event)
+    with pytest.raises(sqlite3.IntegrityError):
+        sink.close()
+
+    assert losses(path) == [(3, 3, 1)]
+    assert ended(path), "a session that closed must say so even having lost events"
+
+
+def test_an_unclosed_empty_log_is_incomplete(tmp_path):
+    """Killed before writing anything is still killed, not an empty session."""
+    path = tmp_path / "stillborn.db"
+    SQLiteSink(path, buffer_size=100).consume(session())
+    with pytest.raises(IncompleteLogError):
+        check_log(path)
+
+
+def test_rows_deleted_from_the_end_of_a_closed_log_are_caught(tmp_path):
+    """The one edit no gap and no marker could ever reveal.
+
+    Deleting from the tail of a finished log leaves `seq` contiguous from 0
+    and trips nothing else. `session_end` recorded the size at close, so the
+    log can be asked whether it still holds what it finished holding.
+    """
+    path = tmp_path / "trimmed.db"
+    book, _ = build(path, buffer_size=64)
+    workload(book, random.Random(3), n_ops=200)
+    book.close()
+    check_log(path)
+    before = seqs(path)
+
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute("DELETE FROM event WHERE seq > ?", (before[-5],))
+        conn.commit()
+    finally:
+        conn.close()
+
+    trimmed = seqs(path)
+    assert trimmed == list(range(len(trimmed))), "the survivors are contiguous from 0"
+    assert losses(path) == []
+    with pytest.raises(EventLogError, match="edited since") as refusal:
+        check_log(path)
+    assert not isinstance(refusal.value, IncompleteLogError)
 
 
 # --------------------------------------------------------------------------

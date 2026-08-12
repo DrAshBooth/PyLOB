@@ -11,6 +11,7 @@ queryable database off the matching path.
 from .sqlite import (
     SCHEMA_VERSION,
     EventLogError,
+    IncompleteLogError,
     SQLiteSink,
     check_log,
     decode_event,
@@ -21,6 +22,7 @@ __all__ = [
     "SQLiteSink",
     "SCHEMA_VERSION",
     "EventLogError",
+    "IncompleteLogError",
     "check_log",
     "decode_event",
     "read_events",

@@ -87,11 +87,31 @@ without a gap, refuses one carrying any `event_loss` row, and refuses a
 recording that lost a batch, and a log truncated in the middle by anything
 else, cannot masquerade as a complete one.
 
-One loss remains undetectable from the file alone: a lost *tail*. If the
-process dies with a partial buffer, those events are gone and what survives
-is a complete contiguous prefix, indistinguishable from a session that ended
-there. That is the price of buffering, and it is the reason a loss on the
-write path leaves a marker rather than relying on the gap it makes.
+Ending, and being killed
+------------------------
+
+A process killed mid-session leaves no `event_loss` row -- nothing was
+attempted, so nothing failed -- and its `seq` values run from 0 with no gap.
+Everything above would call that file complete. It is not: the buffered tail
+died with the process, and a shorter session is exactly what a truncated one
+looks like. Somebody recording a run in order to study it afterwards would
+study a prefix believing it whole.
+
+So `close` writes a `session_end` row as its last act, after the final flush.
+Its absence is the tell. A crash cannot forge one, and the failure direction
+is the safe one: a session killed *during* `close`, or one whose end row
+would not write, reads as unfinished rather than as finished.
+
+That state is **suspect, not corrupt**, and `check_log` reports it as a
+distinct `IncompleteLogError`. A killed run is normal, and the events in the
+file are genuinely good -- every one of them was committed. What is unknown
+is only how many more there were meant to be, which is why nothing here
+claims a count for what the buffer took with it.
+
+`session_end` also carries the log's size at the moment it was written, so
+rows deleted from the *end* of a finished log -- the one edit no gap and no
+marker could ever reveal -- come out as a mismatch between what the sink
+recorded closing with and what is there now.
 
 The log and the projections can never disagree: every write path -- whole
 batch and salvaged single event alike -- puts both in one transaction, so
@@ -157,6 +177,7 @@ __all__ = [
     "SCHEMA_VERSION",
     "SCHEMA",
     "EventLogError",
+    "IncompleteLogError",
     "check_log",
     "decode_event",
     "read_events",
@@ -169,10 +190,11 @@ _log = logging.getLogger(__name__)
 #: `events.STREAM_VERSION`, which versions what the engine emits: the same
 #: stream can be recorded by two schema versions.
 #:
-#: 2 added `event_loss` and `orders.currency`. A version-1 file has no way to
-#: say whether anything was lost, so it is refused rather than read as though
-#: an absent table meant an intact recording.
-SCHEMA_VERSION = 2
+#: 2 added `event_loss` and `orders.currency`. 3 added `session_end`. Both
+#: bumps are for the same reason: an older file has no way to say whether it
+#: lost anything, or whether it was ever closed, and an absent table must not
+#: be read as the good answer to a question that file cannot answer.
+SCHEMA_VERSION = 3
 
 #: Default events per transaction. Tuning only; design.md leaves the number to
 #: benchmark data, and the resulting database does not depend on it.
@@ -204,6 +226,17 @@ CREATE TABLE IF NOT EXISTS event_loss (
     -- it describes are precisely the ones that are not here to be asked.
     recorded_at REAL    NOT NULL,
     error       TEXT    NOT NULL
+);
+
+-- Written by `close` and by nothing else, so that a log which simply stops --
+-- the process killed, its buffered tail gone with it -- is not read as a
+-- session that ended here. One row, or none. `event_count` and `last_seq` are
+-- what the log held at that moment, which is how rows deleted from the end of
+-- a finished log are caught: they leave no gap and trip no marker.
+CREATE TABLE IF NOT EXISTS session_end (
+    recorded_at REAL    NOT NULL,
+    last_seq    INTEGER,
+    event_count INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS session (
@@ -318,6 +351,12 @@ _LOSS_INSERT = """
 INSERT INTO event_loss (first_seq, last_seq, count, recorded_at, error)
 VALUES (?, ?, ?, ?, ?)
 """
+
+_END_INSERT = """
+INSERT INTO session_end (recorded_at, last_seq, event_count) VALUES (?, ?, ?)
+"""
+
+_LOG_EXTENT = "SELECT COUNT(*), MAX(seq) FROM event"
 
 _SESSION_UPSERT = """
 INSERT INTO session (seq, timestamp, tick_size, stream_version)
@@ -546,18 +585,25 @@ class SQLiteSink:
                 self.flush()
 
     def close(self) -> None:
-        """Flush the tail and close the database. Idempotent.
+        """Flush the tail, stamp the log as ended, and close the database.
 
-        Raises if anything was lost -- the tail failing to write, or an
-        earlier batch a `consume` could not salvage -- and raises it again on
-        every later call, because a second `close` that returns quietly is a
-        recording reporting itself complete when it is not.
+        Idempotent. Raises if anything was lost -- the tail failing to write,
+        or an earlier batch a `consume` could not salvage -- and raises it
+        again on every later call, because a second `close` that returns
+        quietly is a recording reporting itself complete when it is not.
+
+        The `session_end` row goes in after the last flush and is what
+        distinguishes this file from one whose process was killed. It is
+        written even when events were lost: ending deliberately and ending
+        whole are separate facts, recorded separately, and a reader is owed
+        both.
         """
         if not self._closed:
             self._closed = True
             try:
                 with suppress(Exception):  # `flush` has already remembered it
                     self.flush()
+                self._record_end()
             finally:
                 self._conn.close()
         if self._error is not None:
@@ -707,9 +753,44 @@ class SQLiteSink:
                 exc_info=exc,
             )
 
+    def _record_end(self) -> None:
+        """Stamp the log as deliberately ended, with its size at that moment.
+
+        The absence of this row is how a reader tells a killed process from a
+        short session, so failing to write it is worth reporting: the file
+        will read as unfinished, and the caller should hear why from the
+        exception rather than infer it later from the file.
+
+        Recording the extent as well as the fact buys the only check there is
+        on rows deleted from the tail of a finished log. It costs one count
+        over the log -- about 10ms per 100k events, once, at the end of a
+        session that took far longer than that to record. Keeping a running
+        total in Python instead would save the scan, but it would make this
+        column "what the sink believes it wrote" rather than "what the file
+        held", and the belief is not the thing a reader needs checked.
+        """
+        try:
+            count, last = self._conn.execute(_LOG_EXTENT).fetchone()
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                self._conn.execute(_END_INSERT, (time.time(), last, count))
+                self._conn.execute("COMMIT")
+            except BaseException:
+                self._rollback()
+                raise
+        except Exception as exc:
+            _log.error(
+                "SQLiteSink could not record the end of the session: the log "
+                "will read as one whose process never closed it",
+                exc_info=exc,
+            )
+            self._remember(exc)
+
     def _remember(self, exc: Exception) -> None:
-        """Keep the first error a loss produced. `close` re-raises it."""
-        _log.error("SQLiteSink lost events", exc_info=exc)
+        """Keep the first error a loss produced. `close` re-raises it.
+
+        Storage only: the call sites log, in the detail each of them has.
+        """
         if self._error is None:
             self._error = exc
 
@@ -972,9 +1053,31 @@ class SQLiteSink:
 class EventLogError(Exception):
     """A recorded log is not a complete stream this module can read.
 
-    Raised for a hole in `seq`, for an `event_loss` row, for a `stream_version`
-    or schema `user_version` this module does not implement -- everything, in
-    short, that would otherwise let a partial recording be read as a whole one.
+    Raised for a hole in `seq`, for an `event_loss` row, for rows removed
+    since the session closed, and for a `stream_version` or schema
+    `user_version` this module does not implement -- everything, in short,
+    that would otherwise let a partial recording be read as a whole one.
+    """
+
+
+class IncompleteLogError(EventLogError):
+    """The log is a prefix: the session that wrote it never closed.
+
+    Suspect rather than corrupt, and the difference matters. Nothing here is
+    wrong -- every event in the file was committed, and the state it describes
+    is real up to the cut. What is missing is whatever the buffer still held
+    when the process died, and how much that was cannot be known from the
+    file. A killed run is an ordinary thing to have; reading one is a
+    deliberate choice rather than an error to route around:
+
+        try:
+            check_log(path)
+        except IncompleteLogError:
+            pass                       # a killed run; the prefix is good
+        events = read_events(path, strict=False)
+
+    Subclasses `EventLogError`, so a caller who only wants whole sessions
+    needs to know none of this.
     """
 
 
@@ -985,7 +1088,10 @@ def check_log(source: str | os.PathLike[str] | sqlite3.Connection) -> None:
     every reader gets the same answer. `read_events` calls it; call it
     directly to ask the question without reading the stream.
 
-    Four ways a file fails:
+    Five ways a file fails, in order of how badly. The first four are
+    corruption -- something is wrong with the file. The last is only
+    incompleteness, and is raised as `IncompleteLogError` for callers who
+    want to tell those apart.
 
     **The schema is not this one.** `PRAGMA user_version` must be
     `SCHEMA_VERSION`. Checked first, because the rest of these queries assume
@@ -1000,8 +1106,7 @@ def check_log(source: str | os.PathLike[str] | sqlite3.Connection) -> None:
     emits it from 0 without gaps, so a complete log has `min(seq) == 0` and
     `max(seq) == count - 1`. Anything else lost events -- and this catches the
     losses no marker could, the ones made after the fact by whatever edited,
-    truncated or partially copied the file. What it cannot see is a lost
-    *tail*, which is what the marker above is for.
+    truncated or partially copied the file.
 
     **The stream is a version this module does not implement.**
     `events.STREAM_VERSION` is bumped when an older stream would replay
@@ -1011,7 +1116,18 @@ def check_log(source: str | os.PathLike[str] | sqlite3.Connection) -> None:
     and out of the raw JSON rather than a decoded event, since decoding a
     version whose fields have changed is the thing being guarded against.
 
-    An empty log passes: nothing was recorded and nothing is missing.
+    **Rows have gone since the session closed.** `session_end` recorded what
+    the log held at the moment it was written, so a log that now holds less
+    has been edited. Deleting from the end leaves no gap and trips no marker;
+    this is the only thing that sees it.
+
+    **The session never closed** -- `IncompleteLogError`, and the one that is
+    not corruption. See that class: the file is a good prefix of a run whose
+    process was killed, and reading it is a choice rather than a mistake.
+
+    An empty log that was closed passes: nothing was recorded and nothing is
+    missing. An empty log that was *not* closed is a session killed before it
+    wrote anything, and is reported as incomplete like any other prefix.
     """
     if isinstance(source, sqlite3.Connection):
         _check_log(source)
@@ -1065,6 +1181,28 @@ def _check_log(conn: sqlite3.Connection) -> None:
                 f"module implements {STREAM_VERSION}"
             )
 
+    # Last, because everything above is a file that is wrong, and this is a
+    # file that is merely unfinished.
+    ended = conn.execute(
+        "SELECT last_seq, event_count FROM session_end ORDER BY rowid"
+    ).fetchall()
+    if not ended:
+        raise IncompleteLogError(
+            f"the log has no session_end row: the process that wrote it was "
+            f"killed rather than closing it, so these {count} event(s) ending "
+            f"at seq {highest} are a prefix of the session and not all of it. "
+            f"Whatever was still buffered went with the process, and how much "
+            f"that was is not knowable from the file. The events that are here "
+            f"were all committed: pass strict=False to read them"
+        )
+    last_seq, event_count = ended[-1]
+    if (event_count, last_seq) != (count, highest):
+        raise EventLogError(
+            f"the log was closed holding {event_count} event(s) ending at seq "
+            f"{last_seq}, and now holds {count} ending at seq {highest}: it has "
+            f"been edited since the session that wrote it finished"
+        )
+
 
 def decode_event(kind: str, payload: str) -> Event:
     """Rebuild the event a row of `event` was written from.
@@ -1097,11 +1235,15 @@ def read_events(
     is the filter a replay wants, and it is the sanctioned rule rather than a
     second copy of it.
 
-    `strict` runs `check_log` before the first event and refuses an incomplete
-    or unreadable log, so a replay or a comparison cannot quietly be run
-    against a stream with a hole in it. Pass `strict=False` to read what
-    survived a damaged log -- the loss is logged as a warning instead, and the
-    events that are there are still exactly the events that were recorded.
+    `strict` runs `check_log` before the first event and refuses a log that is
+    damaged or unfinished, so a replay or a comparison cannot quietly be run
+    against a stream with a hole in it. Pass `strict=False` to read what a
+    damaged or killed session left -- the problem is logged as a warning
+    instead, and the events that are there are still exactly the events that
+    were recorded.
+
+    A caller who wants the prefix of a killed run but still refuses a corrupt
+    file distinguishes the two by exception type; see `IncompleteLogError`.
 
     Note that the checks run when iteration starts, not when this is called:
     it is a generator.
@@ -1123,12 +1265,18 @@ def read_events(
 def _read_events(
     conn: sqlite3.Connection, replayable_only: bool, strict: bool
 ) -> Iterator[Event]:
+    # No traceback on either: `strict=False` asked for this, so the reason is
+    # the useful part and the stack it was raised from is noise.
     try:
         _check_log(conn)
-    except EventLogError:
+    except IncompleteLogError as exc:
         if strict:
             raise
-        _log.warning("reading a damaged event log", exc_info=True)
+        _log.warning("reading the prefix a killed session left: %s", exc)
+    except EventLogError as exc:
+        if strict:
+            raise
+        _log.warning("reading a damaged event log: %s", exc)
     sql = "SELECT kind, payload FROM event"
     if replayable_only:
         sql += " WHERE replayable = 1"
