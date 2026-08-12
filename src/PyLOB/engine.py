@@ -33,7 +33,20 @@ The heaps carry prices, not levels, and use lazy deletion: emptying a level
 drops it from `_levels` and leaves a stale price behind, which the next peek
 pops. A price that is re-created before its stale entry surfaces is *still
 correct* -- the heap holds the price value, and the value has not changed --
-so duplicates cost memory, not accuracy. `_compact` bounds that memory.
+but the heap now holds that price twice, and duplicates are the one thing
+lazy deletion has to be careful about. There are exactly two ways to make
+one: `add` re-creating a level whose stale entry has not surfaced yet, and
+`_compact` rebuilding from the live levels while `match_levels` is holding a
+price it popped, which the walk then pushes back on its way out.
+
+Neither costs accuracy -- a duplicate is the same price value -- provided the
+same *level* is never handed to one match walk twice, which is what the
+`walked` set in `match_levels` guarantees by dropping a copy on sight. What
+they cost is memory, and `_compact` is what bounds it: it rebuilds when
+*either* heap outgrows the live level count, because `_worst` is read only by
+the reporting queries and so sheds a stale entry almost never (lob-n3n: a
+gate on `_best` alone leaves `_worst` growing one entry per level creation
+for the life of the process).
 
 Costs, in the number of price levels L on a side and orders N in a level:
 
@@ -42,6 +55,8 @@ Costs, in the number of price levels L on a side and orders N in a level:
     insert into a new level     O(log L)
     cancel                      O(1)
     fill the front of the book  O(1) per order, O(log L) per exhausted level
+    step over k gated orders    O(k) per level, O(1) when the whole level is
+                                the taker's own (lob-rp4)
     volume at price             O(L)   -- levels, not orders: `volume` is cached
     snapshot                    O(L log L + N)
 
@@ -95,6 +110,41 @@ by the tick, round to an integer, multiply back -- carried out in `decimal` so
 that 0.05 is a twentieth and not 0.05000000000000000277. The float that comes
 back is the nearest double to the exact decimal multiple.
 
+The intermediate quotient is carried at 40 significant digits, and it is the
+price/tick *ratio* that has to fit: a tick of 1e-40 is accepted at
+construction and then refuses every ordinary price, so the usable range is
+"prices within forty digits of the tick". Past that the quantizer raises
+`InvalidOrder` naming the ratio rather than letting `decimal.InvalidOperation`
+out (lob-d6i).
+
+What a submission has to be
+---------------------------
+
+`order-lifecycle` says an invalid submission raises a library exception and
+never terminates the host process, and the reason the gate below is one gate,
+run before the clock moves or an identifier is allocated, is that this engine
+has already been taught what a partly-applied bad input costs: a NaN limit
+price used to rest, and since every comparison against NaN is false it buried
+the real best price in the heap and could never be evicted from it, leaving
+the book crossed between two different traders -- permanently, silently, and
+faithfully reproduced by replay (lob-d6i).
+
+So a price is a finite, strictly positive real number (never a `bool`, which
+is an `int` in Python), a quantity is a positive `int` no larger than
+`MAX_QTY`, `qty * price` has to be finite, and a market order that carries a
+price is refused rather than quietly ignoring it -- the same reasoning that
+made `modifyOrder(price=None)` mean "leave it alone" instead of "become a
+market order" (lob-crf).
+
+Two of those the specs do not state, and both are decisions rather than
+readings. Non-positive prices are rejected because `_charge` on a negative
+price returns a negative commission delta and `_settle` *credits* it: the
+ledger would pay the trader to trade. The quantity ceiling is `2**53`, the
+largest integer a float represents exactly, so that the value and balance
+arithmetic downstream of a fill stays exact; without a ceiling `qty * price`
+raised `OverflowError` from the middle of `_execute`, after both fills had
+been committed and before either was settled.
+
 Matching
 --------
 
@@ -115,6 +165,18 @@ Two rules bend the walk, and both are book state rather than special cases:
   (`trader-balances`). `BookSide.match_levels` therefore hands levels out one
   at a time and puts back what the caller did not empty, so a level nobody
   was allowed to trade with does not stop the walk at the top of the book.
+
+Stepping over a gated order is where the walk pays for the dict: `match`
+holds *one* cursor over the level and advances it, because asking the level
+for its k-th order re-reads the queue from the front and made a walk past k
+of the taker's own orders cost O(k^2) -- 10 orders/sec on the single-agent
+gym ADR-0002 names, 30x slower than the engine this one replaces (lob-rp4).
+A fill takes its maker out of the dict and so invalidates the cursor; the
+skipped prefix in front of it cannot move, so the replacement cursor is
+walked back to where the old one was and the fill, not the skip, pays for it.
+The level also knows when every order in it belongs to one trader, which
+turns the gym's own case -- taker crossing a level entirely its own -- into
+one comparison instead of k.
 
 A modify that changes price re-enters the same loop with the resting order as
 the taker, which is why every fill goes through `BookSide.fill` on *both*
@@ -147,8 +209,10 @@ import heapq
 from collections.abc import Iterator
 from contextlib import closing
 from dataclasses import dataclass, field
-from decimal import ROUND_HALF_EVEN, Context, Decimal
+from decimal import ROUND_HALF_EVEN, Context, Decimal, DecimalException
 from functools import lru_cache
+from math import isfinite
+from numbers import Real
 from typing import Any, Final
 
 from .events import (
@@ -182,9 +246,24 @@ __all__ = [
     "InstrumentBook",
     "OrderBook",
     "DEFAULT_TICK_SIZE",
+    "MAX_QTY",
 ]
 
 DEFAULT_TICK_SIZE: Final = 0.0001
+
+#: The largest quantity a submission may carry: 2**53, the largest integer a
+#: float represents exactly. Past it an order's `value` and its trader's
+#: balance stop being able to hold the number they are given, and `qty *
+#: price` starts overflowing inside `_execute` rather than at the gate.
+MAX_QTY: Final = 2**53
+
+#: `MAX_QTY` at this price is still a finite float, so `qty * price` needs
+#: checking only above it: 2**53 * 1e292 is 9.0e307 against a largest float of
+#: 1.8e308. One comparison on the accept path, in place of a multiplication
+#: that can only matter for a price no market has.
+_NOTIONAL_GUARD: Final = 1e292
+
+_INF: Final = float("inf")
 
 
 # --------------------------------------------------------------------------
@@ -234,30 +313,78 @@ _CTX: Final = Context(prec=40, rounding=ROUND_HALF_EVEN)
 _ONE: Final = Decimal(1)
 
 
+def _positive_real(value: Any, what: str) -> float:
+    """`value` as a positive finite float, or an `InvalidOrder` saying why not.
+
+    The one shape test behind both the price gate and the tick gate, because
+    the two want exactly the same thing of a number and had drifted into
+    wanting it differently -- a string tick raised `TypeError`, `True` raised
+    `decimal.InvalidOperation`, and neither is the library exception
+    `order-lifecycle` promises (lob-d6i).
+
+    `bool` is refused before anything else: `True` is an `int` in Python, so
+    every numeric test below would pass it, and a price of `True` is a mistake
+    rather than a price. Anything else that is a real number is taken -- a
+    `numpy` scalar or a `Fraction` counts -- and converted once, so what the
+    engine stores and quantizes is an ordinary float rather than whatever the
+    caller's array library hands back from arithmetic.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float, Real)):
+        raise InvalidOrder("%s must be a real number, got %r" % (what, value))
+    try:
+        number = float(value)
+    except (OverflowError, ValueError) as exc:
+        # An int too large for a float: 10**400 is a real number and still
+        # not one this engine can hold.
+        raise InvalidOrder("%s is out of range: %r" % (what, value)) from exc
+    if not isfinite(number):
+        raise InvalidOrder("%s must be finite, got %r" % (what, value))
+    if number <= 0:
+        raise InvalidOrder("%s must be positive, got %r" % (what, value))
+    return number
+
+
 @lru_cache(maxsize=256)
+def _tick_cached(tick_size: float) -> Decimal:
+    """`_tick_decimal`'s memo, over an already-validated float."""
+    return Decimal(str(tick_size))
+
+
 def _tick_decimal(tick_size: float) -> Decimal:
     """The tick as an exact decimal, via `str` so 0.05 is a twentieth.
 
     `Decimal(0.05)` is 0.05000000000000000277..., the double; `Decimal("0.05")`
     is the number the caller meant. Cached because a book quantizes on every
-    submission and the tick never changes.
+    submission and the tick never changes -- and validated *outside* the cache,
+    because `lru_cache` raises `TypeError` on an unhashable argument before the
+    body it is wrapping ever gets to reject it.
     """
-    if not tick_size > 0:
-        raise InvalidOrder("tick size must be positive, got %r" % (tick_size,))
-    tick = Decimal(str(tick_size))
-    if not tick.is_finite() or tick <= 0:
-        raise InvalidOrder("tick size must be positive and finite, got %r" % (tick,))
-    return tick
+    return _tick_cached(_positive_real(tick_size, "tick size"))
 
 
 def _quantize(price: float, tick: Decimal) -> float:
-    """`price` snapped to the nearest multiple of an already-decimalized tick."""
-    multiples = _CTX.divide(Decimal(str(price)), tick).quantize(
-        _ONE, rounding=ROUND_HALF_EVEN, context=_CTX
-    )
-    # `+ 0.0` only to turn a -0.0 back into 0.0: they compare and hash alike,
-    # so it is cosmetic, but a book should not report a negative zero price.
-    return float(_CTX.multiply(multiples, tick)) + 0.0
+    """`price` snapped to the nearest multiple of an already-decimalized tick.
+
+    The `decimal` failures are translated rather than propagated: a price of
+    1e40 on a 0.0001 tick, or any price at all on a 1e-40 tick, is a ratio
+    too wide for `_CTX` and used to leak `decimal.InvalidOperation` -- not a
+    `PyLOBError`, so a caller catching this library's errors did not catch it
+    (lob-d6i).
+    """
+    try:
+        multiples = _CTX.divide(Decimal(str(price)), tick).quantize(
+            _ONE, rounding=ROUND_HALF_EVEN, context=_CTX
+        )
+        # `+ 0.0` only to turn a -0.0 back into 0.0: they compare and hash
+        # alike, so it is cosmetic, but a book should not report a negative
+        # zero price.
+        return float(_CTX.multiply(multiples, tick)) + 0.0
+    except DecimalException as exc:
+        raise InvalidOrder(
+            "price %r does not quantize on a tick of %s: the price/tick ratio "
+            "needs more than the %d significant digits the grid carries"
+            % (price, tick, _CTX.prec)
+        ) from exc
 
 
 def quantize_price(price: float, tick_size: float) -> float:
@@ -272,6 +399,10 @@ def quantize_price(price: float, tick_size: float) -> float:
     the caller wrote rather than the double they got: 100.03 means 100.03, not
     100.0299999999999994. Exact halves round to even, as Python's own `round`
     does, so the grid introduces no directional bias.
+
+    Usable range: the price/tick *ratio* is carried at 40 significant digits,
+    so 1e-40 is a legal tick that no ordinary price will quantize against.
+    A ratio wider than that raises `InvalidOrder`.
     """
     return _quantize(price, _tick_decimal(tick_size))
 
@@ -419,6 +550,12 @@ def commission_for(trader: Trader, qty: int, value: float) -> float:
     return min(capped, per_unit)
 
 
+#: `PriceLevel.sole_tid` when the level's orders do not all belong to one
+#: trader. A sentinel rather than `None` because a caller's `tid` is whatever
+#: they say it is, and no sentinel that could also be a `tid` is safe.
+_MIXED: Final = object()
+
+
 class PriceLevel:
     """The FIFO queue of orders resting at one price.
 
@@ -426,13 +563,23 @@ class PriceLevel:
     priority order, and O(1) to remove by identifier. `volume` is the sum of
     the members' `remaining`, maintained incrementally so that a volume query
     costs one addition per *level* rather than one per order.
+
+    `sole_tid` is the same trick applied to ownership: the tid every order
+    here belongs to, or `_MIXED`. Matching reads it to answer "is this whole
+    level the taker's own?" -- the single-agent case, where the answer would
+    otherwise cost one self-matching test per resting order (lob-rp4) -- and
+    it is maintained only where it is cheap, on `append`. It is therefore
+    conservative in one direction: a level that *became* single-owner by
+    losing its other trader's orders reads `_MIXED` until it empties. Never
+    the other way, which is the direction that would matter.
     """
 
-    __slots__ = ("price", "volume", "_orders")
+    __slots__ = ("price", "volume", "sole_tid", "_orders")
 
     def __init__(self, price: float) -> None:
         self.price = price
         self.volume = 0
+        self.sole_tid: Any = _MIXED
         self._orders: dict[int, Order] = {}
 
     def __len__(self) -> int:
@@ -463,11 +610,16 @@ class PriceLevel:
 
     def append(self, order: Order) -> None:
         """Put `order` at the back of the queue."""
-        if order.idNum in self._orders:
+        orders = self._orders
+        if order.idNum in orders:
             raise DuplicateOrderID(
                 "order %r is already resting at %r" % (order.idNum, self.price)
             )
-        self._orders[order.idNum] = order
+        if not orders:
+            self.sole_tid = order.tid
+        elif self.sole_tid != order.tid:
+            self.sole_tid = _MIXED
+        orders[order.idNum] = order
         self.volume += order.remaining
 
     def discard(self, order: Order) -> bool:
@@ -578,23 +730,31 @@ class BookSide:
         Only the caller's own filling removes a level. This yields; it does
         not delete.
 
-        A `_compact` that fires mid-walk (some level emptying) rebuilds the
-        heap from the live levels and so re-adds a price the walk is holding,
-        which is then pushed a second time on the way out. The heaps hold
-        prices and tolerate duplicates by design, so that costs an entry and
-        nothing else.
+        A price already handed out is dropped rather than yielded again. The
+        heap can hold a price twice -- `add` re-creating a level whose stale
+        entry has not surfaced, or a `_compact` firing mid-walk (some level
+        emptying) and rebuilding from the live levels, which re-adds a price
+        this walk is holding and pushes back on the way out. Duplicates are
+        harmless in the heap, where a price is only a price; they are not
+        harmless *here*, because handing the same level over twice restarts
+        the caller's cursor into it from the front. So `walked` is the set of
+        prices this walk has yielded, and a second copy is popped and
+        forgotten, which is also how the heaps shed the duplicates they
+        accumulate (lob-n3n).
 
         Close the iterator -- `contextlib.closing`, or exhaust it -- or the
         prices it walked past stay out of the heap until it is collected.
         """
-        walked: list[float] = []
+        walked: set[float] = set()
         try:
             while True:
                 best = self._peek(self._best, self._best_sign)
                 if best is None or not self.crosses(best, price):
                     return
                 heapq.heappop(self._best)
-                walked.append(best)
+                if best in walked:
+                    continue
+                walked.add(best)
                 yield self._levels[best]
         finally:
             for level_price in walked:
@@ -739,9 +899,17 @@ class BookSide:
         surface, and a price that churns deep in the book never does. This
         bounds the heaps at a small multiple of the live level count for an
         O(L) rebuild that happens O(1/L) of the time.
+
+        The gate reads whichever heap is longer, and it has to: `_best` is
+        drained by every match, so gating on it alone meant the gate never
+        opened, and `_worst` -- peeked only by the reporting queries -- grew
+        one entry per level creation for the life of the process. Measured at
+        20,001 entries over a single live level after 20k churn cycles, and
+        at 499,000 entries and a 234ms first `getWorst*` call over a million
+        operations (lob-n3n).
         """
         live = len(self._levels)
-        if len(self._best) <= 2 * live + 16:
+        if max(len(self._best), len(self._worst)) <= 2 * live + 16:
             return
         self._best = [price * self._best_sign for price in self._levels]
         self._worst = [price * -self._best_sign for price in self._levels]
@@ -979,6 +1147,10 @@ class OrderBook:
         that any order already carries is refused (`DuplicateOrderID`), and
         one above the counter pushes the counter past it, so identifiers stay
         unique across a reload without a separate restore step.
+
+        The input gate is here and nowhere else on the submission path, and
+        every check it makes runs before the clock moves (module docstring,
+        "What a submission has to be"; lob-d6i).
         """
         side = _as_side(side)
         order_type = _as_order_type(order_type)
@@ -988,8 +1160,24 @@ class OrderBook:
         if order_type is OrderType.LIMIT:
             if price is None:
                 raise InvalidOrder("a limit order needs a price")
-            working_price: float | None = self.clipPrice(price)
+            working_price: float | None = self.clipPrice(_check_price(price))
+            if working_price <= 0:
+                raise InvalidOrder(
+                    "price %r quantizes to %r on a tick of %r: under half a "
+                    "tick is not a price this book can hold"
+                    % (price, working_price, self.tick_size)
+                )
+            if working_price > _NOTIONAL_GUARD:
+                _check_notional(qty, working_price)
         else:
+            if price is not None:
+                # Silently ignoring it is how a caller ends up believing a
+                # market order was capped -- the same failure the
+                # `modifyOrder(price=None)` fix refused to leave standing.
+                raise InvalidOrder(
+                    "a market order takes no price, got %r: it crosses every "
+                    "level and prices at the maker" % (price,)
+                )
             working_price = None
 
         idNum = self._assign_idNum(idNum)
@@ -1182,8 +1370,20 @@ class OrderBook:
             _check_qty(qty)
 
         prev_price, prev_qty = order.price, order.qty
-        new_price = prev_price if price is None else self.clipPrice(price)
+        # A modification is a submission of the same order at new terms, so
+        # it goes through the same gate: a NaN here would corrupt the book
+        # exactly as one on the submission path would (lob-d6i).
+        new_price = prev_price if price is None else self.clipPrice(_check_price(price))
         new_qty = max(prev_qty if qty is None else qty, order.fulfilled)
+        if new_price is not None:
+            if new_price <= 0:
+                raise InvalidOrder(
+                    "price %r quantizes to %r on a tick of %r: under half a "
+                    "tick is not a price this book can hold"
+                    % (price, new_price, self.tick_size)
+                )
+            if new_price > _NOTIONAL_GUARD:
+                _check_notional(new_qty, new_price)
         reprioritized = new_price != prev_price or new_qty > prev_qty
 
         self._advance(time)
@@ -1247,6 +1447,10 @@ class OrderBook:
         `taker` may itself be resting: that is a repriced modify, and it is
         why the taker's own side is filled through `BookSide.fill` rather than
         by touching `fulfilled` directly.
+
+        The walk within a level is one cursor, advanced; it used to be an
+        index, re-read from the front of the queue on every step, which made
+        stepping over k of the taker's own orders cost O(k^2) (lob-rp4).
         """
         trades: list[Trade] = []
         book = self.book(taker.instrument)
@@ -1257,12 +1461,23 @@ class OrderBook:
         gated = not self.trader(taker.tid).allow_self_matching
         with closing(makers.match_levels(taker.price)) as levels:
             for level in levels:
-                # Orders skipped by the gate stay at the front of the level,
-                # so the cursor steps past them rather than the level being
-                # re-read from the top.
+                if gated and level.sole_tid == taker.tid:
+                    # Every order here is the taker's own, so the gate would
+                    # step over all of them and trade nothing. One comparison
+                    # instead of one per order -- the single-agent case.
+                    continue
+                # Orders skipped by the gate stay at the front of the level
+                # and stay put, so `skipped` is the length of a prefix that
+                # cannot change under us: it is what a replacement cursor has
+                # to be walked back over, and only a fill needs one.
                 skipped = 0
+                cursor: Iterator[Order] | None = None
                 while taker.remaining > 0:
-                    maker = _at(level, skipped)
+                    if cursor is None:
+                        cursor = iter(level)
+                        for _ in range(skipped):
+                            next(cursor, None)
+                    maker = next(cursor, None)
                     if maker is None:
                         break
                     if gated and maker.tid == taker.tid:
@@ -1271,6 +1486,10 @@ class OrderBook:
                     trades.append(
                         self._execute(book, taker, takers, maker, makers, level.price)
                     )
+                    # A fill that did not exhaust the taker exhausted its
+                    # maker, which leaves the level's dict a member shorter
+                    # and the cursor over it unusable.
+                    cursor = None
                 if taker.remaining <= 0:
                     break
         return trades
@@ -1284,12 +1503,22 @@ class OrderBook:
         makers: BookSide,
         price: float,
     ) -> Trade:
-        """One execution: fill both orders, charge both, move four balances."""
+        """One execution: fill both orders, charge both, move four balances.
+
+        The arithmetic comes first and the fills second, so that an execution
+        is all-or-nothing with respect to its own numbers. `value` used to be
+        computed between the two fills and the settlement, where an
+        `OverflowError` out of `qty * price` left both orders recording a fill
+        that no balance had moved for and no `Filled` described (lob-d6i). The
+        input gate makes that overflow unreachable; the ordering makes it
+        harmless.
+        """
         qty = min(taker.remaining, maker.remaining)
+        value = qty * price
+
         makers.fill(maker, qty)
         takers.fill(taker, qty)
 
-        value = qty * price
         taker_delta = self._charge(taker, value)
         maker_delta = self._charge(maker, value)
         book.last_price = price
@@ -1630,11 +1859,69 @@ def _check_qty(qty: int) -> None:
     the API never terminates the host process -- the legacy engine called
     `sys.exit` here (lob-ihv). `bool` is excluded because `True` is an `int`
     and an order for `True` units is a mistake, not a quantity.
+
+    Python integers have no ceiling and floats do, so the range is bounded at
+    the top as well: `MAX_QTY` is where `qty * price` stops being arithmetic
+    and starts being an `OverflowError` raised from the middle of an
+    execution (lob-d6i).
     """
     if not isinstance(qty, int) or isinstance(qty, bool):
         raise InvalidOrder("quantity must be an integer, got %r" % (qty,))
     if qty <= 0:
         raise InvalidOrder("quantity must be positive, got %r" % (qty,))
+    if qty > MAX_QTY:
+        raise InvalidOrder(
+            "quantity must be at most %d (2**53), got %r" % (MAX_QTY, qty)
+        )
+
+
+def _check_price(price: Any) -> float:
+    """A price the engine will hold, or an `InvalidOrder` saying why not.
+
+    An ordinary float is answered in two comparisons and everything else is
+    handed to `_positive_real`, because this runs on every submission and the
+    accept path is the one ADR-0002 measures.
+
+    Finite, real, and strictly positive. The specs require a limit order to
+    carry a price and say nothing about its sign, so positivity is a decision
+    (module docstring, "What a submission has to be"): a negative price makes
+    `commission_for` return a negative charge, and `_settle` adds the
+    commission delta to the trader's currency leg, so the ledger would credit
+    a trader for the privilege of trading. Zero is refused with it, as the
+    price at which every fill is worth nothing and the percentage cap collapses
+    to zero commission for both sides.
+
+    Non-finite is the one that cost a book: `float("nan")` compares false
+    against everything, so a NaN price in a price heap is never the minimum,
+    never evicted, and buries every better price underneath it (lob-d6i).
+    That same property is what the fast path leans on -- `0.0 < price` is
+    already false for a NaN and for `-inf`, so the bounded comparison below
+    is the whole finiteness test and no `isfinite` call is needed for it.
+    """
+    if type(price) is float and 0.0 < price < _INF:
+        return price
+    return _positive_real(price, "price")
+
+
+def _check_notional(qty: int, price: float) -> None:
+    """`qty * price` has to be a number, not an infinity.
+
+    The product is what `_execute` charges commission on and settles in cash.
+    Two individually legal operands can have an illegal product, and floats
+    overflow quietly: the review's 10**300 units at 1e30 came to `value = inf`,
+    took the ledger to +/-inf, and made the percentage commission cap stop
+    capping, since `min(inf, x)` is `x` -- with nothing raised anywhere
+    (lob-d6i).
+
+    That quantity is refused by `MAX_QTY` now, which leaves only the other
+    end: a quantity at the ceiling against a price above `_NOTIONAL_GUARD`,
+    which is the only case the caller need ask about.
+    """
+    if not isfinite(qty * price):
+        raise InvalidOrder(
+            "quantity %r at price %r overflows: qty * price must be finite"
+            % (qty, price)
+        )
 
 
 def _required(update: dict[str, Any], field_name: str, idNum: int) -> Any:
@@ -1663,21 +1950,6 @@ def _book_line(order: Order) -> str:
         order.price,
         order.timestamp,
     )
-
-
-def _at(level: PriceLevel, index: int) -> Order | None:
-    """The `index`-th order in `level`'s queue, or None past the end.
-
-    Matching looks past the front only to step over orders the self-matching
-    gate skipped, so `index` is 0 for every fill of an ordinary workload and
-    this is `first()` with an offset rather than a scan.
-    """
-    if index == 0:
-        return level.first()
-    for position, order in enumerate(level):
-        if position == index:
-            return order
-    return None
 
 
 def _report(trades: list[Trade], tid: int) -> None:
