@@ -790,7 +790,7 @@ class OrderBook:
     the store
         `create_order`, `order`, `orders`
     the book
-        `book`, `rest`, `match`, `snapshot`, and the `get*` queries
+        `book`, `rest`, `match`, `snapshot`, the `get*` queries, and `print`
     the ledgers
         `balance`, `holdings`
     the counters
@@ -1498,6 +1498,52 @@ class OrderBook:
         """Record a trade price as the instrument's last (reporting only)."""
         self.book(instrument).last_price = price
 
+    def print(self, instrument: str) -> str:
+        """The book as text, in the legacy engine's shape. Returns what it prints.
+
+        Eyeball output and nothing else: nothing parses this and no test
+        asserts on it, so the shape is kept only to spare `example.py`'s output
+        a gratuitous diff (design.md, risks).
+
+        Both sides list best price first and FIFO within a price -- the same
+        matching-priority order `snapshot` gives -- as `id)qty-fulfilled @
+        price t=timestamp`. The two `volume ...` probes are legacy's, fixed
+        prices and all: they mean something for the example's book and very
+        little for anyone else's, and `getVolumeAtPrice` is the query to ask
+        directly.
+
+        One section differs, and not by omission. Legacy dumped every trade the
+        instrument had ever seen out of its `trade_detail` table. This engine
+        keeps no trade log -- an execution is returned to its submitter as a
+        `Trade` and, with a sink attached, persisted by it -- and growing one
+        here would put unbounded memory on the sinkless path that ADR-0002
+        exists to keep free, in order to serve a debug print. `last_price` is
+        what the engine does retain about executions, so that is what the
+        section shows; a full history is `select * from trade` against a
+        `SQLiteSink` database.
+        """
+        book = self.book(instrument)
+        lines = ["------ Bids -------"]
+        lines += [_book_line(order) for order in book.bids]
+        lines += ["", "------ Asks -------"]
+        lines += [_book_line(order) for order in book.asks]
+        lines += ["", "------ Trades ------", "last price: %s" % (book.last_price,), ""]
+        lines += [
+            "volume bid if i ask 98: %d"
+            % (self.getVolumeAtPrice(instrument, "bid", 98),),
+            "volume ask if i bid 101: %d"
+            % (self.getVolumeAtPrice(instrument, "ask", 101),),
+            "best bid: %s" % (self.getBestBid(instrument),),
+            "worst bid: %s" % (self.getWorstBid(instrument),),
+            "best ask: %s" % (self.getBestAsk(instrument),),
+            "worst ask: %s" % (self.getWorstAsk(instrument),),
+        ]
+        value = "\n".join(lines) + "\n"
+        # The builtin: a method named `print` shadows it in the class body,
+        # never inside a method body.
+        print(value)
+        return value
+
     # -- counters ----------------------------------------------------------
 
     def next_priority(self) -> int:
@@ -1606,6 +1652,17 @@ def _required(update: dict[str, Any], field_name: str, idNum: int) -> Any:
             "modifying order %r needs a %r (None leaves it unchanged)"
             % (idNum, field_name)
         ) from None
+
+
+def _book_line(order: Order) -> str:
+    """One resting order as `OrderBook.print` writes it (legacy's format)."""
+    return "%s)%s-%s @ %s t=%s" % (
+        order.idNum,
+        order.qty,
+        order.fulfilled,
+        order.price,
+        order.timestamp,
+    )
 
 
 def _at(level: PriceLevel, index: int) -> Order | None:

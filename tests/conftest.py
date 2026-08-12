@@ -17,7 +17,7 @@ from itertools import count
 from pathlib import Path
 
 import pytest
-from PyLOB import OrderBook
+from PyLOB import LegacyOrderBook
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SRC = REPO_ROOT / "src"
@@ -51,7 +51,7 @@ def build_book(
     instrument=INSTRUMENT,
     currency=CURRENCY,
 ):
-    """Create the schema at `db_path`, seed it, and return a connected OrderBook.
+    """Create the schema at `db_path`, seed it, and return a connected book.
 
     The connection is reachable as `book.db`.
     """
@@ -71,7 +71,7 @@ def build_book(
     crsr.execute(SEED_INSTRUMENT, dict(symbol=instrument, currency=currency))
     crsr.execute("commit")
 
-    return OrderBook(db=conn)
+    return LegacyOrderBook(db=conn)
 
 
 @pytest.fixture
@@ -79,7 +79,7 @@ def lob_factory(tmp_path):
     """Factory building independent order books, each on its own sqlite file.
 
     Call it as `lob_factory(traders=(1,), allow_self_matching=1)`; every call
-    returns a fresh `OrderBook`. All connections are closed at teardown.
+    returns a fresh `LegacyOrderBook`. All connections are closed at teardown.
     """
     books = []
     counter = count(1)

@@ -11,9 +11,11 @@ Three seams:
 
 1. **`ENGINES`** -- the registry of engines under test. One entry per engine;
    the `engine` fixture is parameterized over it, so a new engine reaches all
-   four suites without a line changing in any of them. An engine whose module
-   is not importable yet is *skipped*, not failed: today only the legacy SQL
-   `OrderBook` exists and every `inmemory` parameterization skips.
+   four suites without a line changing in any of them. Both engines are live:
+   the in-memory `PyLOB.engine.OrderBook` and the legacy SQL
+   `PyLOB.LegacyOrderBook`, which ADR-0001 keeps in tree as a cross-check
+   oracle. An engine that cannot yet build a book is *skipped* rather than
+   failed -- see `EngineSpec` for the two gates.
 
 2. **The adapter** (`LegacyAdapter`) -- one engine-neutral vocabulary for
    submitting orders and observing the result. The suites never touch SQL, the
@@ -46,7 +48,7 @@ from pathlib import Path
 from typing import Callable, NamedTuple, Optional
 
 import pytest
-from PyLOB import OrderBook
+from PyLOB import LegacyOrderBook
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SRC = REPO_ROOT / "src"
@@ -288,7 +290,7 @@ class LegacyAdapter:
         database file -- the "survives reload" scenarios' whole point.
         """
         self.book.db.close()
-        self.book = OrderBook(db=_connect(self.db_path), tick_size=self.tick_size)
+        self.book = LegacyOrderBook(db=_connect(self.db_path), tick_size=self.tick_size)
         return self
 
     def close(self):
@@ -458,7 +460,7 @@ def build_legacy(
     crsr.execute("commit")
 
     return LegacyAdapter(
-        OrderBook(db=conn, tick_size=tick_size),
+        LegacyOrderBook(db=conn, tick_size=tick_size),
         db_path=db_path,
         instrument=instrument,
         currency=currency,

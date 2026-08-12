@@ -365,7 +365,7 @@ class SQLiteSink:
     `close` conditionally by hand.
 
         with SQLiteSink("session.db") as sink:
-            book = OrderBook(sinks=[sink])
+            book = OrderBook(sink=sink)
             ...
 
     The context manager closes (and therefore flushes) on the way out. Outside
