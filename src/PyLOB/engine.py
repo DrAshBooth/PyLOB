@@ -835,11 +835,16 @@ class OrderBook:
         self._next_seq = 0
 
         self._sink = sink
-        self.emit(
-            SessionStarted(
-                seq=self.next_seq(), timestamp=self.time, tick_size=tick_size
+        # Gated like every other emission, so "a sinkless engine constructs no
+        # event" (ADR-0002) holds without an exception to remember. One event
+        # per session costs nothing measurable; an invariant with an asterisk
+        # on it does, the first time someone relies on the plain statement.
+        if self.recording:
+            self.emit(
+                SessionStarted(
+                    seq=self.next_seq(), timestamp=self.time, tick_size=tick_size
+                )
             )
-        )
 
     def __repr__(self) -> str:
         return "OrderBook(tick_size=%r, instruments=%d, orders=%d)" % (
