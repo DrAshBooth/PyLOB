@@ -115,8 +115,11 @@ and the layer that consumed it disagreed on what the value meant.
   `best_quotes.sql` (the query file) is loaded, shadows nothing, and is used
   nowhere — dead code that also collides with the `best_quotes` view name.
 - **Dead schema**: `event`/`event_arg` tables (planned event system, unused),
-  the `active` column (never set to 0; makes `order_detail`'s commission
-  CASE partially dead), `trade.idNum`.
+  `trade.idNum`. The `active` column was listed here too — right that it was
+  never written, wrong that it was unread: `best_quotes`, `order_detail`'s
+  commission CASE and both test suites' introspection SQL all selected it, so
+  the first removal attempt turned 45 tests red and was reverted. It has since
+  been dropped along with all five read sites (lob-l1z).
 - **API contract drift**: `processOrder` returns `(trades, quote)`;
   `example.py` unpacks the second element as `idNum`. Works only because
   nobody inspects it.

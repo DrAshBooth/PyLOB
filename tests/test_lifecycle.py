@@ -115,7 +115,7 @@ def modify(book, idNum, side, qty, price, tid):
 
 
 ORDER_STATE = """
-select order_id, side, order_type, price, qty, fulfilled, active, cancel, event_dt
+select order_id, side, order_type, price, qty, fulfilled, cancel, event_dt
 from trade_order
 where idNum = ?
 """
@@ -127,7 +127,6 @@ COLUMNS = (
     "price",
     "qty",
     "fulfilled",
-    "active",
     "cancel",
     "event_dt",
 )

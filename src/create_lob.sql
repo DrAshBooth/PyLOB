@@ -82,7 +82,6 @@ create table if not exists trade_order (
     price real, -- trigger price, null for market
     idNum integer, -- external supplied, optional
     trader integer, -- trader
-    active integer default(1),
     cancel integer default(0),
     fulfill_price real default(0),
     commission real not null default(0), -- calculate on fulfill or on cancel, else nullify
@@ -105,7 +104,7 @@ select
 from trade_order
 inner join trader on trader.tid=trade_order.trader
 inner join side on side.side=trade_order.side
-where active=1 and cancel=0 and qty>fulfilled
+where cancel=0 and qty>fulfilled
 -- please note, that the order by clause may need to be added to your select
 order by 
     side asc,
@@ -117,14 +116,8 @@ order by
 create view if not exists order_detail as
 select 
     order_id, instrument, instrument.currency, order_type, side, event_dt, 
-    qty, fulfilled, price, idNum, trader, active, cancel, 
-    -- the commission in case the entire order would be executed
-    case when active=1 
-    then commission 
-    else min(
-    	commission_max_percnt * price * qty / 100, 
-    	max(commission_min, commission_per_unit * qty)) 
-    end as commission, 
+    qty, fulfilled, price, idNum, trader, cancel, 
+    commission, 
     instrument.currency as commission_currency
 from trade_order
 inner join instrument on trade_order.instrument=instrument.symbol
