@@ -216,6 +216,15 @@ class InstrumentConfigured:
 
     A sink needs it to book the currency leg of every trade and the commission
     debit; without it a fill is only half a balance movement.
+
+    `currency` is a currency and never `None`. An instrument may have no
+    currency -- that is what one nobody configured has, and a sink says so
+    rather than inventing one -- but that state is the absence of this event,
+    not a value it can carry. The engine therefore refuses to withdraw a
+    currency instead of emitting a withdrawal (`engine.configure_instrument`;
+    lob-9fu): admitting `None` here would widen the wire format, oblige every
+    sink to unlearn a currency it has already stamped on orders, and buy a
+    single-currency library nothing at all.
     """
 
     KIND: ClassVar[str] = "instrument_configured"

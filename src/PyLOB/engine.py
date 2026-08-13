@@ -201,6 +201,51 @@ Balances track; they do not gate. No margin check, no sufficient-funds check,
 negative balances permitted and recorded on both sides. That absence is a
 requirement of `trader-balances`, not an omission: a well-meaning funds check
 here would break short-selling research workloads.
+
+What the stream records
+-----------------------
+
+`recording-sink` requires the persisted stream to be sufficient to reconstruct
+the book *and the reporting values*, and that is a claim about the public
+surface: every public call that changes engine state has to leave something a
+replayer can re-issue. There are two ways to keep the claim true, and both are
+used here.
+
+**Most operations emit.** `submit`, `cancelOrder`, `modifyOrder`,
+`processOrder`, `configure_instrument` and `configure_trader` each emit the
+event that describes what they did, and a replayer re-issues those events as
+the same calls (`events`, "Replay").
+
+**A mutation no event can express is refused, not performed quietly.**
+`configure_instrument(symbol, None)` used to withdraw an instrument's currency
+while emitting nothing: the engine then stopped booking currency legs, a sink
+holding the currency it was last told went on booking them, and the replay
+reproduced the sink's ledger rather than the engine's. `setLastPrice`
+overwrote the value `book-queries` defines as "the price of the most recent
+trade" with a price no trade made, unrecorded, so the engine and its own log
+disagreed about a reporting value the spec says the log must reconstruct. Both
+raise now (lob-9fu). Shrinking the mutation set is the fix available in this
+module: growing the emission set instead would mean a new event kind, which is
+a change to the stream format *and* to every sink that folds it.
+
+**What is left is the decomposition `submit` is built from** --
+`create_order`, `rest`, `match`, `emit`, `next_priority`, `next_trade_id`,
+`next_seq`. They are public, they are what a harness reaches for, and used as
+a *partial* sequence they are not replay-coherent: `create_order` emits
+`Accepted` and stops, while a replayer turns an `Accepted` into a whole
+`submit`, so a session that accepted an order without matching it replays as
+one that matched it -- inventing trades that never happened. Each of those
+methods says so in its own docstring, and `tests/test_emission_coverage.py`
+walks the public surface and fails on any new public method that changes state
+without emitting and without being listed there. Whether they should be public
+at all is a change to the public API, which `openspec/config.yaml` makes a
+maintainer's decision rather than this module's.
+
+`match` is guarded rather than merely documented, because its failure was not
+a replay mismatch but a live one: handed a hand-built `Order` the engine had
+never accepted, it traded against real resting liquidity and moved four
+balances for an order `order()` could not find. It now refuses a taker that is
+not its own.
 """
 
 from __future__ import annotations
@@ -282,10 +327,16 @@ class PyLOBError(Exception):
 
 
 class InvalidOrder(PyLOBError, ValueError):
-    """A submission or modification the engine will not accept.
+    """A submission, modification or configuration the engine will not accept.
 
     Also a `ValueError`, because that is what a caller who has never read
     these docs will already be catching around bad input.
+
+    It covers two kinds of refusal, and the second is not about the input
+    being malformed: a call whose effect the event stream could not express
+    is refused too, because performing it would leave the engine and its own
+    log describing different sessions (`configure_instrument` withdrawing a
+    currency, `setLastPrice`; module docstring, "What the stream records").
     """
 
 
@@ -299,7 +350,13 @@ class DuplicateOrderID(InvalidOrder):
 
 
 class UnknownOrder(PyLOBError, LookupError):
-    """Cancel or modify named an identifier no order has."""
+    """An operation named an order this engine does not have.
+
+    Either by identifier -- cancel or modify against one no order carries --
+    or by object: `match` and `rest` refuse an `Order` the engine never
+    accepted, however well formed it is, because trading or resting one puts
+    liquidity in the book that no event describes (lob-9fu).
+    """
 
 
 # --------------------------------------------------------------------------
@@ -969,6 +1026,12 @@ class OrderBook:
     Construction emits `SessionStarted`, so a stream always opens with the
     tick size a replay needs in order to quantize the same way.
 
+    The configuration calls and the operations emit, and a replayer re-issues
+    what they emitted as the same calls. The store, the book and the counters
+    are the decomposition `submit` is built from: each one that changes state
+    without emitting says so in its own docstring, under "Not replay-coherent"
+    (module docstring, "What the stream records").
+
     Single-threaded and synchronous throughout. An operation is finished --
     matched, rested or cancelled, balances moved, events emitted -- before it
     returns, so there is no in-flight state for a caller to observe.
@@ -1031,15 +1094,39 @@ class OrderBook:
 
     # -- configuration -----------------------------------------------------
 
-    def configure_instrument(self, symbol: str, currency: str | None = None) -> None:
+    def configure_instrument(self, symbol: str, currency: str) -> None:
         """Declare an instrument and the currency it settles in.
 
         A sink cannot book the cash leg of a trade without the currency, so
         this is a recorded event and not merely local state.
+
+        Re-callable: naming a different currency re-denominates the legs of
+        every *later* trade, and the event says so, so a replay re-denominates
+        at the same point in the stream.
+
+        There is no way to take a currency back. `currency=None` used to be
+        accepted and to withdraw the declaration while emitting nothing --
+        `InstrumentConfigured` requires a currency, and the emission was
+        skipped rather than the assignment -- after which the engine settled
+        the instrument leg alone and a sink, still holding the currency it was
+        last told about, went on booking the cash leg for every trade. Two
+        ledgers, no event between them, and a replay that reproduced the
+        sink's (lob-9fu). Refusing it is the fix this module can make on its
+        own: the alternative, an `InstrumentConfigured` carrying no currency,
+        is a change to the stream format and to every sink that folds it, and
+        a single-currency library (`config.yaml`) has nothing to spend that
+        on. An instrument with no currency is still a supported state -- it is
+        what an instrument that was never configured has, and `_settle` moves
+        its instrument leg and leaves the cash leg recoverable from the fill.
         """
+        if not isinstance(currency, str) or not currency:
+            raise InvalidOrder(
+                "instrument %r needs a non-empty currency, got %r: a currency "
+                "cannot be withdrawn, because no event says it was" % (symbol, currency)
+            )
         book = self.book(symbol)
         book.currency = currency
-        if self.recording and currency is not None:
+        if self.recording:
             self.emit(
                 InstrumentConfigured(
                     seq=self.next_seq(),
@@ -1151,6 +1238,16 @@ class OrderBook:
         The input gate is here and nowhere else on the submission path, and
         every check it makes runs before the clock moves (module docstring,
         "What a submission has to be"; lob-d6i).
+
+        Not replay-coherent on its own. `Accepted` is the record of a
+        submission, and a replayer re-issues it as a whole `submit` -- accept,
+        cross, then rest or cancel -- because that is what an acceptance
+        means in every stream `submit` writes. A caller that accepts an order
+        and stops therefore records a session it did not run: a bid left
+        unmatched over a crossing ask replays as a bid that took it, trades
+        and all (lob-9fu). Use `submit` unless you are going on to `match` and
+        `rest` yourself, and expect the stream of a session that did not to
+        describe the submission rather than the acceptance.
         """
         side = _as_side(side)
         order_type = _as_order_type(order_type)
@@ -1451,7 +1548,23 @@ class OrderBook:
         The walk within a level is one cursor, advanced; it used to be an
         index, re-read from the front of the queue on every step, which made
         stepping over k of the taker's own orders cost O(k^2) (lob-rp4).
+
+        Not replay-coherent on its own: this is half of `submit`, and what it
+        leaves unmatched neither rests nor is cancelled until a caller says
+        so. The trades it does execute are emitted as they happen, so it
+        cannot leave a fill unrecorded -- but only if the taker is an order
+        the engine accepted, which is why the first thing it does is check.
+        A hand-built `Order` used to trade here against real resting
+        liquidity, moving four balances and draining the book for an order
+        `order()` returned `None` for and no `Accepted` ever described
+        (lob-9fu).
         """
+        if self._orders.get(taker.idNum) is not taker:
+            raise UnknownOrder(
+                "order %r is not this engine's: matching an order it never "
+                "accepted trades real liquidity for an order no event "
+                "describes" % (taker.idNum,)
+            )
         trades: list[Trade] = []
         book = self.book(taker.instrument)
         makers = book.opposite(taker.side)
@@ -1675,7 +1788,20 @@ class OrderBook:
         Called with whatever a submission or a modification has left over. A
         market order never gets here (`order-lifecycle`: it is
         immediate-or-cancel), and neither does a fully filled one.
+
+        Not replay-coherent on its own, and it emits nothing: resting is the
+        *absence* of a transition, and what records it is the `Accepted` (or
+        `Modified`) of the order that got here, which a replayer re-issues as
+        a whole `submit`. Calling it on an order the engine did not accept is
+        refused for the reason `match` is: an order in the book that no event
+        describes is liquidity a replay cannot rebuild.
         """
+        if self._orders.get(order.idNum) is not order:
+            raise UnknownOrder(
+                "order %r is not this engine's: resting an order it never "
+                "accepted puts liquidity in the book that no event describes"
+                % (order.idNum,)
+            )
         if order.order_type is not OrderType.LIMIT:
             raise InvalidOrder("order %r is not a limit order" % (order.idNum,))
         if order.cancelled:
@@ -1724,8 +1850,29 @@ class OrderBook:
         return self.book(instrument).last_price
 
     def setLastPrice(self, instrument: str, price: float) -> None:
-        """Record a trade price as the instrument's last (reporting only)."""
-        self.book(instrument).last_price = price
+        """Refused: the last-trade price is output, and cannot be dictated.
+
+        `book-queries` defines the value this would overwrite as "the price of
+        the most recent trade", and requires that after a reload it equal the
+        last trade in the persisted record. An assignment satisfies neither
+        clause: it names a price no trade made, and it emitted nothing, so the
+        engine reported 999.0 while its own log -- the thing `recording-sink`
+        says must reconstruct the reporting values -- said the price of the
+        last real trade, and a replay landed on the log's answer (lob-9fu).
+
+        `_execute` sets the value where it is defined, on every execution.
+        Seeding an opening price before the first trade is the use this
+        refuses; it would need an event of its own, which is a stream-format
+        change and a maintainer's call, not a setter's.
+
+        Raises `InvalidOrder` always. Kept as a name that says why rather than
+        deleted, because removing a public name needs an ADR (`config.yaml`).
+        """
+        raise InvalidOrder(
+            "the last-trade price of %r is engine output, set by executions "
+            "(%r): assigning it reports a price no trade made and no event "
+            "records" % (instrument, price)
+        )
 
     def print(self, instrument: str) -> str:
         """The book as text, in the legacy engine's shape. Returns what it prints.
@@ -1775,20 +1922,44 @@ class OrderBook:
 
     # -- counters ----------------------------------------------------------
 
+    # Each of the three hands out a number and moves on; nothing re-issues a
+    # number, and no event says one was taken. Called from outside the
+    # operation that needs it, they are silent state changes -- which is what
+    # the list in `tests/test_emission_coverage.py` records them as.
+
     def next_priority(self) -> int:
-        """The next arrival stamp. Advances whether or not a sink is attached."""
+        """The next arrival stamp. Advances whether or not a sink is attached.
+
+        Not replay-coherent: a stamp taken outside `create_order` or a
+        repricing `modifyOrder` belongs to no order and is recorded nowhere,
+        so every later order's `priority` is one higher here than in the
+        replay of this session. Priority is the matching tie-break, so that is
+        a divergence in matching order, not merely in a reported number.
+        """
         priority = self._next_priority
         self._next_priority += 1
         return priority
 
     def next_trade_id(self) -> int:
-        """The next trade identifier."""
+        """The next trade identifier.
+
+        Not replay-coherent: as with `next_priority`, an identifier taken
+        outside `_execute` names no trade, and every later trade is numbered
+        one higher than the replay numbers it.
+        """
         trade_id = self._next_trade_id
         self._next_trade_id += 1
         return trade_id
 
     def next_seq(self) -> int:
-        """The next position in the event stream. Matching must never read it."""
+        """The next position in the event stream. Matching must never read it.
+
+        Not replay-coherent: a `seq` taken without an event to carry it
+        leaves a hole in the stream, and a sink reading the log is entitled to
+        treat a non-contiguous `seq` range as a lost event (`sinks.sqlite`,
+        `check_log`) -- a session that called this would be read as a damaged
+        one.
+        """
         seq = self._next_seq
         self._next_seq += 1
         return seq
@@ -1806,7 +1977,13 @@ class OrderBook:
         return self._sink is not None
 
     def emit(self, event: Event) -> None:
-        """Hand one event to the sink, or drop it when there is none."""
+        """Hand one event to the sink, or drop it when there is none.
+
+        Not replay-coherent: it records, it does not act. An event pushed in
+        from outside describes a transition the engine did not make, and the
+        replay of that stream makes it -- the one direction of divergence the
+        others do not have.
+        """
         if self._sink is not None:
             self._sink.consume(event)
 
