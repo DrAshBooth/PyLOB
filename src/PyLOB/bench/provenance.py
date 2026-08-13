@@ -17,6 +17,11 @@ everything it cannot correct for, and its job is to make the failure modes
 - **Load.** The ADR records a spread of 49k to 114k orders/sec for one
   workload inside a single interleaved loop, with load average between 1.9
   and 325.
+- **Interpreter build.** Not a machine property at all, and the one thing
+  calibration cannot correct for: the judged quantity is a ratio of two Python
+  programs and two CPython builds do not agree on it. `interpreter()` records
+  the identity and `baselines.compare` refuses across a mismatch rather than
+  scaling one build's number by another's.
 
 Everything in this module is best-effort and degrades to `None` rather than
 raising. A benchmark that refused to run because it could not read a battery
@@ -71,6 +76,7 @@ __all__ = [
     "CoreClock",
     "capture",
     "effective_ghz",
+    "interpreter",
     "measure_core_class",
     "request_performance_core",
 ]
@@ -415,6 +421,38 @@ def measure_core_class(run_ghz: float | None) -> tuple[str | None, float | None]
     return None, reference
 
 
+def interpreter() -> dict[str, Any]:
+    """Which Python this is, in enough detail to tell two builds apart.
+
+    Not decoration. The benchmark's judged quantity -- orders processed per
+    calibration pass -- is a ratio of two Python programs, and the ratio is not
+    the same on two interpreters: the same deliberate engine defect has been
+    seen to earn opposite verdicts on two supported CPython builds, because a
+    build's own tuning moves the engine's cost and the calibration's cost by
+    different amounts. Normalisation corrects for a slower *machine*; nothing
+    here corrects for a different *interpreter*.
+
+    So the interpreter is recorded with every baseline and `baselines.compare`
+    refuses across a mismatch (`baselines.interpreter_label` renders it), which
+    is the honest thing rather than the complete one: making the quantity
+    portable across builds is a larger piece of work than making the harness
+    admit it is not.
+
+    `build` is `platform.python_build()`, which distinguishes a python.org
+    3.11.11 from a Homebrew one built on another day -- exactly the pair whose
+    difference is invisible in the version number.
+    """
+    build = platform.python_build()
+    return {
+        "implementation": platform.python_implementation(),
+        "version": platform.python_version(),
+        "build": " ".join(part for part in build if part),
+        # Reported, never compared: a compiler string is informative about a
+        # surprising number and too volatile to gate on.
+        "compiler": platform.python_compiler() or None,
+    }
+
+
 def capture(machine_label: str | None = None) -> dict[str, Any]:
     """Everything about the machine that a surprising number might need.
 
@@ -430,6 +468,9 @@ def capture(machine_label: str | None = None) -> dict[str, Any]:
         "cores": counts,
         "python": "%s %s"
         % (platform.python_implementation(), platform.python_version()),
+        #: The structured form, which `baselines.compare` refuses to cross.
+        #: `python` above stays as the human-readable line in the report.
+        "interpreter": interpreter(),
         "power_source": _power_source(),
         "loadavg": _loadavg(),
         "commit": _commit(),

@@ -30,6 +30,14 @@ BASE_OPS = 100_000.0
 BASE_CALIB = 0.050
 BASE_WORK = BASE_OPS * BASE_CALIB
 
+#: The same experiment on both sides, so the arithmetic tests below are about
+#: the arithmetic. The tests that vary a fingerprint say so.
+SAME = baselines.Fingerprint(
+    workload_checksum=1234,
+    calibration_checksum=5678,
+    interpreter={"implementation": "CPython", "version": "3.11.11", "build": "b"},
+)
+
 
 def compare(measured, calibration_seconds, **kwargs):
     """A run of `measured` orders/sec on a machine of `calibration_seconds`.
@@ -39,6 +47,8 @@ def compare(measured, calibration_seconds, **kwargs):
     quantity the harness actually judges on rather than a hand-set one.
     """
     kwargs.setdefault("measured_work_index", measured * calibration_seconds)
+    kwargs.setdefault("measured_fingerprint", SAME)
+    kwargs.setdefault("baseline_fingerprint", SAME)
     return baselines.compare(
         measured=measured,
         measured_calibration_seconds=calibration_seconds,
@@ -182,6 +192,159 @@ def test_low_confidence_does_not_hide_a_regression():
     assert result.failed
 
 
+def test_a_run_that_did_not_hold_still_is_low_confidence():
+    """The signal that sees the case the machine-distance ratio cannot.
+
+    A run whose judged quantity moved further across its own repeats than the
+    band the verdict is drawn at did not measure one thing three times, and its
+    verdict could have gone either way. The two calibration figures can be
+    identical while that happens, which is why a ratio of them is not on its
+    own a confidence signal.
+    """
+    steady = compare(BASE_OPS, BASE_CALIB, dispersion=0.05)
+    unsteady = compare(BASE_OPS, BASE_CALIB, dispersion=0.50)
+
+    assert steady.confident
+    assert steady.speed_ratio == pytest.approx(unsteady.speed_ratio), (
+        "the machine looks identical to the ratio in both runs"
+    )
+    assert not unsteady.confident
+    assert any(
+        "did not measure one thing" in note for note in unsteady.confidence_notes
+    )
+
+
+def test_the_dispersion_threshold_is_the_tolerance_in_force():
+    """Not a constant: the question is whether the verdict could have flipped.
+
+    Dispersion matters relative to the band separating "ok" from "regression",
+    so a run tolerated at 40% may disperse further than one judged at 5%.
+    """
+    assert compare(BASE_OPS, BASE_CALIB, dispersion=0.10, tolerance=0.40).confident
+    assert not compare(BASE_OPS, BASE_CALIB, dispersion=0.10, tolerance=0.05).confident
+
+
+def test_each_reason_for_low_confidence_carries_its_own_number():
+    """A boolean says "distrust this" and stops. The report has to say why.
+
+    Both signals can fire at once and they mean different things -- one about
+    the machine's distance from the baseline, one about the run's own
+    steadiness -- so they are reported as a list rather than collapsed.
+    """
+    result = compare(BASE_OPS * 0.5, BASE_CALIB / 0.5, dispersion=0.9)
+
+    assert len(result.confidence_notes) == 2
+    assert result.dispersion == pytest.approx(0.9)
+    assert any("90%" in note for note in result.confidence_notes)
+    assert any("0.50x" in note for note in result.confidence_notes)
+
+
+# --------------------------------------------------------------------------
+# fingerprints: a baseline that measured something else cannot judge this run
+# --------------------------------------------------------------------------
+
+
+def test_a_baseline_of_a_different_workload_refuses_to_judge():
+    """The hole the recorded checksums were meant to close and did not.
+
+    `mixed-v1`'s composition can be edited without renaming it; the key still
+    matches, so the baseline is found and scaled and a verdict comes out. The
+    demonstration was a 44% change in trade count reported as `ok`. The
+    checksum was recorded on both sides the whole time and nothing compared
+    them.
+    """
+    result = compare(
+        BASE_OPS,
+        BASE_CALIB,
+        baseline_fingerprint=SAME._replace(
+            workload_checksum=SAME.workload_checksum + 1
+        ),
+    )
+
+    assert result.status == "incomparable"
+    assert not result.failed, "not a regression: an inability to tell"
+    assert result.normalised is None
+    assert any("different order stream" in why for why in result.mismatches)
+
+
+def test_a_baseline_of_a_different_calibration_computation_refuses_to_judge():
+    result = compare(
+        BASE_OPS,
+        BASE_CALIB,
+        baseline_fingerprint=SAME._replace(calibration_checksum=9),
+    )
+
+    assert result.status == "incomparable"
+    assert any("reference computation" in why for why in result.mismatches)
+
+
+def test_a_baseline_recorded_on_another_interpreter_refuses_to_judge():
+    """P1-B, answered honestly rather than completely.
+
+    The judged quantity is a ratio of two Python programs and two CPython
+    builds do not agree on it -- the same deliberate defect has earned opposite
+    verdicts on two supported builds. Making it portable is a larger job;
+    saying so is this one.
+    """
+    other = dict(SAME.interpreter, build="main Jan 1 2024")
+
+    result = compare(
+        BASE_OPS, BASE_CALIB, baseline_fingerprint=SAME._replace(interpreter=other)
+    )
+
+    assert result.status == "incomparable"
+    assert any("different interpreter" in why for why in result.mismatches)
+
+
+def test_a_version_difference_alone_is_enough():
+    other = dict(SAME.interpreter, version="3.12.1")
+
+    result = compare(
+        BASE_OPS, BASE_CALIB, baseline_fingerprint=SAME._replace(interpreter=other)
+    )
+
+    assert result.status == "incomparable"
+
+
+def test_a_baseline_that_records_no_fingerprint_cannot_be_shown_to_match():
+    """Absence of evidence is not a pass.
+
+    A record with no checksums is not "compatible with anything"; it is a
+    record that cannot say what it measured, and scaling by it is a guess.
+    """
+    for field in ("workload_checksum", "calibration_checksum", "interpreter"):
+        result = compare(
+            BASE_OPS, BASE_CALIB, baseline_fingerprint=SAME._replace(**{field: None})
+        )
+
+        assert result.status == "incomparable", field
+
+
+def test_matching_fingerprints_judge_normally():
+    """The guard is not a wall: identical experiments compare as before."""
+    assert compare(BASE_OPS, BASE_CALIB).status == "ok"
+    assert compare(BASE_OPS * 0.5, BASE_CALIB).status == "regression"
+
+
+# --------------------------------------------------------------------------
+# the tolerance is a band, not an off switch
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("tolerance", [1.0, 1.5, 0.0, -0.1])
+def test_a_tolerance_that_is_not_a_band_is_refused(tolerance):
+    """At 1.0 the floor is zero and every run passes, which looks like a setting.
+
+    A guard silently switched off by a plausible-looking number is worse than
+    one that is absent, because the absence is visible.
+    """
+    with pytest.raises(ValueError, match="between 0 and 1"):
+        baselines.validate_tolerance(tolerance)
+
+    with pytest.raises(ValueError, match="between 0 and 1"):
+        compare(BASE_OPS * 0.01, BASE_CALIB, tolerance=tolerance)
+
+
 # --------------------------------------------------------------------------
 # absent baselines
 # --------------------------------------------------------------------------
@@ -192,9 +355,11 @@ def test_no_baseline_is_an_absence_and_not_a_regression():
         measured=123.0,
         measured_work_index=6.0,
         measured_calibration_seconds=BASE_CALIB,
+        measured_fingerprint=SAME,
         baseline=None,
         baseline_work_index=None,
         baseline_calibration_seconds=None,
+        baseline_fingerprint=None,
     )
 
     assert result.status == "no-baseline"
@@ -203,46 +368,158 @@ def test_no_baseline_is_an_absence_and_not_a_regression():
 
 
 def test_a_placeholder_entry_reads_as_no_baseline():
+    """A placeholder is an absence. A half-written record is not.
+
+    The second half of that sentence is a change: `entry` used to return None
+    for a record that was missing its work index, which reports as "no baseline
+    recorded" and exits 0. A file that had lost half its contents would
+    therefore turn the guard off and say nothing at all -- the failure the
+    marking exists to prevent, arriving by another door. A record that claims
+    to be a measurement is now returned whatever state it is in, and
+    `record_problems` says what is wrong with it, so a corruption is an error
+    and only a genuine absence is benign.
+    """
     document = {
         "schema": 1,
         "baselines": {
             "k": {"placeholder": True, "sinkless_orders_per_sec": None},
             "partial": {"placeholder": False, "sinkless_orders_per_sec": 1.0},
-            "real": {
-                "placeholder": False,
-                "sinkless_orders_per_sec": 1.0,
-                "work_index": 2.0,
-            },
         },
     }
 
     assert baselines.entry(document, "k") is None
     assert baselines.entry(document, "missing") is None
-    assert baselines.entry(document, "partial") is None, (
-        "a record without a work index cannot be judged against"
+    assert baselines.entry(document, "partial") is not None
+    assert any(
+        "work_index" in problem
+        for problem in baselines.record_problems(baselines.entry(document, "partial"))
+    ), "a record without a work index must be named as broken, not as absent"
+
+
+def well_formed(**overrides):
+    """A recorded baseline with every field a comparison needs."""
+    record = {
+        "placeholder": False,
+        "sinkless_orders_per_sec": BASE_OPS,
+        "sink_orders_per_sec": 80_000.0,
+        "trades": 4_000,
+        "work_index": BASE_WORK,
+        "work_index_spread": 0.02,
+        "calibration": "calib-v1",
+        "calibration_seconds": BASE_CALIB,
+        "calibration_best_seconds": BASE_CALIB,
+        "calibration_checksum": 4717557328431862,
+        "calibration_spread": 0.01,
+        "workload_checksum": 15240231136383276365,
+        "interpreter": {
+            "implementation": "CPython",
+            "version": "3.11.11",
+            "build": "main Mar 11 2025",
+        },
+        "repeats": 3,
+        "tolerance": 0.20,
+        "recorded_utc": "2026-08-13T09:00:00+00:00",
+        "provenance": {"machine": "somewhere"},
+    }
+    record.update(overrides)
+    return record
+
+
+def test_a_well_formed_record_has_no_problems():
+    assert baselines.record_problems(well_formed()) == []
+
+
+@pytest.mark.parametrize(
+    "overrides, expected",
+    [
+        ({"work_index": None}, "work_index is null"),
+        ({"sinkless_orders_per_sec": None}, "sinkless_orders_per_sec is null"),
+        ({"calibration_seconds": None}, "calibration_seconds is null"),
+        ({"interpreter": None}, "interpreter is null"),
+        ({"workload_checksum": None}, "workload_checksum is null"),
+        ({"work_index": "5000"}, "not int or float"),
+        ({"work_index": 0}, "not above zero"),
+        ({"calibration_seconds": -1.0}, "not above zero"),
+        ({"calibration_seconds": 900.0}, "unit error"),
+        ({"tolerance": 1.0}, "tolerance must be between 0 and 1"),
+        ({"repeats": 0}, "not above zero"),
+        ({"trades": -1}, "negative"),
+        (
+            {"interpreter": {"implementation": "CPython"}},
+            "implementation and a version",
+        ),
+        ({"work_index": BASE_WORK * 1_000}, "do not describe one run"),
+    ],
+)
+def test_every_way_a_record_is_not_a_baseline_is_named(overrides, expected):
+    """A recorded baseline is complete or it is broken; there is no middle.
+
+    Each case here is a file that could plausibly exist -- half-written by an
+    interrupted run, hand-edited, truncated, or recorded in milliseconds -- and
+    every one of them must be an error rather than something the guard shrugs
+    at.
+    """
+    problems = baselines.record_problems(well_formed(**overrides))
+
+    assert any(expected in problem for problem in problems), problems
+
+
+def test_a_missing_field_is_named_rather_than_crashing():
+    record = well_formed()
+    del record["calibration_checksum"]
+
+    assert any(
+        "calibration_checksum is missing" in problem
+        for problem in baselines.record_problems(record)
     )
-    assert baselines.entry(document, "real") is not None
 
 
-def test_the_shipped_baselines_file_is_a_marked_placeholder():
-    """`benchmarks/baselines.json` must not pretend to hold a measurement.
+def test_the_shipped_baselines_file_is_a_placeholder_or_a_real_baseline():
+    """`benchmarks/baselines.json` must never be *half* of either.
 
-    Recording real numbers is a deliberate act on a quiet machine. Until it
-    happens the file documents the schema and guards nothing, and it must say
-    so in terms nobody can miss.
+    This test used to assert the shipped file **is** a placeholder. That was
+    right about the danger and wrong about where it lives: a placeholder must
+    never masquerade as a real baseline, but "the file is a placeholder" is a
+    fact about where the project has got to, not a property of the system, and
+    it stops being true the moment the maintainer records on a quiet machine.
+    Pinned as an assertion it made the recording run turn `./verify` red --
+    the guard's own test forbidding the guard from being armed.
+
+    So the property, stated as one: **every entry is either a marked
+    placeholder holding no measurements, or a recorded baseline complete enough
+    to judge a run against.** Both states are legitimate, and the file is never
+    allowed to sit between them -- which is what would let a null read as a
+    number, or a number hide behind a placeholder marking.
     """
     path = Path(__file__).resolve().parent.parent / "benchmarks" / "baselines.json"
     document = json.loads(path.read_text(encoding="utf-8"))
 
     assert document["schema"] == baselines.SCHEMA
-    assert "PLACEHOLDER" in document["note"]
     assert document["baselines"], "the file should still document the key format"
     for key, record in document["baselines"].items():
-        assert record["placeholder"] is True, key
-        assert record["sinkless_orders_per_sec"] is None, key
-        assert record["work_index"] is None, key
-        assert record["calibration_seconds"] is None, key
-        assert baselines.entry(document, key) is None, key
+        if baselines.is_placeholder(record):
+            assert baselines.placeholder_problems(record) == [], key
+            assert "PLACEHOLDER" in document["note"], (
+                "a file that guards nothing has to say so where nobody can miss it"
+            )
+            assert baselines.entry(document, key) is None, key
+        else:
+            assert baselines.record_problems(record) == [], key
+            assert baselines.entry(document, key) is not None, key
+
+
+def test_a_placeholder_carrying_a_measurement_is_refused():
+    """The half the original test was right about, kept exactly.
+
+    A marked placeholder with a number in it is the masquerade that makes a
+    marking worthless: the harness reads the marking and reports NO BASELINE
+    while the file looks, to a reader, like a recorded measurement.
+    """
+    problems = baselines.placeholder_problems(
+        {"placeholder": True, "sinkless_orders_per_sec": 100_000.0, "work_index": None}
+    )
+
+    assert any("sinkless_orders_per_sec" in problem for problem in problems)
 
 
 # --------------------------------------------------------------------------
@@ -368,40 +645,90 @@ def test_saved_files_are_readable_in_a_diff(tmp_path):
 # the command line
 # --------------------------------------------------------------------------
 
-#: Small enough to keep these two tests well under a second, and still a real
-#: run of the real engine through the real entry point.
+#: Small enough to keep these tests well under a second, and still a real run
+#: of the real engine through the real entry point.
 SMOKE = ["--orders", "400", "--repeats", "1", "--no-sink", "--no-qos"]
 
+KEY = baselines.baseline_key("mixed-v1", 42, 400, "calib-v1")
 
-def test_rebaseline_records_and_a_later_run_compares_against_it(tmp_path, capsys):
-    """The recorded number is what a later run is judged against.
+
+def record_baseline(path, *extra):
+    """Record a baseline at `path` and return the document and its record.
 
     `--force` because the machine running the suite is not promised to be
     quiet; the gate that would otherwise refuse has its own tests above.
     """
-    path = tmp_path / "baselines.json"
-
-    assert main([*SMOKE, "--baselines", str(path), "--rebaseline", "--force"]) == 0
-
+    assert main(
+        [*SMOKE, "--baselines", str(path), "--rebaseline", "--force", *extra]
+    ) in (
+        0,
+        1,
+    )
     document = json.loads(path.read_text(encoding="utf-8"))
-    key = baselines.baseline_key("mixed-v1", 42, 400, "calib-v1")
-    record = document["baselines"][key]
+    return document, document["baselines"][KEY]
+
+
+def scale(path, document, record, factor):
+    """Claim the recorded run was `factor` times faster than it was.
+
+    Both figures move together, because both describe one run: an engine four
+    times faster does four times the work per calibration pass *and* reports
+    four times the throughput. Moving only the work index would leave a record
+    whose fields contradict each other, which `record_problems` now refuses --
+    correctly, since no measurement could produce it.
+
+    The factors below are twentyfold and not fourfold, and deliberately so:
+    two consecutive runs of this 400-order smoke measurement on a contended
+    laptop have been seen a factor of 2.2 apart, so a claim only four times the
+    truth is a verdict this machine can overturn by being busy. Twenty is
+    outside anything jitter reaches, which keeps these assertions arithmetic --
+    the property this file's docstring claims for them.
+    """
+    record["work_index"] *= factor
+    record["sinkless_orders_per_sec"] *= factor
+    baselines.save(path, document)
+
+
+def test_rebaseline_records_and_a_later_run_compares_against_it(tmp_path, capsys):
+    """The recorded number is what a later run is judged against."""
+    path = tmp_path / "baselines.json"
+    document, record = record_baseline(path)
+
     assert record["placeholder"] is False
     assert record["sinkless_orders_per_sec"] > 0
     assert record["work_index"] > 0
     assert record["calibration_seconds"] > 0
     assert record["provenance"]["commit"]["sha"] is not None
+    assert baselines.record_problems(record) == [], (
+        "a freshly recorded baseline must satisfy the contract the shipped "
+        "file is held to"
+    )
 
     # A four-fold claim about the baseline is beyond any jitter either way, so
     # these two verdicts are arithmetic rather than luck.
-    record["work_index"] *= 4
-    baselines.save(path, document)
+    scale(path, document, record, 20)
     assert main([*SMOKE, "--baselines", str(path)]) == 1
     assert "REGRESSION" in capsys.readouterr().err
 
-    record["work_index"] /= 16
-    baselines.save(path, document)
+    scale(path, document, record, 1 / 400)
     assert main([*SMOKE, "--baselines", str(path)]) == 0
+
+
+def test_a_recorded_baseline_keeps_the_shipped_files_contract(tmp_path):
+    """The blocker, end to end: recording must not break `./verify`.
+
+    A recorded baseline is written by the harness and then held to exactly the
+    check `tests` applies to the shipped file. If these two ever disagree, the
+    maintainer's recording run turns the suite red and the only way out is to
+    un-record it.
+    """
+    path = tmp_path / "baselines.json"
+    document, record = record_baseline(path)
+
+    assert not baselines.is_placeholder(record)
+    assert baselines.record_problems(record) == []
+    assert baselines.entry(document, KEY) is not None
+    assert "PLACEHOLDER" not in document["note"]
 
 
 def test_a_faster_run_does_not_silently_rebaseline(tmp_path):
@@ -411,12 +738,8 @@ def test_a_faster_run_does_not_silently_rebaseline(tmp_path):
     and it means nobody ever reviews the number the guard is set at.
     """
     path = tmp_path / "baselines.json"
-    main([*SMOKE, "--baselines", str(path), "--rebaseline", "--force"])
-
-    document = json.loads(path.read_text(encoding="utf-8"))
-    key = baselines.baseline_key("mixed-v1", 42, 400, "calib-v1")
-    document["baselines"][key]["work_index"] /= 8
-    baselines.save(path, document)
+    document, record = record_baseline(path)
+    scale(path, document, record, 1 / 20)
     before = path.read_bytes()
 
     assert main([*SMOKE, "--baselines", str(path)]) == 0
@@ -426,3 +749,205 @@ def test_a_faster_run_does_not_silently_rebaseline(tmp_path):
 def test_an_unknown_workload_is_a_usage_error(capsys):
     assert main(["--workload", "no-such", "--repeats", "1"]) == 2
     assert "unknown workload" in capsys.readouterr().err
+
+
+# --------------------------------------------------------------------------
+# the guard failing to apply is not the guard passing
+# --------------------------------------------------------------------------
+
+
+def test_a_mislocated_baselines_path_is_an_error_and_not_an_empty_guard(
+    tmp_path, capsys
+):
+    """A typo in `--baselines` used to read as "nothing recorded" and exit 0.
+
+    Which is the worst outcome available: the guard is off, the exit code says
+    everything is fine, and the report says so too.
+    """
+    assert main([*SMOKE, "--baselines", str(tmp_path / "typo.json")]) == 3
+    assert "no baselines file" in capsys.readouterr().err
+
+
+def test_a_corrupt_baselines_file_does_not_read_as_a_regression(tmp_path, capsys):
+    """Exit 3, not 1: "I cannot tell" is not "you made it slower"."""
+    path = tmp_path / "baselines.json"
+    path.write_text("{ this is not json", encoding="utf-8")
+
+    assert main([*SMOKE, "--baselines", str(path)]) == 3
+    assert "not valid JSON" in capsys.readouterr().err
+
+
+def test_a_baselines_path_that_is_a_directory_is_not_a_regression_either(tmp_path):
+    """`exists()` is true of a directory, and reading one raises OSError.
+
+    Left uncaught it would be a traceback; caught as a regression it would be a
+    lie. It is the same event as a corrupt file: no baseline to apply.
+    """
+    directory = tmp_path / "baselines.json"
+    directory.mkdir()
+
+    assert main([*SMOKE, "--baselines", str(directory)]) == 3
+
+
+def test_a_half_written_baseline_is_an_error_rather_than_an_absence(tmp_path, capsys):
+    """The other way a file can disarm the guard while looking fine."""
+    path = tmp_path / "baselines.json"
+    document, record = record_baseline(path)
+    del record["work_index"]
+    baselines.save(path, document)
+
+    assert main([*SMOKE, "--baselines", str(path)]) == 3
+    assert "not usable" in capsys.readouterr().err
+
+
+def test_an_edited_workload_fails_loudly_instead_of_reporting_ok(tmp_path, capsys):
+    """The demonstrated hole, closed.
+
+    Editing `mixed-v1`'s composition without renaming it changed the trade
+    count by 44% and the throughput by 26%, and the harness reported `ok` and
+    exited 0 -- the baseline's workload checksum and the run's stream
+    fingerprint both sat in the process, uncompared. Here the recorded
+    checksum is changed instead, which is the same event from the file's side:
+    the baseline measured a stream this run did not.
+    """
+    path = tmp_path / "baselines.json"
+    document, record = record_baseline(path)
+    record["workload_checksum"] += 1
+    baselines.save(path, document)
+
+    assert main([*SMOKE, "--baselines", str(path)]) == 3
+    assert "different order stream" in capsys.readouterr().err
+
+
+def test_a_baseline_from_another_interpreter_refuses_rather_than_misjudging(
+    tmp_path, capsys
+):
+    path = tmp_path / "baselines.json"
+    document, record = record_baseline(path)
+    record["interpreter"] = dict(record["interpreter"], version="3.9.0")
+    baselines.save(path, document)
+
+    assert main([*SMOKE, "--baselines", str(path)]) == 3
+    assert "different interpreter" in capsys.readouterr().err
+
+
+def test_a_tolerance_that_disables_the_guard_is_a_usage_error(tmp_path, capsys):
+    path = tmp_path / "baselines.json"
+    record_baseline(path)
+
+    assert main([*SMOKE, "--baselines", str(path), "--tolerance", "1.0"]) == 2
+    assert "between 0 and 1" in capsys.readouterr().err
+
+
+def test_the_recorded_tolerance_is_used_when_none_is_given(tmp_path):
+    """The field was written and never read, which made it a comment.
+
+    A baseline recorded to be judged at a given band is judged at that band by
+    a later run that does not say otherwise; a command-line tolerance still
+    wins. The two bands are far apart, and the claimed baseline ten times the
+    measured one, so which verdict comes out is decided by which tolerance was
+    read and not by how busy the machine is.
+    """
+    path = tmp_path / "baselines.json"
+    document, record = record_baseline(path)
+    scale(path, document, record, 10)
+    record["tolerance"] = 0.99
+    baselines.save(path, document)
+
+    assert main([*SMOKE, "--baselines", str(path)]) == 0, (
+        "a floor at 1% of the baseline cannot be breached by a run a tenth of it"
+    )
+    assert main([*SMOKE, "--baselines", str(path), "--tolerance", "0.20"]) == 1, (
+        "a floor at 80% of the baseline certainly can"
+    )
+
+
+# --------------------------------------------------------------------------
+# --rebaseline must not bless a regression
+# --------------------------------------------------------------------------
+
+
+def test_rebaseline_refuses_to_move_the_floor_down(tmp_path, capsys):
+    """It used to rewrite the floor while reporting REGRESSION in the same run.
+
+    A floor that follows the measurement down is not a floor; whatever caused
+    the drop is written into the guard and never seen again. Moving it *up*
+    needs no ceremony -- that is the ordinary case.
+    """
+    path = tmp_path / "baselines.json"
+    document, record = record_baseline(path)
+    scale(path, document, record, 20)
+    before = path.read_bytes()
+
+    assert main([*SMOKE, "--baselines", str(path), "--rebaseline", "--force"]) == 3
+    assert path.read_bytes() == before, "the floor must not have moved"
+    err = capsys.readouterr().err
+    assert "refusing to move the baseline down" in err
+    assert "--rebaseline-down" in err
+
+
+def test_force_does_not_carry_permission_to_move_the_floor_down(tmp_path):
+    """`--force` is about the machine, not about the number.
+
+    Conflating them would mean the flag every maintainer types on a laptop also
+    silently authorises absorbing a regression.
+    """
+    path = tmp_path / "baselines.json"
+    document, record = record_baseline(path)
+    scale(path, document, record, 20)
+
+    assert main([*SMOKE, "--baselines", str(path), "--rebaseline", "--force"]) == 3
+
+
+def test_rebaseline_down_is_the_explicit_opt_in(tmp_path, capsys):
+    path = tmp_path / "baselines.json"
+    document, record = record_baseline(path)
+    scale(path, document, record, 20)
+    high = json.loads(path.read_text(encoding="utf-8"))["baselines"][KEY]["work_index"]
+
+    # The verdict still stands: the run regressed against the floor it was
+    # judged at, and rewriting the floor afterwards does not undo that.
+    assert (
+        main(
+            [
+                *SMOKE,
+                "--baselines",
+                str(path),
+                "--rebaseline",
+                "--rebaseline-down",
+                "--force",
+            ]
+        )
+        == 1
+    )
+    after = json.loads(path.read_text(encoding="utf-8"))["baselines"][KEY]["work_index"]
+    assert after < high, "the floor should have moved down as asked"
+
+
+def test_rebaseline_always_reports_how_far_the_floor_moved(tmp_path, capsys):
+    """A number that changes without a delta is a number nobody reviews."""
+    path = tmp_path / "baselines.json"
+    document, record = record_baseline(path)
+    capsys.readouterr()
+    # Halve the recorded floor, so this run re-baselines upward.
+    scale(path, document, record, 1 / 20)
+
+    assert main([*SMOKE, "--baselines", str(path), "--rebaseline", "--force"]) == 0
+
+    out = capsys.readouterr().out
+    assert "rebaseline" in out
+    assert "work index" in out
+    assert "%" in out, "the move has to be reported as a proportion, not only raw"
+
+
+def test_the_first_baseline_says_it_replaced_nothing(tmp_path, capsys):
+    path = tmp_path / "baselines.json"
+
+    main([*SMOKE, "--baselines", str(path), "--rebaseline", "--force"])
+
+    assert "nothing replaced" in capsys.readouterr().out
+
+
+def test_rebaseline_down_without_rebaseline_is_a_usage_error(capsys):
+    assert main([*SMOKE, "--rebaseline-down"]) == 2
+    assert "means nothing without --rebaseline" in capsys.readouterr().err

@@ -78,6 +78,24 @@ exposed. Sizing the calibration to the engine pass would, at the cost of
 roughly doubling a run and of changing what a calibration figure means -- a
 decision for ADR-0005's author rather than for this module. Nine percent sits
 comfortably inside the 20% tolerance, so it is a known bias and not a defect.
+
+What is reported about how much to trust it
+-------------------------------------------
+
+Three summaries come out of the same repeats and they answer three questions.
+`sinkless.orders_per_sec` is best-of-N and answers "how fast is this engine".
+`work_index` is a median and answers "did it change". `work_index_spread` --
+`(max - min) / median` of the per-repeat indices -- answers "could this verdict
+have gone the other way", and it is the only one of the three that is about the
+measurement rather than about the engine.
+
+It is reported because it is the one within-run number that sees a machine
+that did not hold still. Read it against the tolerance: a run whose judged
+quantity moved by more across three repeats than the band the verdict is drawn
+at has not measured one thing three times. `calibration_median_seconds` exists
+for the same reason -- the comparison's machine-speed figure is taken from the
+same statistic as its verdict, rather than pairing a median work index with the
+luckiest calibration pass of the run.
 """
 
 from __future__ import annotations
@@ -140,13 +158,25 @@ class BenchResult(NamedTuple):
     sinkless: RunResult
     #: Reported, never gating. None when `--no-sink` skipped it.
     sink: RunResult | None
-    #: Best of N, for the report and for the confidence ratio.
+    #: Best of N, for the report. *Not* what the comparison uses: see
+    #: `calibration_median_seconds`.
     calibration: calibration_module.CalibrationResult
     #: (max - min) / min of the calibration seconds across repeats.
     calibration_spread: float
+    #: Median of the per-repeat calibration seconds -- the machine-speed figure
+    #: a comparison is made on, and recorded with a baseline. It is a median
+    #: because `work_index` is: a ratio built from the *luckiest* calibration
+    #: pass and the *median* work index describes no run that happened, and
+    #: that mismatch is how a run whose calibration varied by 94% across
+    #: repeats used to report itself confident.
+    calibration_median_seconds: float
     #: Median of the per-repeat work indices. The quantity a regression is
     #: judged on; see the module docstring for why it is not best-of-N.
     work_index: float
+    #: (max - min) / median of the per-repeat work indices: how much the judged
+    #: quantity itself moved while this run was being taken. The one within-run
+    #: number that says whether the verdict could have gone the other way.
+    work_index_spread: float
     samples: tuple[Sample, ...]
     provenance: dict[str, Any]
     workload_checksum: int
@@ -266,7 +296,11 @@ def measure(
     best_calibration = min(calibrations, key=lambda result: result.seconds)
     slowest = max(result.seconds for result in calibrations)
     spread = (slowest - best_calibration.seconds) / best_calibration.seconds
-    work_index = statistics.median(sample.work_index for sample in samples)
+    median_calibration = statistics.median(result.seconds for result in calibrations)
+    indices = [sample.work_index for sample in samples]
+    work_index = statistics.median(indices)
+    # Relative, so it can be read against the tolerance the verdict is made at.
+    index_spread = (max(indices) - min(indices)) / work_index if work_index else 0.0
 
     context = provenance_module.capture(machine_label)
     run_ghz = clock.ghz
@@ -287,7 +321,9 @@ def measure(
         sink=min(sinked, key=_seconds) if sinked else None,
         calibration=best_calibration,
         calibration_spread=spread,
+        calibration_median_seconds=median_calibration,
         work_index=work_index,
+        work_index_spread=index_spread,
         samples=tuple(samples),
         provenance=context,
         workload_checksum=workloads_module.checksum(ops),

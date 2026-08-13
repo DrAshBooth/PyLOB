@@ -7,6 +7,20 @@ command answers "did I make it slower?" without anyone reading prose:
     1   a regression against the recorded baseline (or, with
         `--fail-on-low-confidence`, a measurement not worth trusting)
     2   the command line was wrong (argparse's own code)
+    3   the guard could not be applied at all
+
+Three is separate from one on purpose. "You made it slower" and "I could not
+find out whether you made it slower" are different facts, and a caller that
+cannot tell them apart -- CI, a bisect script, a pre-push hook -- will read the
+second as the first and go looking for a performance bug that does not exist.
+It covers a baselines file that is missing, unreadable or half-written, and a
+baseline that measured a different workload, a different reference computation
+or a different interpreter. Every one of those means *this baseline cannot
+judge this run*, which is not a verdict.
+
+`--rebaseline` does not change the verdict. A regression still exits 1 even
+when the floor has just been rewritten, because the run did regress and the
+rewriting was a separate deliberate act.
 
 There is no `--engine` flag. The change this implements specified
 `--engine new|legacy`; ADR-0003 deleted the legacy engine, so the flag would
@@ -20,7 +34,7 @@ import datetime
 import json
 import sys
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Final, Sequence
 
 from . import baselines as baselines_module
 from . import calibration as calibration_module
@@ -49,6 +63,9 @@ def _parser() -> argparse.ArgumentParser:
             "  0  no regression, or no baseline recorded yet\n"
             "  1  regression against the recorded baseline\n"
             "  2  bad usage\n"
+            "  3  the guard could not be applied: the baselines file is\n"
+            "     missing, unreadable or half-written, or the baseline\n"
+            "     measured a different workload, calibration or interpreter\n"
         ),
     )
     parser.add_argument(
@@ -79,32 +96,44 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--tolerance",
         type=float,
-        default=baselines_module.DEFAULT_TOLERANCE,
-        help="fraction below baseline that counts as a regression "
-        "(default: %(default)s)",
+        default=None,
+        help="fraction below baseline that counts as a regression. Must be "
+        "between 0 and 1. Defaults to the tolerance recorded with the "
+        "baseline, or %s when there is none." % (baselines_module.DEFAULT_TOLERANCE,),
     )
     parser.add_argument(
         "--baselines",
         type=Path,
         default=_DEFAULT_BASELINES,
-        help="baselines file (default: benchmarks/baselines.json)",
+        help="baselines file (default: benchmarks/baselines.json). A path that "
+        "does not exist is an error, not an empty guard.",
     )
     parser.add_argument(
         "--rebaseline",
         action="store_true",
         help="record this run as the baseline, rewriting the file. Refuses on "
-        "a machine that is not quiet unless --force.",
+        "a machine that is not quiet unless --force, and refuses to move the "
+        "floor down without --rebaseline-down.",
+    )
+    parser.add_argument(
+        "--rebaseline-down",
+        action="store_true",
+        help="with --rebaseline, allow the new baseline to be *lower* than the "
+        "recorded one. Moving a floor down absorbs whatever made it move.",
     )
     parser.add_argument(
         "--force",
         action="store_true",
-        help="with --rebaseline, record even though the machine is contended",
+        help="with --rebaseline, record even though the machine is contended. "
+        "Does not permit a downward move: that is --rebaseline-down.",
     )
     parser.add_argument(
         "--fail-on-low-confidence",
         action="store_true",
-        help="exit non-zero when the calibration is too far from the "
-        "baseline's for scaling to be trusted, even without a regression",
+        help="exit non-zero on a measurement not worth trusting, even without "
+        "a regression: the judged quantity moved more across this run's "
+        "repeats than the tolerance, or the machine is too far from the "
+        "baseline's for scaling to be trusted",
     )
     parser.add_argument(
         "--no-sink",
@@ -155,11 +184,22 @@ def _record(result: runner_module.BenchResult, tolerance: float) -> dict[str, An
         # later run is actually judged against; the orders/sec above is the
         # human-readable face of it.
         "work_index": round(result.work_index, 2),
+        "work_index_spread": round(result.work_index_spread, 4),
         "calibration": result.calibration.name,
-        "calibration_seconds": round(result.calibration.seconds, 6),
+        # The *median*, matching the median work index above, because these two
+        # are the pair a later comparison forms its ratios from and a ratio
+        # built from two different statistics describes no run that happened.
+        "calibration_seconds": round(result.calibration_median_seconds, 6),
+        # Best of N, for the report only. Never compared against.
+        "calibration_best_seconds": round(result.calibration.seconds, 6),
         "calibration_checksum": result.calibration.checksum,
         "calibration_spread": round(result.calibration_spread, 4),
         "workload_checksum": result.workload_checksum,
+        # Lifted out of the provenance below, where it is also recorded,
+        # because it is load-bearing rather than explanatory: `compare` refuses
+        # across a mismatch, so it is part of the contract of a record and not
+        # part of the story around one.
+        "interpreter": result.provenance.get("interpreter"),
         "repeats": result.repeats,
         "tolerance": tolerance,
         "recorded_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(
@@ -167,6 +207,28 @@ def _record(result: runner_module.BenchResult, tolerance: float) -> dict[str, An
         ),
         "provenance": result.provenance,
     }
+
+
+def _delta(previous: dict[str, Any] | None, result: runner_module.BenchResult) -> str:
+    """How far `--rebaseline` is about to move the floor, in words.
+
+    Always printed, in either direction. A guard whose floor moves without
+    saying how far is a guard nobody can review in the diff, and the diff is
+    the only place a re-baseline is ever looked at.
+    """
+    if previous is None or not previous.get("work_index"):
+        return "first baseline for this key: work index %.0f (nothing replaced)" % (
+            result.work_index,
+        )
+    old = previous["work_index"]
+    new = result.work_index
+    return "work index %.0f -> %.0f (%+.1f%%); reported throughput %.0f/s -> %.0f/s" % (
+        old,
+        new,
+        (new - old) / old * 100.0,
+        previous.get("sinkless_orders_per_sec") or 0.0,
+        result.sinkless.orders_per_sec,
+    )
 
 
 def _report(
@@ -224,10 +286,15 @@ def _report(
         )
     )
     print(
-        "calibration %s %.4fs per pass, spread %.1f%% across repeats"
+        "interpreter %s"
+        % (baselines_module.interpreter_label(context.get("interpreter")),)
+    )
+    print(
+        "calibration %s %.4fs per pass (median %.4fs), spread %.1f%% across repeats"
         % (
             result.calibration.name,
             result.calibration.seconds,
+            result.calibration_median_seconds,
             result.calibration_spread * 100,
         )
     )
@@ -251,14 +318,21 @@ def _report(
             )
         )
     print(
-        "work index  %9.0f orders per calibration pass   [median of %d, GATING]"
-        % (result.work_index, result.repeats)
+        "work index  %9.0f orders per calibration pass   "
+        "[median of %d, spread %.1f%%, GATING]"
+        % (result.work_index, result.repeats, result.work_index_spread * 100)
     )
     print()
     print("baseline    %s" % key)
     if comparison.status == "no-baseline":
         print("            NO BASELINE recorded. Nothing to guard against yet;")
         print("            `--rebaseline` records one, on a quiet machine.")
+        return
+    if comparison.incomparable:
+        print("            INCOMPARABLE: a baseline is recorded, and it cannot")
+        print("            judge this run.")
+        for mismatch in comparison.mismatches:
+            print("            - %s" % (mismatch,))
         return
     print(
         "            recorded %.0f/s; this machine measures %.2fx its speed"
@@ -279,21 +353,53 @@ def _report(
     if not comparison.confident:
         verdict += " (LOW CONFIDENCE)"
     print("            %s" % verdict)
-    if not comparison.confident:
-        print(
-            "            calibration is %.2fx the baseline's, outside the %.2fx band"
-            % (comparison.speed_ratio, baselines_module.CONFIDENCE_BAND)
-        )
-        print(
-            "            in which linear scaling can be trusted; treat this "
-            "number as indicative"
-        )
+    for note in comparison.confidence_notes:
+        print("            - %s" % (note,))
+
+
+#: The guard could not be applied. See the module docstring for why this is
+#: not 1.
+_UNUSABLE: Final = 3
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     if args.list:
         return _list()
+
+    if args.tolerance is not None:
+        try:
+            baselines_module.validate_tolerance(args.tolerance)
+        except ValueError as exc:
+            print("error: --tolerance %s" % exc, file=sys.stderr)
+            return 2
+    if args.rebaseline_down and not args.rebaseline:
+        print(
+            "error: --rebaseline-down means nothing without --rebaseline",
+            file=sys.stderr,
+        )
+        return 2
+
+    # A path that does not exist reads as an empty document, which reads as
+    # "no baseline", which exits 0. That is a typo in `--baselines` silently
+    # disarming the guard, so the only place it is allowed is the one that is
+    # about to create the file.
+    if not args.baselines.exists() and not args.rebaseline:
+        print(
+            "error: no baselines file at %s. A missing file cannot guard "
+            "anything; pass --rebaseline to create one, or correct the path."
+            % (args.baselines,),
+            file=sys.stderr,
+        )
+        return _UNUSABLE
+    try:
+        document = baselines_module.load(args.baselines)
+    except (OSError, ValueError) as exc:
+        # OSError as well as ValueError: a path that exists but is a directory,
+        # or is unreadable, is the same event as a corrupt one -- the guard has
+        # no baseline to apply and must not report that as a pass.
+        print("error: %s" % exc, file=sys.stderr)
+        return _UNUSABLE
 
     try:
         result = runner_module.measure(
@@ -313,18 +419,64 @@ def main(argv: Sequence[str] | None = None) -> int:
     key = baselines_module.baseline_key(
         result.workload, result.seed, result.orders, result.calibration.name
     )
-    document = baselines_module.load(args.baselines)
     recorded = baselines_module.entry(document, key)
+    problems = [] if recorded is None else baselines_module.record_problems(recorded)
+    if problems:
+        if not args.rebaseline:
+            print(
+                "error: the baseline recorded at %s is not usable:" % (key,),
+                file=sys.stderr,
+            )
+            for problem in problems:
+                print("  - %s" % problem, file=sys.stderr)
+            print(
+                "A half-written baseline is not an absent one: it would read "
+                "as 'nothing recorded' and exit 0, leaving the guard off and "
+                "saying nothing. Fix the file, or --rebaseline over it.",
+                file=sys.stderr,
+            )
+            return _UNUSABLE
+        # About to be overwritten, so it need not be usable -- but say so.
+        print(
+            "warning: replacing an unusable baseline (%s)" % ("; ".join(problems),),
+            file=sys.stderr,
+        )
+        recorded = None
+
+    # The tolerance recorded with a baseline is the band it was recorded to be
+    # judged at, so it is what a later run uses unless that run says otherwise.
+    # Recording it and then ignoring it -- as this did -- made the field a
+    # comment, and a comment inside a guard is a place for a wrong belief to
+    # live undisturbed.
+    if args.tolerance is not None:
+        tolerance = args.tolerance
+    elif recorded is not None and isinstance(recorded.get("tolerance"), (int, float)):
+        tolerance = float(recorded["tolerance"])
+    else:
+        tolerance = baselines_module.DEFAULT_TOLERANCE
+
     comparison = baselines_module.compare(
         measured=result.sinkless.orders_per_sec,
         measured_work_index=result.work_index,
-        measured_calibration_seconds=result.calibration.seconds,
+        # The median, matching the median work index: see `runner`.
+        measured_calibration_seconds=result.calibration_median_seconds,
+        measured_fingerprint=baselines_module.Fingerprint(
+            workload_checksum=result.workload_checksum,
+            calibration_checksum=result.calibration.checksum,
+            interpreter=result.provenance.get("interpreter"),
+        ),
         baseline=None if recorded is None else recorded["sinkless_orders_per_sec"],
         baseline_work_index=None if recorded is None else recorded.get("work_index"),
         baseline_calibration_seconds=(
             None if recorded is None else recorded["calibration_seconds"]
         ),
-        tolerance=args.tolerance,
+        baseline_fingerprint=(
+            None
+            if recorded is None
+            else baselines_module.fingerprint_of_record(recorded)
+        ),
+        tolerance=tolerance,
+        dispersion=result.work_index_spread,
     )
 
     if args.rebaseline:
@@ -340,8 +492,31 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "(ADR-0005). Run it quiet, or --force if you mean it.",
                 file=sys.stderr,
             )
-            return 1
-        document.setdefault("baselines", {})[key] = _record(result, args.tolerance)
+            return _UNUSABLE
+        # A floor that can move down on its own is not a floor. Moving it up is
+        # the ordinary case and needs no ceremony; moving it down absorbs
+        # whatever made it move, which is the one thing the guard exists to
+        # notice, so it takes a flag of its own. `--force` is about the machine
+        # and deliberately does not carry this.
+        movement = _delta(recorded, result)
+        if (
+            recorded is not None
+            and recorded.get("work_index")
+            and result.work_index < recorded["work_index"]
+            and not args.rebaseline_down
+        ):
+            print(
+                "refusing to move the baseline down: %s" % (movement,),
+                file=sys.stderr,
+            )
+            print(
+                "The verdict on this run was %s. Re-baselining down writes "
+                "whatever caused that into the floor, so it takes "
+                "--rebaseline-down and not --force." % (comparison.status,),
+                file=sys.stderr,
+            )
+            return _UNUSABLE
+        document.setdefault("baselines", {})[key] = _record(result, tolerance)
         if complaints:
             document["baselines"][key]["forced"] = complaints
         document["note"] = (
@@ -349,7 +524,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             "the calibration figure taken with it (ADR-0005); the harness "
             "scales by their ratio. Change a workload or a calibration and "
             "its name changes, which changes the key, which reads as 'no "
-            "baseline' until it is recorded again."
+            "baseline' until it is recorded again -- and if the name does not "
+            "change, the recorded workload and calibration checksums and the "
+            "recorded interpreter identity are compared on every run, so a "
+            "baseline that measured something else refuses to judge instead of "
+            "judging wrongly."
         )
         baselines_module.save(args.baselines, document)
 
@@ -368,9 +547,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                     ),
                     "trades": result.sinkless.trades,
                     "work_index": result.work_index,
+                    "work_index_spread": result.work_index_spread,
                     "calibration": result.calibration.name,
                     "calibration_seconds": result.calibration.seconds,
+                    "calibration_median_seconds": result.calibration_median_seconds,
                     "calibration_spread": result.calibration_spread,
+                    "workload_checksum": result.workload_checksum,
+                    "calibration_checksum": result.calibration.checksum,
                     "samples": [
                         {
                             "calibration_seconds": sample.calibration_seconds,
@@ -391,8 +574,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         _report(result, comparison, key)
         if args.rebaseline:
             print()
+            print("rebaseline  %s" % (movement,))
             print("recorded to %s" % args.baselines)
 
+    if comparison.incomparable and not args.rebaseline:
+        print(
+            "INCOMPARABLE on %s: %s" % (result.workload, comparison.reason),
+            file=sys.stderr,
+        )
+        return _UNUSABLE
     if comparison.failed:
         print(
             "REGRESSION on %s: %s" % (result.workload, comparison.reason),

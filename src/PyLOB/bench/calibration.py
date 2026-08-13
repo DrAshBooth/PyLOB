@@ -51,7 +51,9 @@ against, and the recorded ratios no longer mean anything.
 That is the enforcement behind ADR-0005's versioning rule. Editing this file's
 arithmetic changes the checksum, which fails every run until the name changes
 too -- so "changing a calibration means a new name" cannot be forgotten, only
-overruled on purpose. It is the same rule `workloads.py` follows, for the same
+overruled on purpose. A checksum of `0` is refused rather than treated as an
+opt-out, for the same reason: a falsy sentinel that quietly disables the check
+leaves the rule written down and unenforced. It is the same rule `workloads.py` follows, for the same
 reason: a silently edited denominator makes every recorded baseline a lie
 about a computation that no longer exists.
 
@@ -276,6 +278,20 @@ _CALIB_V1 = CalibrationSpec(
 
 CALIBRATIONS: Final[dict[str, CalibrationSpec]] = {_CALIB_V1.name: _CALIB_V1}
 
+
+def _validate_registry(registry: dict[str, CalibrationSpec]) -> None:
+    """Every registered calibration must carry a real pin. See `run`."""
+    for name, spec in registry.items():
+        if not spec.checksum:
+            raise ValueError(
+                "calibration %r has no pinned checksum (%r): the denominator "
+                "every baseline is scaled by would be unversioned."
+                % (name, spec.checksum)
+            )
+
+
+_validate_registry(CALIBRATIONS)
+
 #: What each phase is *meant* to be, as a fraction of a pass. Not enforced at
 #: run time -- a machine with an unusual `decimal` is allowed to have an
 #: unusual split -- but `tests/test_bench_calibration.py` checks the intended
@@ -313,13 +329,23 @@ def run(name: str = "calib-v1", *, verify: bool = True) -> CalibrationResult:
     for phase, (fn, rounds) in spec.phases.items():
         checksum = (checksum * 31 + fn(rounds)) & _MASK
     seconds = time.perf_counter() - start
-    if verify and spec.checksum and checksum != spec.checksum:
-        raise ValueError(
-            "calibration %s produced checksum %d, expected %d: the reference "
-            "computation has changed, so every recorded baseline scaled by it "
-            "is meaningless. Give the changed computation a new name."
-            % (name, checksum, spec.checksum)
-        )
+    if verify:
+        if not spec.checksum:
+            # A falsy checksum is a broken spec, not an opt-out. Treating it as
+            # one would disable the versioning rule on the denominator every
+            # recorded baseline is scaled by.
+            raise ValueError(
+                "calibration %s has no pinned checksum, so there is nothing to "
+                "check this pass against. Pin it, or the name promises nothing."
+                % (name,)
+            )
+        if checksum != spec.checksum:
+            raise ValueError(
+                "calibration %s produced checksum %d, expected %d: the "
+                "reference computation has changed, so every recorded baseline "
+                "scaled by it is meaningless. Give the changed computation a "
+                "new name." % (name, checksum, spec.checksum)
+            )
     return CalibrationResult(name=name, seconds=seconds, checksum=checksum)
 
 

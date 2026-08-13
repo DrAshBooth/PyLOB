@@ -26,22 +26,48 @@ stream it just built does not match. Retune the mix and every run fails until
 the name changes with it. A *new* workload is cheap -- add a spec, record its
 checksum -- which is the point: making the honest path the easy one.
 
+A checksum of `0` is not "unpinned", it is a broken spec, and `generate`
+refuses it rather than skipping the check. A falsy sentinel that silently
+disables the only enforcement of the versioning rule is worse than no
+enforcement, because the docstring above keeps promising it.
+
 `mixed-v1`
 ----------
 
-The shape the trial measurement used (2026-08-10, 20,000 orders): 70% passive
-limits, 20% crossing limits, 10% market orders, 20 traders with commissions, a
-mid that drifts. It is a general-purpose "is the engine still fast" workload,
-not a stress case -- the pathological shapes (`lob-rp4`'s self-match walk, a
-ten-thousand-level sparse book) belong in workloads of their own, under names
-of their own.
+The shape the trial measurement used (2026-08-10, 20,000 orders): 20 traders
+with commissions, a mid that drifts, and an order stream the generator labels
+70% passive limits, 20% crossing limits, 10% market orders. It is a
+general-purpose "is the engine still fast" workload, not a stress case -- the
+pathological shapes (`lob-rp4`'s self-match walk, a ten-thousand-level sparse
+book) belong in workloads of their own, under names of their own.
 
-The composition is exact, not probabilistic: the generator builds a list of
+The label split is exact, not probabilistic: the generator builds a list of
 14,000 / 4,000 / 2,000 kind tags and shuffles it. Drawing each kind from
 `rng.random()` would make the 70/20/10 split a per-seed accident, so two seeds
 would measure subtly different workloads and the seed would become a hidden
 parameter of the number. Shuffling a fixed multiset keeps the seed controlling
 only the *order* and the prices, which is the variation that is wanted.
+
+**70/20/10 describes the labels, not the behaviour, and the two differ a
+lot.** Whether a limit order crosses depends on the book it meets, and the mid
+drifts underneath a book that does not move with it, so a "passive" bid one
+tick under a mid that has walked up meets asks left behind at lower prices.
+Measured on the canonical stream (seed 42, 20,000 orders) through the engine:
+
+    labelled passive  14,000 (70%)   of which 4,316 traded on arrival
+    labelled crossing  4,000 (20%)   of which 1,831 rested instead
+    labelled market    2,000 (10%)   all traded
+
+    realised: 11,515 rested (57.6%), 6,485 limits traded on arrival (32.4%),
+              2,000 market orders traded (10.0%)
+
+That is the workload `mixed-v1` names, and the numbers above are the honest
+description of it. `tests/test_bench_workloads.py` measures them by replaying
+the stream through the engine rather than by re-reading the labels, so a
+change to either the stream or the matching semantics moves them and is seen.
+The generator is *not* retuned to make the labels come true: the labels are
+the knob, the realised mix is the consequence, and changing the consequence
+would mean `mixed-v2` and a re-baseline.
 
 `mixed-v1` is also traffic the differential harness checks. Its `benchmark`
 profile replays this stream through the engine and through the spec-derived
@@ -118,7 +144,11 @@ class WorkloadSpec(NamedTuple):
 
 
 def _mixed(spec: WorkloadSpec, seed: int, orders: int) -> list[Op]:
-    """`mixed-v1`'s generator: 70% passive, 20% crossing, 10% market.
+    """`mixed-v1`'s generator: labels 70% passive, 20% crossing, 10% market.
+
+    Those are the labels it draws from, not the behaviour it produces; the
+    module docstring records what the stream realises against a live book and
+    why the two differ.
 
     The mid is a bounded random walk on the tick grid. Bounded because an
     unbounded walk would spread the book over an ever-wider price range and
@@ -193,10 +223,33 @@ _MIXED_V1 = WorkloadSpec(
     commission=(2.5, 1.0, 0.01),
     # Pinned; see the module docstring. `checksum(generate("mixed-v1", 42))`.
     checksum=15240231136383276365,
-    description="70% passive limits, 20% crossing, 10% market; drifting mid",
+    description=(
+        "limits labelled 70% passive / 20% crossing plus 10% market, drifting "
+        "mid; realises ~58% resting, ~32% limits trading on arrival"
+    ),
 )
 
 WORKLOADS: Final[dict[str, WorkloadSpec]] = {_MIXED_V1.name: _MIXED_V1}
+
+
+def _validate_registry(registry: dict[str, WorkloadSpec]) -> None:
+    """Every registered workload must carry a real pin.
+
+    Checked at import rather than at first use: a spec with `checksum=0` would
+    otherwise sit in the registry looking pinned and enforcing nothing, and the
+    run that discovered it would be the one whose baseline was already wrong.
+    """
+    for name, spec in registry.items():
+        if not spec.checksum:
+            raise ValueError(
+                "workload %r has no pinned checksum (%r). A name is a promise "
+                "about a composition and the checksum is what keeps it; record "
+                "`checksum(generate(%r))` rather than leaving it unset."
+                % (name, spec.checksum, name)
+            )
+
+
+_validate_registry(WORKLOADS)
 
 #: name -> generator. Kept beside `WORKLOADS` rather than inside `WorkloadSpec`
 #: so a spec stays plain data that can be printed and compared.
@@ -253,7 +306,16 @@ def generate(
         raise ValueError("orders must be positive, got %r" % (count,))
     ops = _GENERATORS[name](spec, seed, count)
     canonical = seed == CANONICAL_SEED and count == spec.orders
-    if verify and canonical and spec.checksum:
+    if verify and canonical:
+        if not spec.checksum:
+            # Not "unpinned": a spec that reaches here with a falsy checksum is
+            # broken, and skipping the comparison would turn the versioning
+            # rule off at exactly the workload whose identity is least certain.
+            raise ValueError(
+                "workload %s has no pinned checksum, so its canonical stream "
+                "cannot be checked against the one its baselines were recorded "
+                "on. Pin it, or the name promises nothing." % (name,)
+            )
         actual = checksum(ops)
         if actual != spec.checksum:
             raise ValueError(

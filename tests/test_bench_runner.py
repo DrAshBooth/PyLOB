@@ -16,6 +16,7 @@ the identity, and it is a better one than a name that could only ever say
 "new".
 """
 
+import platform
 import statistics
 
 import pytest
@@ -144,6 +145,47 @@ def test_the_reported_throughput_is_the_best_repeat_not_the_median():
     assert result.sinkless.orders_per_sec == pytest.approx(best)
 
 
+def test_the_calibration_figure_a_comparison_uses_is_the_median():
+    """The confidence ratio must come from the statistic the verdict does.
+
+    The comparison's machine-speed figure used to be the *best* calibration
+    pass of the run while its verdict came from the *median* work index -- a
+    ratio built from the luckiest sample and the middle one, describing no run
+    that happened. That mismatch is how a run whose calibration varied by 94%
+    across repeats reported itself confident.
+    """
+    result = measure(repeats=3)
+    seconds = [sample.calibration_seconds for sample in result.samples]
+
+    assert result.calibration_median_seconds == pytest.approx(
+        statistics.median(seconds)
+    )
+    assert result.calibration.seconds == pytest.approx(min(seconds)), (
+        "the best pass is still reported; it is simply not what is compared"
+    )
+
+
+def test_the_dispersion_of_the_judged_quantity_is_reported():
+    """The one within-run number that sees a machine that would not hold still.
+
+    Read against the tolerance by `baselines.compare`: a run whose judged
+    quantity moved further across its own repeats than the band separating
+    "ok" from "regression" did not measure one thing three times.
+    """
+    result = measure(repeats=3)
+    indices = [sample.work_index for sample in result.samples]
+
+    assert result.work_index_spread == pytest.approx(
+        (max(indices) - min(indices)) / result.work_index
+    )
+    assert result.work_index_spread >= 0
+
+
+def test_a_single_repeat_disperses_by_nothing():
+    """One observation cannot disagree with itself, and must not pretend to."""
+    assert measure(repeats=1).work_index_spread == 0.0
+
+
 def test_provenance_records_what_adr_0005_asks_for(result):
     """Machine, CPU, cores, Python, commit, load average, power source.
 
@@ -158,6 +200,7 @@ def test_provenance_records_what_adr_0005_asks_for(result):
         "cpu",
         "cores",
         "python",
+        "interpreter",
         "power_source",
         "loadavg",
         "commit",
@@ -171,6 +214,24 @@ def test_provenance_records_what_adr_0005_asks_for(result):
     assert set(context["cores"]) == {"logical", "performance", "efficiency"}
     assert context["power_source"] in ("ac", "battery", "unknown")
     assert set(context["commit"]) == {"sha", "branch", "dirty"}
+
+
+def test_the_interpreter_is_recorded_in_enough_detail_to_tell_builds_apart(result):
+    """P1-B's cheap half: the harness cannot be portable, so it must be honest.
+
+    The judged quantity is a ratio of two Python programs, and two CPython
+    builds do not agree on it -- the same deliberate defect has earned opposite
+    verdicts on two supported builds. `baselines.compare` refuses across a
+    mismatch, and this is the identity it refuses on. The build string is what
+    separates two 3.11.11s from different sources, which the version alone
+    cannot.
+    """
+    identity = result.provenance["interpreter"]
+
+    assert identity["implementation"] == "CPython"
+    assert identity["version"] == platform.python_version()
+    assert identity["build"], "a version with no build cannot distinguish two"
+    assert identity["build"] != identity["version"]
 
 
 def test_core_class_is_never_a_guess(result):

@@ -60,6 +60,27 @@ def test_a_changed_computation_is_refused_at_run_time(monkeypatch):
         calibration.run("calib-v1")
 
 
+def test_a_checksum_of_zero_is_a_broken_pin_and_not_an_opt_out(monkeypatch):
+    """The denominator every baseline is scaled by must be versioned.
+
+    `if spec.checksum` skipped the check on zero, which is the value most
+    likely to be left behind by someone adding a calibration and meaning to
+    fill it in.
+    """
+    spec = calibration.CALIBRATIONS["calib-v1"]
+    monkeypatch.setitem(calibration.CALIBRATIONS, "calib-v1", spec._replace(checksum=0))
+
+    with pytest.raises(ValueError, match="no pinned checksum"):
+        calibration.run("calib-v1")
+
+
+def test_the_registry_refuses_an_unpinned_calibration():
+    spec = calibration.CALIBRATIONS["calib-v1"]
+
+    with pytest.raises(ValueError, match="no pinned checksum"):
+        calibration._validate_registry({"calib-v1": spec._replace(checksum=0)})
+
+
 def test_the_calibration_does_not_import_the_engine():
     """The denominator must not move when the numerator does.
 

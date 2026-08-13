@@ -91,10 +91,11 @@ is the guard that says so -- if sharing a generator ever cost this harness one
 of those classes, that test fails rather than the coverage quietly shrinking.
 
 What the fifth profile is worth on its own, beyond the shared-definition
-claim: `mixed-v1` walks a mid across a 500-tick band with 70% of its orders
-resting away from the touch, so it builds a book with more distinct price
-levels than the widest hand-written grid here and keeps creating, emptying and
-recreating them as the touch moves -- twenty traders' ledgers, quantities up
+claim: `mixed-v1` walks a mid across a 500-tick band with most of its orders
+resting away from the touch -- 57.6% of the canonical stream does, measured
+against a live book rather than read off the generator's labels -- so it builds
+a book with more distinct price levels than the widest hand-written grid here
+and keeps creating, emptying and recreating them as the touch moves -- twenty traders' ledgers, quantities up
 to 100, and the level bookkeeping under a shape none of the fixed grids
 produce.
 
