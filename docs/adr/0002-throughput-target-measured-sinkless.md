@@ -1,6 +1,6 @@
 # ADR-0002: The throughput target is measured with no sink attached
 
-Status: Accepted
+Status: Superseded by [ADR-0005](0005-calibrated-throughput-baselines.md)
 Date: 2026-08-12
 
 ## Context
