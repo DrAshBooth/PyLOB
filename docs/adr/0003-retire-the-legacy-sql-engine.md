@@ -53,7 +53,7 @@ identifiers, invalid submissions, reloads, multiple instruments.
 **Deleted:** `src/PyLOB/orderbook.py`, `src/create_lob.sql`, the twelve
 `src/PyLOB/*.sql` query files, `src/lob.db`, `src/lob.html`, the
 `LegacyOrderBook` export, `LegacyAdapter` and the engine registry's legacy
-entry, all 20 `engine_xfail` markers, `tests/test_lifecycle.py` (legacy-only),
+entry, all 12 `engine_xfail` markers, `tests/test_lifecycle.py` (legacy-only),
 and the legacy half of `tests/test_issue8_regressions.py`.
 
 **The nine legacy defects close as won't-fix**, with the code they describe.
