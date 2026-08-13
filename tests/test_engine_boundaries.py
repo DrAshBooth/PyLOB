@@ -476,6 +476,40 @@ def test_a_gated_order_keeps_its_place_its_quantity_and_its_fills():
     assert book.book(INSTRUMENT).asks.level_at(100.0).volume == 6
 
 
+def test_the_cursor_resumes_where_it_was_when_a_fill_invalidates_it():
+    """Two tradeable orders behind the gated one, taken by one taker in turn.
+
+    A fill takes its maker out of the level's dict and so invalidates the
+    cursor over it. The replacement is walked back over the skipped prefix --
+    which cannot have moved, because a skipped order stays exactly where it is
+    -- and landing one order either side of where the old cursor was is
+    invisible unless the walk has to make *two* fills in one level. Every
+    other gated test here fills once and stops, so the walk-back is taken and
+    never checked: an overshoot silently steps over a maker the taker was
+    entitled to, and an undershoot re-reads one it has already passed.
+    """
+    book = make_book()
+    mine, _ = book.submit(1, INSTRUMENT, "ask", "limit", 5, 100.0)
+    first, _ = book.submit(2, INSTRUMENT, "ask", "limit", 2, 100.0)
+    second, _ = book.submit(3, INSTRUMENT, "ask", "limit", 2, 100.0)
+    behind, _ = book.submit(2, INSTRUMENT, "ask", "limit", 4, 100.0)
+
+    taker, trades = book.submit(1, INSTRUMENT, "bid", "limit", 6, 100.0)
+
+    assert [(trade.ask_idNum, trade.qty) for trade in trades] == [
+        (first.idNum, 2),
+        (second.idNum, 2),
+        (behind.idNum, 2),
+    ]
+    assert taker.filled
+    assert mine.fulfilled == 0 and mine.resting
+    assert [order.idNum for order in book.snapshot(INSTRUMENT, "ask")] == [
+        mine.idNum,
+        behind.idNum,
+    ]
+    assert book.book(INSTRUMENT).asks.level_at(100.0).volume == 7
+
+
 def _gated_walk_steps(k):
     """Queue steps taken by one taker crossing k of its own orders to reach one more.
 

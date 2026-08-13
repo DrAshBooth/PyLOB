@@ -32,8 +32,10 @@ Issues = "https://github.com/DrAshBooth/PyLOB/issues"
 
 # Pinned exactly: these are the versions ./verify enforced as `uvx ruff@0.9.10`
 # and `uvx pytest@8.3.5` before the tools moved into the lockfile.
+# `pytest-timeout` is pinned with them: it is a `./verify` dependency in
+# practice, because without it a test that hangs hangs the gate.
 [dependency-groups]
-dev = ["ruff==0.9.10", "pytest==8.3.5"]
+dev = ["ruff==0.9.10", "pytest==8.3.5", "pytest-timeout==2.3.1"]
 
 # Ruff's defaults are what ./verify has been enforcing; they are written out
 # here so a future ruff release cannot change the rule set underneath us.
@@ -53,6 +55,19 @@ select = ["E4", "E7", "E9", "F"]
 # repo does not have.
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# The slowest test here takes 0.28s and the whole of `./verify` takes seven,
+# so thirty seconds is a hundred times the headroom any plausible machine
+# contention needs. It is set for the failure mode a matching engine has and
+# an assertion cannot catch: a walk that stops advancing does not fail, it
+# spins. Two mutants in the 2026-08 review's mutation run (lob-6oj) took the
+# suite down that way rather than failing it, and one such run was found still
+# burning a core hours after the process that started it had finished.
+#
+# What this buys is that the run *ends*: a spinning test is failed, named, and
+# the process exits. It is not a bound on the suite -- a defect that hangs
+# forty tests costs thirty seconds forty times over -- so a slow red run still
+# means "something is spinning", and the failures say which tests.
+timeout = 30
 
 # The engine loads every *.sql sibling of orderbook.py as an attribute at
 # import time, so the .sql files are package data, not build inputs: an
