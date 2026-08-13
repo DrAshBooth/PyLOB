@@ -1,0 +1,15 @@
+{
+  "baselines": {
+    "mixed-v1|seed=42|orders=20000|calib=calib-v1": {
+      "calibration": "calib-v1",
+      "calibration_seconds": null,
+      "note": "PLACEHOLDER. The key and the field names are real; every measured value is null on purpose. Recording a baseline is a deliberate act on a quiet machine on mains power -- see the top-level note.",
+      "placeholder": true,
+      "sink_orders_per_sec": null,
+      "sinkless_orders_per_sec": null,
+      "work_index": null
+    }
+  },
+  "note": "PLACEHOLDER -- no baseline has been recorded. Every measured value below is null on purpose. ADR-0005 makes a throughput figure meaningful only alongside the calibration figure taken with it: a run is judged on its work index (orders processed per calibration pass), so a baseline recorded on a contended machine, on battery, or on an efficiency core is a bad denominator for everyone who ever runs this, and normalisation does not repair it. Until a real one is recorded the harness reports NO BASELINE and exits 0, rather than pretending to guard. To record: `uv run python -m PyLOB.bench --rebaseline`, which refuses on a machine that is not quiet and rewrites this file so the change is reviewable in the diff.",
+  "schema": 1
+}
