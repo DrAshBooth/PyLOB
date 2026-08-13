@@ -19,31 +19,17 @@ stage() {
   fi
 }
 
-# Run example.py against a scratch copy of src/ with a freshly built schema.
-# The committed src/lob.db is never touched.
+# Run example.py end to end: the library driven the way the README points a
+# reader at, through the installed package rather than through the test
+# suite's fixtures.
+#
+# It used to build src/create_lob.sql into a scratch database first, and to
+# run from a scratch copy of src/ so the committed src/lob.db was never
+# touched. ADR-0003 deleted the schema, the database and the engine that read
+# them; example.py owns every file it writes (a TemporaryDirectory), so what
+# is left is the example itself.
 smoke() {
-  local tmp py rc=0
-  # Resolve the project interpreter before cd-ing away: `uv run` inside the
-  # scratch dir would look for a project there and miss this one. Without
-  # this the smoke stage runs whatever python3 is on PATH, which need not be
-  # the version uv.lock pins for the other stages.
-  py=$(uv run python -c 'import sys; print(sys.executable)') || return $?
-  tmp=$(mktemp -d "${TMPDIR:-/tmp}/pylob-smoke.XXXXXX")
-  cp -R src/. "$tmp/"
-  rm -f "$tmp/lob.db"
-  (
-    cd "$tmp"
-    "$py" - <<'EOF'
-import sqlite3
-
-conn = sqlite3.connect("lob.db")
-conn.executescript(open("create_lob.sql").read())
-conn.close()
-EOF
-    "$py" example.py > /dev/null
-  ) || rc=$?
-  rm -rf "$tmp"
-  return $rc
+  uv run python src/example.py > /dev/null
 }
 
 # === checks: do not add to this block without asking the user first ===

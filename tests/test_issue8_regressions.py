@@ -2,114 +2,79 @@
 
 Issue #8 (pinned at `c0dd932`) reports two separate ways a resting order can
 be matched for more than its stated size, both of them mistakes in how the
-cumulative-executed column `trade_order.fulfilled` is written:
+cumulative-executed quantity is written. Both were diagnosed in the 2013 SQL
+engine ADR-0003 has since retired:
 
-* **Finding 1** -- the `trade_insert` trigger (`src/create_lob.sql`) applies a
-  new trade's quantity with `where idNum in (new.bid_order, new.ask_order)`,
-  but `trade.bid_order`/`trade.ask_order` hold `trade_order.order_id` values.
-  The credit therefore lands on whichever rows happen to carry those numbers
-  in their *`idNum`* column -- nobody, or the wrong orders entirely.
-* **Finding 2** -- `processMatchesDB` (`src/PyLOB/orderbook.py`) starts from
-  `qtyToExec = quote["qty"]`, and `modifyOrder` never puts `fulfilled` into
-  the dict it passes there, so a reprice-triggered cross may execute the
-  order's whole raw `qty` instead of its true remainder `qty - fulfilled`.
+* **Finding 1** -- the `trade_insert` trigger applied a new trade's quantity
+  with `where idNum in (new.bid_order, new.ask_order)`, but those columns held
+  internal row ids. The credit therefore landed on whichever rows happened to
+  carry those numbers in their *`idNum`* column -- nobody, or the wrong orders
+  entirely.
+* **Finding 2** -- the reprice path started from `qtyToExec = quote["qty"]`,
+  and `modifyOrder` never put `fulfilled` into the dict it passed there, so a
+  reprice-triggered cross could execute the order's whole raw `qty` instead of
+  its true remainder `qty - fulfilled`.
 
 Every test below asserts the issue's **expected post-fix** numbers, and each
 docstring records the buggy value the issue's author measured against the
 unfixed engine.
 
-Both engines, one test body
----------------------------
+Why the scenarios outlived the engine that had the bugs
+-------------------------------------------------------
 
 The two findings are mistakes in *fill accounting*, not in SQL: any engine can
 credit a fill to the wrong order, and any engine can size a cross from an
-order's raw quantity instead of its remainder. So every scenario here runs
-against every engine in the acceptance registry, through the same
-engine-neutral adapter the acceptance suites use -- `book.limit(...)`,
-`order.fulfilled`, `book.trades()`. The raw `trade_order` SQL these tests used
-to run has no meaning on an engine with no database, and none of it was
-load-bearing: what the issue measured is quantities, and the adapter reports
-quantities.
+order's raw quantity instead of its remainder. So these scenarios are written
+against the engine-neutral adapter the acceptance suites use --
+`book.limit(...)`, `order.fulfilled`, `book.trades()` -- and not against any
+engine's own API. What the issue measured is quantities, and the adapter
+reports quantities.
 
-Where the two findings differ is in how much of the *mechanism* survives that
-translation. Finding 2's mechanism is engine-neutral to begin with: a
-partially filled order repriced across the book is a thing every engine can
-get wrong, and the numbers the issue measured are the numbers to assert.
+Finding 2's mechanism survives that translation whole: a partially filled
+order repriced across the book is a thing any engine can get wrong, and the
+numbers the issue measured are the numbers to assert.
 
-Finding 1's mechanism is not. `idNum` diverging from an internal row id is a
-legacy schema concept; the in-memory engine has no second identifier to
-diverge from, since `_orders` is keyed on `idNum` and a `Trade` names its two
-orders by `idNum`. The scenario is kept rather than dropped for that engine,
-because what the ratified contract took from Finding 1 is not the trigger's
-`WHERE` clause but the invariant it broke -- `order-matching`, "Fills are
-credited to the orders that traded", explicitly "regardless of any difference
-between an order's public identifier (`idNum`) and its internal row identity".
-So the setup is kept verbatim, decoy identifiers and all, and the question
-asked of it is the neutral one: *did this fill land on the two orders that
-traded, and on nobody else?* On legacy that setup lands squarely on the
-trigger bug. On the in-memory engine it is an arrangement the engine has no
-way to be fooled by, and the assertion is the contract's rather than the
-trigger's -- a scenario that passes by construction there, which is the
-honest translation and not a weakened one.
+Finding 1's does not. `idNum` diverging from an internal row id was a schema
+concept of the retired engine; this one has no second identifier to diverge
+from, since `_orders` is keyed on `idNum` and a `Trade` names its two orders
+by `idNum`. The scenario is kept rather than dropped, because what the
+ratified contract took from Finding 1 is not the trigger's `WHERE` clause but
+the invariant it broke -- `order-matching`, "Fills are credited to the orders
+that traded", explicitly "regardless of any difference between an order's
+public identifier (`idNum`) and its internal row identity". So the setup is
+kept verbatim, decoy identifiers and all, and the question asked of it is the
+neutral one: *did this fill land on the two orders that traded, and on nobody
+else?* Here that arrangement is one the engine has no way to be fooled by, and
+the assertion is the contract's rather than the trigger's -- a scenario that
+passes by construction, which is the honest translation and not a weakened
+one.
 
-Observation is by `idNum` throughout, because that is the identifier both
-engines have. These tests previously read `trade_order` by `order_id`, a
-legacy-only handle, and the change costs no power: under the unfixed trigger X
-(idNum 3) reports `fulfilled=10` and the order that actually traded, A (idNum
-500), reports 0 -- the same failure, in the vocabulary the two engines share.
-
-Both repros use one trader crossing itself, exactly as the issue does:
-`matches.sql`'s `(allow_self_matching=1 or trader<>:tid)` clause requires it
-on the legacy engine, and it keeps the scenarios minimal.
+Both repros use one trader crossing itself, exactly as the issue does: it is
+the smallest way to exercise both sides of a match.
 """
-
-from importlib.util import find_spec
 
 import pytest
 
-# The engine registry and the engine-neutral adapter surface live in the
-# acceptance conftest. A conftest applies to its own directory and below, so
-# this file cannot inherit its fixtures and imports the pieces instead --
-# `tests/` is on `sys.path` while this module is imported, which makes
-# `acceptance` an importable namespace package.
-from acceptance.conftest import ENGINES
+# The engine-neutral adapter surface lives in the acceptance conftest. A
+# conftest applies to its own directory and below, so this file cannot inherit
+# its fixtures and imports the builder instead -- `tests/` is on `sys.path`
+# while this module is imported, which makes `acceptance` an importable
+# namespace package.
+from acceptance.conftest import build_inmemory
 
 TID = 1
 
 
-def _engine_params():
-    """`ENGINES` as fixture params; an engine with no module is skipped, not failed."""
-    for spec in ENGINES:
-        marks = []
-        if find_spec(spec.requires) is None:
-            marks.append(
-                pytest.mark.skip(
-                    reason="engine %r is not present yet (no module %s)"
-                    % (spec.id, spec.requires)
-                )
-            )
-        yield pytest.param(spec, id=spec.id, marks=marks)
+@pytest.fixture
+def book(tmp_path):
+    """An empty book with trader 1 allowed to match itself.
 
-
-@pytest.fixture(params=list(_engine_params()))
-def book(request, tmp_path):
-    """An empty book on the engine under test, with trader 1 matching itself.
-
-    The same fixture the issue's repros needed -- one trader crossing itself
-    is the smallest way to exercise both sides of a match -- built through the
-    engine registry so both engines get it.
+    The fixture the issue's repros needed -- one trader crossing itself is the
+    smallest way to exercise both sides of a match.
     """
-    spec = request.param
-    try:
-        adapter = spec.build(
-            tmp_path / ("issue8_%s.db" % spec.id),
-            traders=(TID,),
-            self_matching=(TID,),
-        )
-    except NotImplementedError as exc:
-        # Same gate as the acceptance suites: an engine whose module exists
-        # but whose adapter does not work yet skips rather than fails.
-        pytest.skip("engine %r is not ready: %s" % (spec.id, exc))
+    adapter = build_inmemory(
+        tmp_path / "issue8.db", traders=(TID,), self_matching=(TID,)
+    )
     yield adapter
     adapter.close()
 
@@ -118,10 +83,10 @@ def place(book, side, qty, price, idNum=None, timestamp=None):
     """Submit a limit order for `TID` and return its `OrderRef`.
 
     Passing `idNum` selects the replay path -- the code path an engine offers
-    for a caller-supplied `idNum`/`timestamp`, which is what makes `idNum`
-    diverge from the legacy `order_id` in Finding 1. Omitting it uses the
-    default path, where legacy's private `nextQuoteID` counter happens to
-    track `order_id` 1:1.
+    for a caller-supplied `idNum`/`timestamp`, and the path that made `idNum`
+    diverge from the row id `order_id` in Finding 1. Omitting it uses the
+    default path, where the unfixed engine's private counter happened to track
+    `order_id` 1:1.
     """
     return book.limit(side, qty, price, tid=TID, idNum=idNum, timestamp=timestamp)
 
@@ -154,22 +119,23 @@ def test_fill_is_credited_only_to_the_participating_orders(book):
     """Finding 1: a trade must advance `fulfilled` on its own two orders only.
 
     Four orders are placed on the replay path with `idNum` values deliberately
-    offset from the legacy `order_id` sequence, arranged so that the two
-    resting non-participants X and Y carry the `idNum` values 3 and 4 that the
-    crossing pair A and B carry as `order_id`:
+    offset from the `order_id` row-id sequence the issue reports, arranged so
+    that the two resting non-participants X and Y carry the `idNum` values 3
+    and 4 that the crossing pair A and B carry as `order_id`:
 
         X  bid 10 @ 90   idNum=3    order_id=1   (never crosses)
         Y  ask 10 @ 110  idNum=4    order_id=2   (never crosses)
         A  bid 10 @ 100  idNum=500  order_id=3
         B  ask 10 @ 100  idNum=501  order_id=4   -> trades 10 with A
 
-    On legacy the single trade row is `(bid_order=3, ask_order=4)`, so the
-    trigger's `where idNum in (3, 4)` credits X and Y -- two orders that never
-    traded. Measured against unfixed code: X and Y both report `fulfilled=10`
-    while the actual participants A and B both report `fulfilled=0`.
+    In the unfixed engine the single trade row is `(bid_order=3, ask_order=4)`,
+    so the trigger's `where idNum in (3, 4)` credits X and Y -- two orders that
+    never traded. Measured against unfixed code: X and Y both report
+    `fulfilled=10` while the actual participants A and B both report
+    `fulfilled=0`.
 
     An engine that keys orders on `idNum` alone has no second sequence for
-    these decoys to collide with; there the arrangement is inert and the
+    these decoys to collide with, so the arrangement is inert here and the
     assertion is `order-matching`'s plain requirement that a fill reach the
     two orders that traded and no others.
     """
@@ -201,10 +167,10 @@ def test_resting_order_never_trades_more_than_its_size(book):
     """Finding 1 (issue repro 1): 12 shares executed against a 10-share order.
 
     A 10-share bid rests with a caller-supplied `idNum=500`. An ask for 10
-    crosses it and legitimately takes all 10 -- but on legacy the trigger's
-    `WHERE` matched no row (`idNum` 500/501 vs `order_id` 1/2), so `fulfilled`
-    stays at 0, the bid keeps reporting a full 10 available in `best_quotes`,
-    and a second ask for 2 trades against it again.
+    crosses it and legitimately takes all 10 -- but in the unfixed engine the
+    trigger's `WHERE` matched no row (`idNum` 500/501 vs `order_id` 1/2), so
+    `fulfilled` stayed at 0, the bid kept reporting a full 10 available, and a
+    second ask for 2 traded against it again.
 
     Measured against unfixed code: `fulfilled=0` after the first ask, the
     second ask trades 2, and 12 total executes against the 10-share bid.
@@ -247,9 +213,9 @@ def reprice_scenario(book):
         A  repriced to bid @ 105 -- now crosses C; may only take its own 6
         E  bid 12 @ 101          -- fresh, unrelated; C should fill it whole
 
-    Placed on the default path, so on legacy `idNum` tracks `order_id` and
-    Finding 1 is not a factor here. The reprice restates A's quantity as its
-    unchanged 10, which is the raw `qty` Finding 2 mistakes for a remainder.
+    Placed on the default path, where `idNum` tracked `order_id` and Finding 1
+    was not a factor. The reprice restates A's quantity as its unchanged 10,
+    which is the raw `qty` Finding 2 mistakes for a remainder.
     """
     a = place(book, "bid", 10, 100)
     place(book, "ask", 4, 100)

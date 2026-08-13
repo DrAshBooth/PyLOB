@@ -1,5 +1,43 @@
 # Architecture review — August 2026
 
+> **Historical record; annotated 2026-08-13.** This reviewed the SQL-backed
+> engine PR #7 built. That engine no longer exists: ADR-0003 retired it and
+> deleted `src/PyLOB/orderbook.py`, `src/create_lob.sql`, `src/lob.db`,
+> `src/lob.html` and the query files cited below (twelve by then: the dead
+> `best_quotes.sql` this review names in §3 went first), so every path in this
+> document now resolves to nothing. It is kept because it is the evidence
+> ADR-0001 acted on — the three-layer coupling, the accounting bugs, and the
+> 439 orders/sec baseline that put SQLite on trial. The findings are left
+> exactly as they were written; only this note is new.
+>
+> Where they ended up:
+>
+> - **1.1, 1.2** (issue #8) — fixed. `fix-fulfilled-accounting` is archived and
+>   the behaviours are pinned by `tests/test_issue8_regressions.py`.
+> - **1.3, 1.4, 1.5** (unrunnable `trade_delete`, restart identity collision,
+>   last price lost on restart) — closed with the code they describe.
+>   `fix-persistence-identity` was never written: ADR-0001 defines restart by
+>   replaying the event log rather than by reopening a live book database
+>   (`tests/test_replay.py`), and a supplied duplicate identifier now raises
+>   `DuplicateOrderID` instead of colliding silently.
+> - **1.6, 1.7** (resting market orders, wrong-side modify) — ruled on rather
+>   than inherited. `openspec/specs/order-lifecycle/spec.md` makes a market
+>   order immediate-or-cancel and never resting, and makes a modify naming the
+>   wrong side an error. `spec-book-queries` is archived.
+> - **1.8, 1.9** (non-decimal ticks, `sys.exit` on invalid input) — fixed in
+>   the current engine: a 0.05 tick quantizes 100.03 to 100.05, and invalid
+>   input raises `InvalidOrder`. No change proposal was needed;
+>   `harden-order-api` was never written.
+> - **2 and 3** describe the deleted schema and its couplings. The equivalent
+>   for the engine that replaced it is `docs/engine-review-2026-08.md`.
+> - **4**, the change map, is spent: `modernize-packaging`, `spec-book-queries`
+>   and `spec-commissions-balances` are archived; `rewrite-docs` and
+>   `benchmark-harness` are still open, and `benchmark-harness`'s plan still
+>   names the retired engine.
+> - **3's last bullet** — "docs describe the deleted implementation" — is half
+>   closed: the README no longer credits the RBTree code PR #7 deleted, and no
+>   longer claims the wiki as current. The wiki itself still describes it.
+
 Read-only review of the SQL-backed implementation (post-PR-#7), covering
 `src/PyLOB/orderbook.py`, `src/create_lob.sql`, and all 13 query files.
 Every finding marked **[confirmed]** was reproduced against a fresh DB built

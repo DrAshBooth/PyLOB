@@ -1,15 +1,12 @@
 """PyLOB: a limit order book for simulation research.
 
-`OrderBook` is the in-memory matching engine (`PyLOB.engine`): price-time
-priority in one layer, no I/O, no database. It is the engine ADR-0001 moved
-matching into, and as of this release it is what `from PyLOB import OrderBook`
-gives you.
-
-`LegacyOrderBook` is the 2013 SQL engine (`PyLOB.orderbook`), which matches by
-executing queries against a SQLite connection you hand it. It stays in the
-tree as the cross-check oracle the differential suite runs against, and it is
-the class the old import used to name -- code that passed `OrderBook(db=conn)`
-wants this one.
+`OrderBook` is the matching engine (`PyLOB.engine`): price-time priority in
+one layer, no I/O, no database. It is the engine ADR-0001 moved matching
+into, and since ADR-0003 retired the 2013 SQL engine it is the only one --
+`OrderBook(db=conn)` no longer means anything, and there is no
+`LegacyOrderBook` to reach for. The public API that engine defined is kept
+(`processOrder`, `cancelOrder`, `modifyOrder`, `getVolumeAtPrice`,
+`getBest*`/`getWorst*`, `print`); only the implementation behind it is gone.
 
 Also exported: the exceptions a caller catches (`PyLOBError` and its
 subclasses), the objects the public API hands back (`Order`, `Trade`,
@@ -38,11 +35,9 @@ from .engine import (
     UnknownOrder,
 )
 from .events import EventSink, OrderType, Side
-from .orderbook import OrderBook as LegacyOrderBook
 
 __all__ = [
     "OrderBook",
-    "LegacyOrderBook",
     "PyLOBError",
     "InvalidOrder",
     "DuplicateOrderID",

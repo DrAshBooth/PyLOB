@@ -1,13 +1,12 @@
 """Acceptance tests for the order-lifecycle contract.
 
-Contract: `openspec/changes/spec-book-queries/specs/order-lifecycle/spec.md`.
-Every test here names the requirement and scenario it encodes, and asserts the
-*target* behaviour -- what an engine has to do, not what any engine does today.
-Known legacy divergences are recorded with `@pytest.mark.engine_xfail` (see
-`conftest.py`), never with a branch on the engine.
+Contract: `openspec/specs/order-lifecycle/spec.md`. Every test here names the
+requirement and scenario it encodes, and asserts the *target* behaviour --
+what an engine has to do, not what any engine does today.
 
-Fixtures come from `tests/acceptance/conftest.py`: `engine` is an empty book on
-the engine under test, and the suite is run once per registered engine.
+Fixtures come from `tests/acceptance/conftest.py`: `engine` is an empty book
+reached through the engine-neutral adapter surface, never through an engine's
+own API, so a scenario here states a contract rather than an implementation.
 """
 
 import pytest
@@ -28,11 +27,6 @@ def test_trades_price_at_the_maker(engine):
     assert [(trade.price, trade.qty) for trade in taker.trades] == [(101, 3), (102, 2)]
 
 
-@pytest.mark.engine_xfail(
-    "legacy",
-    "lob-0bl: the legacy engine rests a market order's remainder instead of "
-    "cancelling it",
-)
 def test_market_remainder_is_cancelled(engine):
     """Market orders are immediate-or-cancel / Remainder is cancelled when liquidity runs out."""
     engine.limit("ask", 3, 101, tid=100)
@@ -46,11 +40,6 @@ def test_market_remainder_is_cancelled(engine):
     assert engine.snapshot("bid") == ()
 
 
-@pytest.mark.engine_xfail(
-    "legacy",
-    "lob-0bl: with no opposite-side liquidity the legacy engine rests the "
-    "whole market order instead of cancelling it",
-)
 def test_market_order_on_an_empty_opposite_side(engine):
     """Market orders are immediate-or-cancel / Market order on an empty opposite side."""
     engine.limit("bid", 4, 99, tid=100)
@@ -91,11 +80,6 @@ def test_cancel_targets_exactly_one_order(engine):
     ]
 
 
-@pytest.mark.engine_xfail(
-    "legacy",
-    "lob-0rb: the legacy engine silently no-ops on a cancel for an identifier "
-    "no order has",
-)
 def test_cancel_with_an_unknown_identifier_raises(engine):
     """Order identifiers are unique and stable / Unknown identifier raises."""
     resting = engine.limit("bid", 5, 100, tid=100)
@@ -107,11 +91,6 @@ def test_cancel_with_an_unknown_identifier_raises(engine):
     assert engine.snapshot("bid") == before
 
 
-@pytest.mark.engine_xfail(
-    "legacy",
-    "lob-0rb: the legacy engine silently no-ops on a modify for an identifier "
-    "no order has",
-)
 def test_modify_with_an_unknown_identifier_raises(engine):
     """Order identifiers are unique and stable / Unknown identifier raises."""
     resting = engine.limit("bid", 5, 100, tid=100)
@@ -123,12 +102,6 @@ def test_modify_with_an_unknown_identifier_raises(engine):
     assert engine.snapshot("bid") == before
 
 
-@pytest.mark.engine_xfail(
-    "legacy",
-    "lob-7e7: the legacy engine's idNum counter (`nextQuoteID`) starts from 0 "
-    "on every construction and is never seeded from the database, so the "
-    "first order after a reload reuses the first identifier ever issued",
-)
 def test_identifiers_stay_unique_across_a_reload(engine):
     """Order identifiers are unique and stable / requirement statement.
 
@@ -146,12 +119,6 @@ def test_identifiers_stay_unique_across_a_reload(engine):
     assert [entry.idNum for entry in engine.snapshot("bid")] == [issued, later.idNum]
 
 
-@pytest.mark.engine_xfail(
-    "legacy",
-    "lob-a17: the legacy engine accepts a second order carrying an idNum "
-    "already in the book -- `trade_order.idNum` has a plain index, not a "
-    "unique one -- so two orders answer to one identifier",
-)
 def test_externally_supplied_duplicate_identifier_is_rejected(engine):
     """Order identifiers are unique and stable / Externally supplied duplicate is rejected."""
     engine.limit("bid", 5, 100, tid=100, idNum=7, timestamp=1)
@@ -168,11 +135,6 @@ def test_externally_supplied_duplicate_identifier_is_rejected(engine):
 
 
 @pytest.mark.parametrize("qty", [0, -3])
-@pytest.mark.engine_xfail(
-    "legacy",
-    "lob-ihv: the legacy engine calls sys.exit on an invalid submission "
-    "instead of raising a library exception",
-)
 def test_non_positive_quantity_raises(engine, qty):
     """Invalid submissions raise library exceptions / Non-positive quantity."""
     engine.limit("ask", 5, 101, tid=100)
@@ -192,11 +154,6 @@ def test_non_positive_quantity_raises(engine, qty):
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.engine_xfail(
-    "legacy",
-    "lob-0rb: the legacy engine silently no-ops on a modify addressed with "
-    "the wrong side",
-)
 def test_modify_with_a_side_mismatch_raises(engine):
     """Modify is validated and priority-aware / Side mismatch raises."""
     resting = engine.limit("bid", 5, 100, tid=100)
@@ -224,11 +181,6 @@ def test_quantity_reduced_below_fills_clamps(engine):
     assert engine.snapshot("bid") == ()
 
 
-@pytest.mark.engine_xfail(
-    "legacy",
-    "lob-pn3: the legacy engine keeps event_dt on a price change, so a "
-    "round trip away from the price and back keeps the original time priority",
-)
 def test_price_change_loses_time_priority(engine):
     """Modify is validated and priority-aware / Price change loses time priority."""
     first = engine.limit("bid", 5, 100, tid=100)
@@ -300,12 +252,6 @@ def test_same_timestamp_arrivals_keep_arrival_order(engine_factory):
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.engine_xfail(
-    "legacy",
-    "lob-5rt.2: the legacy engine quantizes with round(price, "
-    "int(log10(1/tick_size))), which is decimal-only -- tick 0.05 gives "
-    "rounder=1 and clips 100.03 to 100.0",
-)
 def test_non_decimal_tick(engine_factory):
     """Prices are quantized to the tick / Non-decimal tick."""
     engine = engine_factory(tick_size=0.05)

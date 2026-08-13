@@ -1,6 +1,7 @@
 # ADR-0001: Move matching to an in-memory engine; retain SQLite as an optional sink
 
-Status: Accepted
+Status: Accepted; the transition clause in Consequences is superseded by
+ADR-0003 (the SQL engine is retired, not in tree)
 Date: 2026-08-10
 
 ## Context

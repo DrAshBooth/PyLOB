@@ -1,243 +1,146 @@
-"""The differential harness: the legacy SQL engine as an oracle for the new one.
+"""The differential harness: a spec-derived reference matcher as the oracle.
 
-ADR-0001 keeps `PyLOB.orderbook` in the tree as a cross-check until the
-in-memory engine passes the same suites. This is that cross-check: seeded
-random workloads run through both engines in lockstep, and after *every*
-operation the two are compared on everything either can be asked -- the full
-book on both sides in priority order, best/worst prices, volume-at-price,
-last price, the whole trade log, every order's accounting, and every trader's
-balances in both the instrument and the currency.
+Seeded random workloads run through two implementations in lockstep, and after
+*every* operation the two are compared on everything either can be asked --
+both books in priority order, best/worst prices, volume-at-price, last price,
+the whole trade log, every order's accounting, and every trader's balance in
+every instrument and currency.
 
-Both engines are driven through the acceptance suites' adapter
+The two implementations are `PyLOB.engine.OrderBook` and `tests/reference`, a
+matching engine written from the frozen specs that shares no code with it. Both
+are driven through the acceptance suites' adapter surface
 (`tests/acceptance/conftest.py`), which is what makes a differential harness
-expressible at all: `limit`, `market`, `cancel`, `modify`, `order_state`,
-`snapshot`, `trades`, `best`, `worst`, `volume_at`, `last_price`, `balance`
-mean the same thing on both sides of the comparison.
+expressible at all: `limit`, `market`, `cancel`, `modify`, `reopen`,
+`order_state`, `snapshot`, `trades`, `best`, `worst`, `volume_at`,
+`last_price`, `balance` mean the same thing on both sides of the comparison.
 
 
-The whitelist, and why it has exactly two entries
+What replaced what, and why the whitelist is gone
 -------------------------------------------------
 
-`openspec/changes/inmemory-engine/design.md` decision 6 names two expected
-divergences: **IOC remainder handling** and **priority-on-price-change**.
-`WHITELIST` below is that list, and it is not a set of comparisons the
-comparator skips -- it is a set of divergences this file *pins with explicit
-scenarios* (`test_whitelist_ioc_remainder`,
-`test_whitelist_priority_on_price_change`). Each asserts what both engines do,
-so the day the legacy engine is fixed or the new one regresses, the pin fails
-loudly. A skipped comparison would go quiet instead.
+Until ADR-0003 the oracle was the legacy SQL engine. It was an oracle by
+accident of history: it disagreed with the frozen specs in nine known ways, so
+this file carried a two-entry whitelist of expected divergences and nine
+generator constraints, each named after a legacy defect, each one excluding
+inputs the harness would otherwise have wanted most.
 
-The randomized workload is then constrained so that no whitelisted divergence
-is reachable from it, and every comparison in it is exact (money excepted --
-see below). `CONSTRAINTS` records each constraint, the bead it corresponds to,
-and why the constraint was preferred to a whitelist entry. The rule applied
-throughout, and the maintainer's recommendation on lob-we3: **a generator
-constraint costs one line and is easy to state; a whitelist entry blinds the
-harness to a whole class of difference forever.**
+A spec-derived matcher has none of those divergences, so all of it is gone --
+the whitelist entirely, and seven of the nine constraints. The workload now
+generates exactly what the old one had to exclude:
 
-Both whitelisted divergences are *state-poisoning* rather than local: once a
-legacy market remainder is resting, or once a repriced order sits ahead of the
-queue it should be behind, every subsequent fill, balance and trade differs.
-There is no narrow way to blind the comparator to them, which is a second
-reason the constraint-plus-pin shape is the only honest one.
+============================  ==========================================
+excluded before               generated now
+============================  ==========================================
+`lob-0bl` market remainders   market orders sized freely; the remainder is
+                              cancelled on both sides (`order-lifecycle`:
+                              market orders are immediate-or-cancel)
+`lob-pn3` reprices into an    reprices into any level, occupied or not --
+occupied level                which is the case that tells the two
+                              priority rules apart
+`lob-a17` supplied            the data-replay path, identifiers and
+identifiers                   timestamps supplied by the caller, several
+                              orders sharing one timestamp
+`lob-7e7`/`lob-bis` reloads   the engine reloads mid-workload and must come
+                              back agreeing with a model that never went
+                              away
+`lob-crf` `modify(price=      generated, alongside the "don't mention it"
+None)`                        form, which must produce the same outcome
+`lob-we3` off-grid prices     half-tick prices on three different ticks, so
+                              the two quantizers are compared rather than
+                              both being the identity
+`lob-z45` one instrument      several instruments, one profile with two
+                              currencies
+============================  ==========================================
+
+`CONSTRAINTS` is what is left: two entries, both about generating *legal*
+input, neither naming a defect in anything.
 
 
 Why money is compared within a tolerance
 ----------------------------------------
 
-The two engines apply the same commission formula to the same cumulative
-(Q, V), but move the currency leg in a different number of floating-point
-steps: legacy's `trade_insert` trigger debits the value and the commission as
-separate `UPDATE`s, while `OrderBook._settle` debits `value + delta` in one.
-`a - v - c` and `a - (v + c)` are not the same double. The commissions
-contract already says money is compared within a tolerance and never for bit
-equality; `MONEY_REL` / `MONEY_ABS` (1e-9) are the acceptance suites' own.
+The two implementations apply the same commission formula to the same
+cumulative (Q, V) but move the currency leg in a different number of
+floating-point steps: `trader-balances` and `commissions` describe the cash
+movement and the commission debit separately and the model does them
+separately, while `OrderBook._settle` debits `value + delta` in one. `a - v -
+c` and `a - (v + c)` are not the same double. The commissions contract already
+says money is compared within a tolerance and never for bit equality;
+`MONEY_REL` / `MONEY_ABS` (1e-9) are the acceptance suites' own.
 
 Everything else -- prices, quantities, identifiers, queue positions -- is
-compared exactly, because on the constrained workload there is no reason for
-it to differ by so much as a bit.
+compared exactly, because there is no reason for it to differ by so much as a
+bit.
 """
 
-import importlib.util
+import ast
 import random
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import pytest
-
-# --------------------------------------------------------------------------
-# the acceptance surface, borrowed
-# --------------------------------------------------------------------------
-
-_ACCEPTANCE = Path(__file__).resolve().parent / "acceptance" / "conftest.py"
-
-
-def _acceptance_surface():
-    """`tests/acceptance/conftest.py` as a module, under a name of its own.
-
-    Loaded by path rather than imported: it is a conftest for the directory
-    below this one, so pytest never makes it importable from here, and giving
-    the copy a distinct module name keeps it out of `sys.modules['conftest']`
-    where the two conftests would collide.
-    """
-    spec = importlib.util.spec_from_file_location(
-        "pylob_acceptance_surface", _ACCEPTANCE
-    )
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-_surface = _acceptance_surface()
-
-Commissions = _surface.Commissions
-NO_COMMISSION = _surface.NO_COMMISSION
-MONEY_REL = _surface.MONEY_REL
-MONEY_ABS = _surface.MONEY_ABS
-
-INSTRUMENT = _surface.INSTRUMENT
-CURRENCY = _surface.CURRENCY
-
-#: A decimal tick, and every generated price an exact multiple of it. See
-#: CONSTRAINTS["on-grid prices, decimal tick"].
-TICK = 0.01
+from acceptance_surface import (
+    CURRENCY,
+    INSTRUMENT,
+    MONEY_ABS,
+    MONEY_REL,
+    UNSET,
+    BookEntry,
+    Commissions,
+    NO_COMMISSION,
+    build_inmemory,
+)
+from reference import build_reference
+from reference import matcher as reference_matcher
 
 TRADERS = (1, 2, 3, 4, 5)
 
+#: Every supplied-identifier order carries this timestamp, so several of them
+#: share one. `order-lifecycle`'s "Same-timestamp arrivals keep arrival order"
+#: is then a property of the workload rather than a scenario off to one side.
+REPLAY_TIMESTAMP = 7.0
 
-# --------------------------------------------------------------------------
-# the two named divergences (design.md decision 6)
-# --------------------------------------------------------------------------
+#: Supplied identifiers start well above anything the engines assign, so that
+#: "supplied" and "assigned" cannot collide by accident. Both sides push their
+#: counter past a supplied identifier, and the harness compares the next
+#: assignment, so the rule is checked rather than assumed.
+FIRST_SUPPLIED_ID = 1_000_000
 
-
-@dataclass(frozen=True)
-class Whitelisted:
-    """One expected legacy/new divergence, pinned by a scenario in this file."""
-
-    name: str
-    bead: str
-    #: Why a generator constraint could not stand in for the entry.
-    unavoidable: str
-
-
-WHITELIST = (
-    Whitelisted(
-        name="IOC remainder",
-        bead="lob-0bl",
-        unavoidable=(
-            "This is the behaviour change itself, not an input the generator "
-            "can steer around: the order-lifecycle contract says a market "
-            "order never rests, and the legacy engine rests the remainder. "
-            "The randomized workload avoids *producing* a remainder (see "
-            "CONSTRAINTS['market orders never leave a remainder']) so that the "
-            "comparison stays exact, but the divergence is real and is pinned "
-            "here rather than merely dodged."
-        ),
-    ),
-    Whitelisted(
-        name="priority on price change",
-        bead="lob-pn3",
-        unavoidable=(
-            "Also the behaviour change itself: order-lifecycle requires a "
-            "price change to surrender time priority, and legacy re-stamps "
-            "arrival only on a quantity increase. The randomized workload "
-            "reprices only into empty levels (see CONSTRAINTS['reprice only "
-            "into an empty level']), where the two priority rules provably "
-            "agree; the disagreement is pinned here."
-        ),
-    ),
-)
+#: ...and each supplied identifier clears the last by more than a workload's
+#: worth of operations. `order-lifecycle` makes a supplied identifier push the
+#: counter past itself, so the identifiers assigned *after* one climb out of
+#: the range the next supplied one would otherwise sit in. A stride wider than
+#: `Profile.ops` is what keeps "supplied" and "assigned" from meeting.
+SUPPLIED_STRIDE = 1000
 
 
-#: Every constraint the workload generator carries, and why it is a constraint
-#: rather than a third whitelist entry. Read alongside `WHITELIST`.
+#: Every constraint the workload generator carries, and why. Two entries, both
+#: about generating input that is *legal*; nothing here is a divergence being
+#: dodged, which is the difference between this list and the nine it replaces.
 CONSTRAINTS = {
-    "market orders never leave a remainder": (
-        "lob-0bl",
-        "A market order's quantity is drawn from the liquidity it may actually "
-        "consume right now (opposite-side resting volume, minus the taker's "
-        "own orders when the self-matching gate applies), so it always fills "
-        "completely. Legacy rests any remainder at a null price that its book "
-        "view sorts *first* and then trades at the next taker's price, which "
-        "corrupts every later comparison rather than showing up as one "
-        "difference. Whitelisting it would mean blinding the harness to the "
-        "book, the trades and the balances from that point on.",
+    "every generated operation is legal input": (
+        "The comparator compares state, and a refusal changes no state: two "
+        "implementations that both raise have agreed about nothing anyone can "
+        "see. Illegal input is therefore worth generating only as a pair of "
+        "raises to assert on, which is a deterministic test and not a random "
+        "walk -- `test_both_refuse_what_the_specs_refuse` is that test, and "
+        "`tests/acceptance/` plus `tests/test_engine_boundaries.py` own the "
+        "error paths in depth. Note what this constraint no longer says: it "
+        "does not exclude a *hostile* input, only an invalid one. Half-tick "
+        "prices, market orders that outrun the book, reprices onto a busy "
+        "level and identifiers chosen by the caller are all legal, and all "
+        "generated."
     ),
-    "reprice only into an empty level": (
-        "lob-pn3",
-        "Legacy's queue key is the last arrival-or-quantity-increase; the new "
-        "engine's is the last arrival-or-quantity-increase-or-reprice. They "
-        "order a level identically unless some order already at the "
-        "destination arrived between the repriced order's own arrival and its "
-        "reprice. Repricing only into a level that is currently empty makes "
-        "that impossible: nothing can join the level afterwards except by a "
-        "fresh arrival (a later reprice would find the level occupied), and a "
-        "fresh arrival is behind the repriced order under both keys. So the "
-        "constraint keeps reprices in the workload -- about 8% of operations "
-        "-- while keeping the queue comparison exact.",
-    ),
-    "no invalid submissions": (
-        "lob-ihv",
-        "Legacy calls `sys.exit` on a qty <= 0 or a bad side/type, which "
-        "raises `SystemExit` and would tear down the whole pytest run rather "
-        "than fail one test. The new engine raises `InvalidOrder`. The "
-        "acceptance suites already pin that contract; generating invalid "
-        "input here would buy nothing and cost the run.",
-    ),
-    "cancel and modify address a currently resting order": (
-        "lob-0rb",
-        "Legacy silently no-ops on an unknown identifier, and its "
-        "`cancel_order.sql` will happily set cancel=1 on an order that is "
-        "already filled or already cancelled; the new engine raises. Worse, "
-        "legacy's `modifyOrder` on a *cancelled* order still reaches "
-        "`processMatchesDB`, so a cancelled order can trade. All of it is "
-        "error-path behaviour the acceptance suites pin directly, and none of "
-        "it is what a differential harness is for.",
-    ),
-    "identifiers are engine-assigned, never supplied": (
-        "lob-a17",
-        "Legacy accepts a duplicate external idNum, after which every "
-        "idNum-keyed operation addresses an arbitrary one of the two orders; "
-        "the new engine raises `DuplicateOrderID`. Letting each engine assign "
-        "its own identifiers side-steps it -- and the two assignments are "
-        "themselves compared on every submission, so the harness still proves "
-        "the counters agree rather than assuming it.",
-    ),
-    "no reload mid-workload": (
-        "lob-7e7, lob-bis",
-        "Legacy does not re-seed its idNum counter or rebuild `lastPrice` "
-        "from the database on reload. Reload is not this harness's subject -- "
-        "lob-5rt.7's replay tests own it -- so the workload simply never "
-        "reopens a book.",
-    ),
-    "modify always names an explicit price": (
-        "lob-crf",
-        "Legacy reads `price=None` on a modify as 'match as a market order' "
-        "and trades a limit order straight through its own limit; the new "
-        "engine reads it as 'leave the price alone'. The adapter's default "
-        "fills the order's current price in, so the generator never has to "
-        "send a bare None.",
-    ),
-    "on-grid prices, decimal tick": (
-        "lob-we3",
-        "Legacy quantizes with `round(price, log10(1/tick))` on a binary "
-        "double; the new engine divides by the tick in decimal and rounds "
-        "half-even. The two disagree on an exact half-tick (100.00005 on a "
-        "0.0001 tick: legacy 100.0001, new 100.0) and on any non-decimal tick "
-        "(100.03 on a 0.05 tick: legacy 100.0, new 100.05 -- legacy simply "
-        "wrong). Generating prices that are already exact multiples of a "
-        "decimal tick means both quantizers are the identity and neither "
-        "class arises. This is lob-we3's option (a), and the reason is the "
-        "general rule: the alternative third whitelist entry would blind the "
-        "harness to every price difference, including the ones where legacy "
-        "is outright wrong.",
-    ),
-    "one instrument": (
-        "lob-z45",
-        "Legacy's `active_orders.sql` has no instrument filter, so a book "
-        "snapshot leaks orders from other instruments. Single-instrument is "
-        "a standing constraint of the current specs anyway.",
+    "cancel and modify address a live resting order": (
+        "The same rule as above, for the two operations that name an order "
+        "instead of describing one: `order-lifecycle` makes an unknown "
+        "identifier raise, and both implementations refuse to cancel an order "
+        "that is already cancelled or already fully filled. Choosing the "
+        "target from a book snapshot is how the generator names an order that "
+        "exists without having to track what became of every order it ever "
+        "submitted. It costs nothing: every resting order is reachable, and "
+        "the interesting modifies -- the repricing ones -- are only defined "
+        "for an order that is still in the book."
     ),
 }
 
@@ -251,33 +154,46 @@ CONSTRAINTS = {
 class Op:
     """One operation, in the adapter's vocabulary.
 
-    Rendered rather than replayed: a failing run prints these, and each line
-    is the call that produced it.
+    Rendered rather than replayed: a failing run prints these, and each line is
+    the call that produced it.
+
+    `price` and `qty` are three-valued on a modify. `UNSET` means the call does
+    not mention them and the adapter fills in the order's current value;
+    `None` means an explicit `None` was passed, which `order-lifecycle` reads
+    as "leave that one alone". The two are different calls that must have the
+    same effect, so the generator sends both.
     """
 
     kind: str
+    instrument: str | None = None
     side: str | None = None
-    qty: int | None = None
-    price: float | None = None
+    qty: object = UNSET
+    price: object = UNSET
     tid: int | None = None
     idNum: int | None = None
+    timestamp: float | None = None
+    #: What this operation is an example of, for the coverage assertions.
+    tags: tuple = ()
 
     def render(self):
-        if self.kind == "limit":
-            return "limit(%r, qty=%d, price=%r, tid=%d)" % (
-                self.side,
-                self.qty,
-                self.price,
-                self.tid,
-            )
-        if self.kind == "market":
-            return "market(%r, qty=%d, tid=%d)" % (self.side, self.qty, self.tid)
+        if self.kind == "reload":
+            return "reopen()"
         if self.kind == "cancel":
             return "cancel(%d)" % (self.idNum,)
+        if self.kind in ("limit", "market"):
+            parts = ["%r" % self.side, "qty=%d" % self.qty]
+            if self.kind == "limit":
+                parts.append("price=%r" % self.price)
+            parts.append("tid=%d" % self.tid)
+            parts.append("instrument=%r" % self.instrument)
+            if self.idNum is not None:
+                parts.append("idNum=%d" % self.idNum)
+                parts.append("timestamp=%r" % self.timestamp)
+            return "%s(%s)" % (self.kind, ", ".join(parts))
         parts = ["%d" % self.idNum]
-        if self.qty is not None:
-            parts.append("qty=%d" % self.qty)
-        if self.price is not None:
+        if self.qty is not UNSET:
+            parts.append("qty=%r" % self.qty)
+        if self.price is not UNSET:
             parts.append("price=%r" % self.price)
         return "modify(%s)" % ", ".join(parts)
 
@@ -287,173 +203,278 @@ class Profile:
     """One shape of workload: the market's parameters and the operation mix."""
 
     name: str
-    #: Prices as whole ticks, so every generated price is exactly on the grid.
-    grid: tuple[int, ...]
+    #: The tick, and the grid as whole *half*-ticks -- so half the grid is on
+    #: the tick and half of it is exactly between two ticks. See
+    #: `test_the_grid_is_half_on_the_grid_and_half_off_it`.
+    tick_size: float
+    grid: tuple
+    #: (symbol, currency) pairs. More than one of either is now allowed.
+    instruments: tuple = ((INSTRUMENT, CURRENCY),)
     commissions: object = NO_COMMISSION
     self_matching: object = ()
-    ops: int = 150
-    #: Cumulative weights for limit / market / cancel / modify.
-    p_limit: float = 0.60
-    p_market: float = 0.72
-    p_cancel: float = 0.85
+    ops: int = 180
+    #: Cumulative weights: limit / market / cancel / modify, remainder reload.
+    p_limit: float = 0.52
+    p_market: float = 0.68
+    p_cancel: float = 0.82
+    p_modify: float = 1.00
+    #: How often a submission supplies its own identifier and timestamp.
+    p_supplied: float = 0.0
+    #: At most this many reloads, however the dice fall.
+    max_reloads: int = 0
+    #: Behaviour this profile must actually reach, or the run proves less than
+    #: it claims. Checked at the end of every workload.
+    expects: frozenset = frozenset()
+
+    @property
+    def symbols(self):
+        """Every symbol a balance can be held in: instruments and currencies."""
+        seen = []
+        for symbol, currency in self.instruments:
+            for name in (symbol, currency):
+                if name not in seen:
+                    seen.append(name)
+        return tuple(seen)
+
+    def price(self, half_ticks):
+        """A grid point as a price: `half_ticks` halves of this profile's tick."""
+        return round(half_ticks * self.tick_size / 2, 12)
 
 
-def _grid(low, high, step):
+def _halves(low, high, step):
     return tuple(range(low, high + 1, step))
 
 
 PROFILES = (
-    # A wide book: many price levels, mostly one order deep, so the price
-    # index and the level bookkeeping do the work.
-    Profile(name="wide", grid=_grid(9500, 10500, 5)),
-    # Commissions on and two traders allowed to cross themselves: exercises
-    # the ledgers and the self-matching gate together.
+    # A wide book on a 0.01 tick: many price levels, mostly one order deep, so
+    # the price index and the level bookkeeping do the work.
+    Profile(
+        name="wide",
+        tick_size=0.01,
+        grid=_halves(19940, 20060, 3),
+        expects=frozenset({"market remainder", "off-grid price", "price=None modify"}),
+    ),
+    # Commissions on, two traders allowed to cross themselves, two instruments
+    # sharing a currency: the ledgers, the self-matching gate and a currency
+    # balance that nets across two books, all at once. The 0.05 tick is where
+    # a quantizer that reads the tick as a double gets it wrong.
     Profile(
         name="ledgers",
-        grid=_grid(9800, 10200, 5),
+        tick_size=0.05,
+        grid=_halves(3990, 4012, 1),
+        instruments=(("FAKE", "USD"), ("BAR", "USD")),
         commissions=Commissions(min=2.5, max_pct=1.0, per_unit=0.01),
         self_matching=(1, 3),
+        expects=frozenset({"market remainder", "off-grid price", "two instruments"}),
     ),
     # A narrow book: every level many orders deep, which is where FIFO order,
-    # partial fills and the modify rules actually collide.
+    # partial fills and the modify rules actually collide -- and where a
+    # reprice lands on an occupied level nearly every time.
     Profile(
         name="deep",
-        grid=_grid(9980, 10020, 5),
+        tick_size=0.01,
+        grid=_halves(19995, 20009, 1),
         commissions=Commissions(min=0.5, max_pct=0.5, per_unit=0.02),
         self_matching=True,
+        p_limit=0.44,
+        p_market=0.58,
+        p_cancel=0.74,
+        p_modify=1.00,
+        expects=frozenset(
+            {"market remainder", "off-grid price", "reprice onto an occupied level"}
+        ),
+    ),
+    # The replay shapes: identifiers and timestamps supplied by the caller,
+    # several orders sharing one timestamp, two instruments in two currencies,
+    # and the engine reloading itself from its event stream mid-workload.
+    Profile(
+        name="replay",
+        tick_size=0.0001,
+        grid=_halves(1999990, 2000010, 3),
+        instruments=(("FAKE", "USD"), ("BAZ", "EUR")),
+        commissions=Commissions(min=1.0, max_pct=2.0, per_unit=0.005),
+        self_matching=(2,),
+        ops=140,
         p_limit=0.50,
-        p_market=0.62,
+        p_market=0.64,
         p_cancel=0.78,
+        p_modify=0.94,
+        p_supplied=0.35,
+        max_reloads=2,
+        expects=frozenset(
+            {"supplied identifier", "reload", "off-grid price", "two instruments"}
+        ),
     ),
 )
 
-SEEDS = (1, 2, 3, 4)
-
-
-def _price(ticks):
-    """A grid point as a price. Exact: `ticks` hundredths on a 0.01 tick."""
-    return ticks / 100.0
+SEEDS = (1, 2, 3, 4, 5, 6, 7, 8)
 
 
 class Generator:
     """The seeded workload generator, and every constraint in `CONSTRAINTS`.
 
-    State-adaptive by necessity rather than by taste: two of the constraints
-    ("no remainder", "empty destination level") are questions about the book
-    as it stands, so the generator reads the book before choosing. It reads it
-    from the *legacy* engine, the oracle -- and only ever at a point where the
-    two engines have just been compared equal, so which one it reads is
-    immaterial.
+    State-adaptive by necessity rather than by taste: naming a live order means
+    reading the book as it stands. It reads it from the *reference* -- the
+    oracle -- and only ever at a point where the two have just been compared
+    equal, so the choice is immaterial to the workload and material to nothing
+    else. Reading the oracle rather than the engine also means a broken engine
+    cannot steer the generator away from the input that would expose it.
 
     Deterministic given (profile, seed): the random stream is, and both
-    engines are, so the operation sequence is too.
+    implementations are, so the operation sequence is too.
     """
 
     def __init__(self, profile, seed):
         self.profile = profile
         self.rng = random.Random(seed)
-        #: idNum -> tid, so the generator can tell which resting liquidity a
-        #: given taker is actually allowed to consume.
-        self.owner = {}
+        self.next_supplied = FIRST_SUPPLIED_ID
+        self.reloads = 0
 
     def next_op(self, oracle):
         rng = self.rng
         profile = self.profile
-        resting = oracle.snapshot("bid") + oracle.snapshot("ask")
+        live = self._live(oracle)
         roll = rng.random()
 
-        if roll < profile.p_limit or not resting:
-            return self._limit()
+        if roll < profile.p_limit or not live:
+            return self._submit("limit")
         if roll < profile.p_market:
-            return self._market(oracle)
+            return self._submit("market")
         if roll < profile.p_cancel:
-            # CONSTRAINTS["cancel and modify address a currently resting
-            # order"]: a snapshot lists exactly the resting orders.
-            return Op(kind="cancel", idNum=rng.choice(resting).idNum)
-        return self._modify(oracle, rng.choice(resting).idNum)
+            # CONSTRAINTS["cancel and modify address a live resting order"]:
+            # a snapshot lists exactly the orders that are still in the book.
+            return Op(kind="cancel", idNum=rng.choice(live)[0])
+        if roll < profile.p_modify or self.reloads >= profile.max_reloads:
+            return self._modify(oracle, rng.choice(live))
+        self.reloads += 1
+        return Op(kind="reload", tags=("reload",))
 
-    def _limit(self):
+    def _live(self, oracle):
+        """(idNum, instrument, side) for every order resting anywhere."""
+        found = []
+        for symbol, _currency in self.profile.instruments:
+            for side in ("bid", "ask"):
+                for entry in oracle.snapshot(side, symbol):
+                    found.append((entry.idNum, symbol, side))
+        return found
+
+    def _submit(self, kind):
+        """A limit or a market order, occasionally on the data-replay path.
+
+        A market order's quantity is drawn without reference to the liquidity
+        it can reach, so it often outruns the book -- `order-lifecycle` says
+        the remainder is cancelled and never rests, and the old harness had to
+        exclude exactly this because the legacy engine rested it (`lob-0bl`).
+        """
         rng = self.rng
+        profile = self.profile
+        tags = []
+        price = UNSET
+        if kind == "limit":
+            price = profile.price(rng.choice(profile.grid))
+            if price != reference_matcher.quantize(price, profile.tick_size):
+                tags.append("off-grid price")
+
+        idNum = timestamp = None
+        if rng.random() < profile.p_supplied:
+            idNum = self.next_supplied
+            self.next_supplied += SUPPLIED_STRIDE
+            timestamp = REPLAY_TIMESTAMP
+            tags.append("supplied identifier")
+
         return Op(
-            kind="limit",
+            kind=kind,
+            instrument=rng.choice(profile.instruments)[0],
             side=rng.choice(("bid", "ask")),
-            qty=rng.randint(1, 8),
-            price=_price(rng.choice(self.profile.grid)),
+            qty=rng.randint(1, 12 if kind == "market" else 8),
+            price=price,
             tid=rng.choice(TRADERS),
+            idNum=idNum,
+            timestamp=timestamp,
+            tags=tuple(tags),
         )
 
-    def _market(self, oracle):
-        """A market order sized to the liquidity it may actually consume.
+    def _modify(self, oracle, target):
+        """A quantity change, a price change, both, or neither stated.
 
-        CONSTRAINTS["market orders never leave a remainder"]. "May actually
-        consume" is not the same as "is resting": a trader without
-        `allow_self_matching` steps over their own orders, so those do not
-        count towards what this order can fill against.
+        The price is drawn from the whole grid, so a reprice lands on an
+        occupied level whenever the book is busy -- the case where a rule that
+        re-stamps arrival only on a quantity increase parts company with one
+        that re-stamps it on a price change too (`lob-pn3`, which the old
+        harness had to steer around).
+
+        Not naming the price at all and naming it as an explicit `None` are
+        both generated: `order-lifecycle` says they mean the same thing, and
+        `lob-crf` is what happens when they do not.
         """
         rng = self.rng
-        side = rng.choice(("bid", "ask"))
-        tid = rng.choice(TRADERS)
-        makers = oracle.snapshot("ask" if side == "bid" else "bid")
-        reachable = sum(
-            entry.available
-            for entry in makers
-            if self._may_match(tid, self.owner.get(entry.idNum))
-        )
-        if reachable <= 0:
-            return self._limit()
-        return Op(kind="market", side=side, qty=rng.randint(1, reachable), tid=tid)
+        profile = self.profile
+        idNum, instrument, side = target
+        tags = []
 
-    def _may_match(self, taker, maker):
-        if taker != maker:
-            return True
-        allowed = self.profile.self_matching
-        return allowed is True or taker in allowed
+        wants_price = rng.random() < 0.5
+        wants_qty = rng.random() < 0.55 or not wants_price
 
-    def _modify(self, oracle, idNum):
-        """A quantity change, a price change, or both.
+        price = UNSET
+        if wants_price:
+            price = profile.price(rng.choice(profile.grid))
+            if price != reference_matcher.quantize(price, profile.tick_size):
+                tags.append("off-grid price")
+            occupied = {entry.price for entry in oracle.snapshot(side, instrument)} - {
+                oracle.order_state(idNum).price
+            }
+            if reference_matcher.quantize(price, profile.tick_size) in occupied:
+                tags.append("reprice onto an occupied level")
+        elif rng.random() < 0.5:
+            price = None
+            tags.append("price=None modify")
 
-        A price change targets a level that is *currently empty* on the
-        order's side -- CONSTRAINTS["reprice only into an empty level"]. The
-        order's own level is occupied by the order itself, so this also
-        guarantees the price really changes. When the book leaves no free
-        level (the `deep` profile's grid is only nine wide) the operation
-        falls back to a pure quantity change rather than being dropped, which
-        keeps the operation mix stable across profiles.
-        """
-        rng = self.rng
-        state = oracle.order_state(idNum)
-        occupied = {entry.price for entry in oracle.snapshot(state.side)}
-        free = [t for t in self.profile.grid if _price(t) not in occupied]
-
-        wants_price = rng.random() < 0.5 and free
-        wants_qty = rng.random() < 0.5 or not wants_price
         return Op(
             kind="modify",
+            instrument=instrument,
+            side=side,
             idNum=idNum,
-            qty=rng.randint(1, 12) if wants_qty else None,
-            price=_price(rng.choice(free)) if wants_price else None,
+            qty=rng.randint(1, 12) if wants_qty else UNSET,
+            price=price,
+            tags=tuple(tags),
         )
-
-    def observe(self, op, idNum):
-        if op.kind in ("limit", "market"):
-            self.owner[idNum] = op.tid
 
 
 def apply_op(engine, op):
-    """Run one operation; return `(idNum, trades)` as that engine saw them."""
+    """Run one operation; return `(idNum, trades)` as that implementation saw it."""
+    if op.kind == "reload":
+        engine.reopen()
+        return None, ()
     if op.kind == "limit":
-        ref = engine.limit(op.side, op.qty, op.price, op.tid)
+        ref = engine.limit(
+            op.side,
+            op.qty,
+            op.price,
+            op.tid,
+            instrument=op.instrument,
+            idNum=op.idNum,
+            timestamp=op.timestamp,
+        )
         return ref.idNum, tuple(ref.trades)
     if op.kind == "market":
-        ref = engine.market(op.side, op.qty, op.tid)
+        ref = engine.market(
+            op.side,
+            op.qty,
+            op.tid,
+            instrument=op.instrument,
+            idNum=op.idNum,
+            timestamp=op.timestamp,
+        )
         return ref.idNum, tuple(ref.trades)
     if op.kind == "cancel":
         engine.cancel(op.idNum)
         return op.idNum, ()
     kwargs = {}
-    if op.qty is not None:
+    if op.qty is not UNSET:
         kwargs["qty"] = op.qty
-    if op.price is not None:
+    if op.price is not UNSET:
+        # An explicit `price=None` reaches the adapter as an explicit None; a
+        # price the generator did not mention never reaches it at all.
         kwargs["price"] = op.price
     return op.idNum, tuple(engine.modify(op.idNum, **kwargs))
 
@@ -465,18 +486,18 @@ def apply_op(engine, op):
 
 @dataclass
 class Difference:
-    """One thing the two engines disagree about, ready to be printed."""
+    """One thing the two implementations disagree about, ready to be printed."""
 
     what: str
-    legacy: object
-    inmemory: object
+    reference: object
+    engine: object
     detail: str = ""
 
     def render(self):
         lines = [
             "  %s" % self.what,
-            "      legacy   : %s" % _show(self.legacy),
-            "      inmemory : %s" % _show(self.inmemory),
+            "      reference: %s" % _show(self.reference),
+            "      engine   : %s" % _show(self.engine),
         ]
         if self.detail:
             lines.append("      %s" % self.detail)
@@ -520,12 +541,12 @@ def _first_mismatch(left, right):
     """Where two sequences first part company, phrased for a human."""
     for index, (a, b) in enumerate(zip(left, right)):
         if a != b:
-            return "first differs at position %d: legacy %s, inmemory %s" % (
+            return "first differs at position %d: reference %s, engine %s" % (
                 index,
                 _one(a),
                 _one(b),
             )
-    return "same first %d, then legacy has %d and inmemory %d" % (
+    return "same first %d, then reference has %d and engine %d" % (
         min(len(left), len(right)),
         len(left),
         len(right),
@@ -536,64 +557,74 @@ def _money_differs(a, b):
     return a != pytest.approx(b, rel=MONEY_REL, abs=MONEY_ABS)
 
 
-def differences(legacy, inmemory, known_ids=(), probes=()):
-    """Everything the two engines disagree about right now, as a list.
+def differences(reference, engine, profile, known_ids=(), probes=()):
+    """Everything the two implementations disagree about right now, as a list.
 
-    Empty means they agree on the whole of the observable surface: both books
-    in priority order, the four price accessors, volume-at-price at `probes`,
-    the last price, the entire trade log, every order in `known_ids`, and
-    every trader's balance in both the instrument and the currency.
+    Empty means they agree on the whole of the observable surface: for every
+    instrument, both books in priority order, the four price accessors,
+    volume-at-price at `probes`, the last price and the entire trade log; then
+    every order in `known_ids`, and every trader's balance in every instrument
+    and every currency.
 
     Money is compared within `MONEY_REL` / `MONEY_ABS`; everything else
     exactly.
     """
     found = []
 
-    for side in ("bid", "ask"):
-        left, right = legacy.snapshot(side), inmemory.snapshot(side)
+    for symbol, _currency in profile.instruments:
+        where = "" if len(profile.instruments) == 1 else " of %s" % symbol
+        for side in ("bid", "ask"):
+            left = reference.snapshot(side, symbol)
+            right = engine.snapshot(side, symbol)
+            if left != right:
+                found.append(
+                    Difference(
+                        "book[%s]%s (price, then priority order)" % (side, where),
+                        left,
+                        right,
+                        _first_mismatch(left, right),
+                    )
+                )
+            for query in ("best", "worst"):
+                a = getattr(reference, query)(side, symbol)
+                b = getattr(engine, query)(side, symbol)
+                if a != b:
+                    found.append(
+                        Difference("%s %s price%s" % (query, side, where), a, b)
+                    )
+            for price in probes:
+                a = reference.volume_at(side, price, symbol)
+                b = engine.volume_at(side, price, symbol)
+                if a != b:
+                    found.append(
+                        Difference("volume_at[%s, %s]%s" % (side, price, where), a, b)
+                    )
+
+        left, right = reference.trades(symbol), engine.trades(symbol)
         if left != right:
             found.append(
                 Difference(
-                    "book[%s] (price, then priority order)" % side,
-                    left,
-                    right,
+                    "trade log%s (%d vs %d executions)"
+                    % (where, len(left), len(right)),
+                    left[-4:],
+                    right[-4:],
                     _first_mismatch(left, right),
                 )
             )
-        for query in ("best", "worst"):
-            a, b = getattr(legacy, query)(side), getattr(inmemory, query)(side)
-            if a != b:
-                found.append(Difference("%s %s price" % (query, side), a, b))
-        for price in probes:
-            a = legacy.volume_at(side, price)
-            b = inmemory.volume_at(side, price)
-            if a != b:
-                found.append(Difference("volume_at[%s, %s]" % (side, price), a, b))
 
-    left, right = legacy.trades(), inmemory.trades()
-    if left != right:
-        found.append(
-            Difference(
-                "trade log (%d vs %d executions)" % (len(left), len(right)),
-                left[-4:],
-                right[-4:],
-                _first_mismatch(left, right),
-            )
-        )
-
-    a, b = legacy.last_price(), inmemory.last_price()
-    if a != b:
-        found.append(Difference("last price", a, b))
+        a, b = reference.last_price(symbol), engine.last_price(symbol)
+        if a != b:
+            found.append(Difference("last price%s" % where, a, b))
 
     for idNum in known_ids:
-        left, right = legacy.order_state(idNum), inmemory.order_state(idNum)
+        left, right = reference.order_state(idNum), engine.order_state(idNum)
         if left is None or right is None:
             if left is not right:
                 found.append(Difference("order %d exists" % idNum, left, right))
             continue
         if left[:-1] != right[:-1]:
             fields = [
-                "%s: legacy %r vs inmemory %r" % (name, a, b)
+                "%s: reference %r vs engine %r" % (name, a, b)
                 for name, a, b in zip(left._fields, left, right)
                 if a != b
             ]
@@ -608,9 +639,9 @@ def differences(legacy, inmemory, known_ids=(), probes=()):
             )
 
     for tid in TRADERS:
-        for symbol in (INSTRUMENT, CURRENCY):
-            a = legacy.balance(tid, symbol)
-            b = inmemory.balance(tid, symbol)
+        for symbol in profile.symbols:
+            a = reference.balance(tid, symbol)
+            b = engine.balance(tid, symbol)
             if _money_differs(a, b):
                 found.append(Difference("balance[%d, %s]" % (tid, symbol), a, b))
 
@@ -624,28 +655,37 @@ def differences(legacy, inmemory, known_ids=(), probes=()):
 
 @dataclass
 class Run:
-    """One workload in flight: the two engines and the trail behind them."""
+    """One workload in flight: the two implementations and the trail behind them."""
 
     profile: Profile
     seed: int
-    legacy: object
-    inmemory: object
+    reference: object
+    engine: object
     generator: Generator
     history: list = field(default_factory=list)
     known_ids: list = field(default_factory=list)
+    #: What this run has actually exercised, checked against `profile.expects`.
+    tags: set = field(default_factory=set)
 
     @property
     def probes(self):
+        """Prices to ask volume-at-price about: on the grid, and off it.
+
+        The off-grid probe is not decoration: `book-queries` puts the query
+        price on the grid before answering, so a probe between two ticks is
+        the only thing that compares the two quantizers on the *read* path.
+        """
         grid = self.profile.grid
         return tuple(
-            _price(grid[index]) for index in (0, len(grid) // 4, len(grid) // 2, -1)
+            self.profile.price(grid[index])
+            for index in (0, len(grid) // 4, len(grid) // 2, -1)
         )
 
     def report(self, index, op, found):
         """The failure message. This is the whole point of the harness."""
         recent = self.history[max(0, index - 5) : index]
         lines = [
-            "differential divergence: legacy and inmemory disagree",
+            "differential divergence: the reference matcher and the engine disagree",
             "",
             "  profile  : %s" % self.profile.name,
             "  seed     : %d" % self.seed,
@@ -659,18 +699,21 @@ class Run:
         lines.append("")
         lines.append("  the %d operations before it:" % len(recent))
         lines.extend(
-            "    %4d  %-46s -> id %d" % (position, done.render(), idNum)
+            "    %4d  %-58s -> id %s" % (position, done.render(), idNum)
             for position, done, idNum in recent
         )
         lines.append("")
         lines.append("  books at the divergence:")
-        for side in ("bid", "ask"):
-            lines.append(
-                "    legacy   %s: %s" % (side, _show_book(self.legacy.snapshot(side)))
-            )
-            lines.append(
-                "    inmemory %s: %s" % (side, _show_book(self.inmemory.snapshot(side)))
-            )
+        for symbol, _currency in self.profile.instruments:
+            for side in ("bid", "ask"):
+                lines.append(
+                    "    reference %s %-4s: %s"
+                    % (symbol, side, _show_book(self.reference.snapshot(side, symbol)))
+                )
+                lines.append(
+                    "    engine    %s %-4s: %s"
+                    % (symbol, side, _show_book(self.engine.snapshot(side, symbol)))
+                )
         lines.append("")
         lines.append(
             "  reproduce: uv run pytest tests/test_differential.py -k "
@@ -679,58 +722,66 @@ class Run:
         return "\n".join(lines)
 
     def step(self, index):
-        op = self.generator.next_op(self.legacy)
-        legacy_id, legacy_trades = apply_op(self.legacy, op)
-        inmemory_id, inmemory_trades = apply_op(self.inmemory, op)
+        op = self.generator.next_op(self.reference)
+        reference_id, reference_trades = apply_op(self.reference, op)
+        engine_id, engine_trades = apply_op(self.engine, op)
 
         found = []
-        if legacy_id != inmemory_id:
-            found.append(Difference("identifier assigned", legacy_id, inmemory_id))
-        if legacy_trades != inmemory_trades:
+        if reference_id != engine_id:
+            found.append(Difference("identifier assigned", reference_id, engine_id))
+        if reference_trades != engine_trades:
             found.append(
                 Difference(
                     "executions returned by this operation",
-                    legacy_trades,
-                    inmemory_trades,
-                    _first_mismatch(legacy_trades, inmemory_trades),
+                    reference_trades,
+                    engine_trades,
+                    _first_mismatch(reference_trades, engine_trades),
                 )
             )
         found.extend(
             differences(
-                self.legacy,
-                self.inmemory,
+                self.reference,
+                self.engine,
+                self.profile,
                 known_ids=self.known_ids,
                 probes=self.probes,
             )
         )
 
-        self.generator.observe(op, legacy_id)
+        self.tags.update(op.tags)
         if op.kind in ("limit", "market"):
-            self.known_ids.append(legacy_id)
-        self.history.append((index, op, legacy_id))
+            self.known_ids.append(reference_id)
+            state = self.reference.order_state(reference_id)
+            if op.kind == "market" and state.fulfilled < state.qty:
+                self.tags.add("market remainder")
+        self.history.append((index, op, reference_id))
 
         if found:
             raise AssertionError(self.report(index, op, found))
 
 
 def build_pair(tmp_path, profile, name="run"):
-    """The two engines, configured identically, on their own scratch files."""
+    """The reference and the engine, configured identically."""
+    first, first_currency = profile.instruments[0]
     options = dict(
         traders=TRADERS,
         commissions=profile.commissions,
         self_matching=profile.self_matching,
-        instrument=INSTRUMENT,
-        currency=CURRENCY,
-        tick_size=TICK,
+        instrument=first,
+        currency=first_currency,
+        tick_size=profile.tick_size,
     )
-    try:
-        legacy = _surface.build_legacy(tmp_path / ("%s-legacy.db" % name), **options)
-        inmemory = _surface.build_inmemory(
-            tmp_path / ("%s-inmemory.db" % name), **options
-        )
-    except (ImportError, NotImplementedError) as exc:
-        pytest.skip("the in-memory engine is not ready: %s" % exc)
-    return legacy, inmemory
+    reference = build_reference(tmp_path / ("%s-reference" % name), **options)
+    engine = build_inmemory(tmp_path / ("%s-engine.db" % name), **options)
+    for adapter in (reference, engine):
+        # The acceptance builders configure one instrument; a differential
+        # workload wants several. `configure_instrument` is the public call
+        # that declares one, and on the engine it is also what puts an
+        # `InstrumentConfigured` in the stream, so a reload rebuilds the same
+        # set of books.
+        for symbol, currency in profile.instruments[1:]:
+            adapter.book.configure_instrument(symbol, currency)
+    return reference, engine
 
 
 # --------------------------------------------------------------------------
@@ -744,47 +795,59 @@ def profile(request):
 
 
 @pytest.mark.parametrize("seed", SEEDS, ids=lambda seed: "seed%d" % seed)
-def test_engines_agree_on_a_seeded_workload(tmp_path, profile, seed):
-    """Every observable, after every operation, on both engines.
+def test_the_engine_agrees_with_the_reference(tmp_path, profile, seed):
+    """Every observable, after every operation, on both implementations.
 
-    A divergence here is a *finding*, not a test to relax: either the new
-    engine has a bug, or the legacy oracle has one that no bead names yet.
-    The whitelist is closed (`test_whitelist_is_the_two_named_divergences`)
-    and adding to it is a design decision, not a way to make a red run green.
+    A divergence here is a *finding*, not a test to relax: either the engine
+    has a bug or the reference matcher misreads a spec, and both are worth a
+    bead. There is no whitelist to add it to -- that was the legacy oracle's
+    apparatus and it went with the legacy oracle.
     """
-    legacy, inmemory = build_pair(tmp_path, profile, name="seed%d" % seed)
+    reference, engine = build_pair(tmp_path, profile, name="seed%d" % seed)
     run = Run(
         profile=profile,
         seed=seed,
-        legacy=legacy,
-        inmemory=inmemory,
+        reference=reference,
+        engine=engine,
         generator=Generator(profile, seed),
     )
     try:
         for index in range(profile.ops):
             run.step(index)
         # A workload that never traded would agree trivially.
-        executions = len(legacy.trades())
+        executions = {
+            symbol: len(reference.trades(symbol))
+            for symbol, _currency in profile.instruments
+        }
     finally:
-        legacy.close()
-        inmemory.close()
+        reference.close()
+        engine.close()
 
-    assert len(run.known_ids) >= profile.ops // 2
-    assert executions > 0, "the workload never traded -- it proves nothing"
+    assert len(run.known_ids) >= profile.ops // 3
+    assert all(executions.values()), "an instrument never traded: %r" % (executions,)
+
+    if len(profile.instruments) > 1:
+        run.tags.add("two instruments")
+    missing = profile.expects - run.tags
+    assert not missing, (
+        "this workload never reached %s, so it proves less than it claims; "
+        "it reached %s" % (sorted(missing), sorted(run.tags))
+    )
 
 
 def test_the_comparator_would_notice(tmp_path):
-    """The harness has teeth: feed the two engines different input, see it fail.
+    """The harness has teeth: feed the two different input, see it fail.
 
     Without this, a comparator that quietly compared nothing would pass every
     test above.
     """
-    legacy, inmemory = build_pair(tmp_path, PROFILES[0], name="teeth")
-    legacy.limit("ask", 5, 101.0, 1)
-    inmemory.limit("ask", 4, 101.0, 1)
-    found = differences(legacy, inmemory, known_ids=[1], probes=(101.0,))
-    legacy.close()
-    inmemory.close()
+    profile = PROFILES[0]
+    reference, engine = build_pair(tmp_path, profile, name="teeth")
+    reference.limit("ask", 5, 101.0, 1)
+    engine.limit("ask", 4, 101.0, 1)
+    found = differences(reference, engine, profile, known_ids=[1], probes=(101.0,))
+    reference.close()
+    engine.close()
 
     reported = {item.what for item in found}
     assert any("book[ask]" in what for what in reported), reported
@@ -793,108 +856,153 @@ def test_the_comparator_would_notice(tmp_path):
 
 
 # --------------------------------------------------------------------------
-# the whitelist, pinned
+# what makes the reference an oracle rather than a mirror
 # --------------------------------------------------------------------------
 
 
-def test_whitelist_is_the_two_named_divergences():
-    """`design.md` decision 6 names two. Growing this list is a design change.
+def test_the_reference_imports_nothing_from_the_engine():
+    """`tests/reference/matcher.py` may not import `PyLOB`. At all.
 
-    Anything else the harness finds is a bug in one engine or the other, and
-    the honest response is a bead, not an entry here.
+    This is the whole basis of the harness. An oracle that borrows the code
+    under test agrees with it by construction, and the tempting way to silence
+    a divergence -- import the engine's quantizer, reuse its enums -- is
+    exactly the change that would turn this file into a mirror while every
+    test stayed green.
+
+    Reading the import statements rather than trusting a convention, because a
+    convention is what this would be otherwise.
     """
-    assert [entry.name for entry in WHITELIST] == [
-        "IOC remainder",
-        "priority on price change",
-    ]
-    assert [entry.bead for entry in WHITELIST] == ["lob-0bl", "lob-pn3"]
+    source = Path(reference_matcher.__file__).read_text()
+    imported = []
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Import):
+            imported.extend(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            imported.append(node.module or "")
 
-
-def test_whitelist_ioc_remainder(tmp_path):
-    """Whitelist entry 1 (lob-0bl): legacy rests a market remainder, we cancel.
-
-    lob-0bl's own repro, run through both engines. The legacy remainder is not
-    merely parked: it sorts ahead of every priced order and then buys at the
-    *next taker's* price, which is why this divergence cannot be contained to
-    one comparison and why the randomized workload never produces a remainder.
-    """
-    legacy, inmemory = build_pair(tmp_path, PROFILES[0], name="ioc")
-    for engine in (legacy, inmemory):
-        engine.limit("ask", 3, 101.0, 1)
-        taker = engine.market("bid", 8, 2)
-        assert taker.fulfilled == 3
-
-    assert legacy.order_state(2).resting is True
-    assert legacy.order_state(2).cancelled is False
-    assert legacy.snapshot("bid") == (
-        _surface.BookEntry(idNum=2, price=None, available=5, qty=8, fulfilled=3),
+    assert imported, "no imports found -- did the parse work?"
+    offenders = [name for name in imported if name.split(".")[0] == "PyLOB"]
+    assert not offenders, (
+        "the reference matcher imports %r from the engine it is supposed to "
+        "check independently" % (offenders,)
     )
 
-    assert inmemory.order_state(2).resting is False
-    assert inmemory.order_state(2).cancelled is True
-    assert inmemory.snapshot("bid") == ()
 
-    # The consequence, and the reason this one poisons a whole run.
-    for engine in (legacy, inmemory):
-        engine.limit("ask", 5, 200.0, 3)
-    assert legacy.trades()[-1] == _surface.Trade(bid=2, ask=3, price=200.0, qty=5)
-    assert len(inmemory.trades()) == 1
+def test_every_constraint_says_why():
+    """A constraint with no argument behind it is a habit, and habits rot.
 
-    found = differences(legacy, inmemory, known_ids=[1, 2, 3], probes=(101.0,))
-    assert found, "lob-0bl no longer diverges -- retire this whitelist entry"
-    legacy.close()
-    inmemory.close()
-
-
-def test_whitelist_priority_on_price_change(tmp_path):
-    """Whitelist entry 2 (lob-pn3): a reprice costs priority here, not there.
-
-    The order-lifecycle scenario: A and B rest at 99, A is repriced away and
-    back, and B should now be ahead. Legacy re-stamps arrival only on a
-    quantity increase, so A keeps its place -- a priority-jumping exploit.
+    There are two, and both have to be about generating legal input. The nine
+    that named legacy defects went with the legacy engine; if this list grows
+    back, the reason had better not be "the harness found something".
     """
-    legacy, inmemory = build_pair(tmp_path, PROFILES[0], name="reprice")
-    for engine in (legacy, inmemory):
-        first = engine.limit("bid", 5, 99.0, 1)
-        engine.limit("bid", 5, 99.0, 2)
-        engine.modify(first, price=98.0)
-        engine.modify(first, price=99.0)
-
-    assert [entry.idNum for entry in legacy.snapshot("bid")] == [1, 2]
-    assert [entry.idNum for entry in inmemory.snapshot("bid")] == [2, 1]
-
-    found = differences(legacy, inmemory, known_ids=[1, 2], probes=(99.0,))
-    assert found, "lob-pn3 no longer diverges -- retire this whitelist entry"
-    assert any("book[bid]" in item.what for item in found)
-    legacy.close()
-    inmemory.close()
+    assert set(CONSTRAINTS) == {
+        "every generated operation is legal input",
+        "cancel and modify address a live resting order",
+    }
+    for name, reason in CONSTRAINTS.items():
+        assert len(reason) > 200, name
 
 
-# --------------------------------------------------------------------------
-# the constraints, pinned
-# --------------------------------------------------------------------------
+def test_both_refuse_what_the_specs_refuse(tmp_path):
+    """The illegal input the workload does not generate, asserted directly.
 
+    `order-lifecycle` names these: a non-positive quantity, an unknown side, an
+    unknown order type, a limit order with no price, an identifier no order
+    has, an externally supplied identifier already in use, and a modify that
+    changes the side. Both implementations must refuse each one with *their own
+    library exception* -- "Submissions with ... SHALL raise a library
+    exception. The API SHALL never terminate the host process" -- and leave the
+    book exactly as it was: "an exception is raised, no state changes, and the
+    process continues".
 
-def test_every_constraint_names_a_bead():
-    """A constraint with no bead behind it is a hunch, and hunches rot."""
-    for name, (bead, reason) in CONSTRAINTS.items():
-        assert bead, name
-        assert len(reason) > 80, name
+    Asserting the library base class rather than `Exception` is what makes the
+    process clause testable: a `SystemExit` (which is what the legacy engine
+    did with a bad quantity) is not caught by either base, so it fails this
+    test loudly instead of passing it quietly.
 
-
-def test_generated_prices_are_exactly_on_the_grid(tmp_path):
-    """CONSTRAINTS["on-grid prices, decimal tick"], demonstrated.
-
-    Both engines quantize a generated price to the identical double, so the
-    quantizers cannot contribute a difference. The half-tick case lob-we3
-    describes is right next door, and is left out of the workload rather than
-    whitelisted.
+    Deterministic rather than random on purpose: a refusal changes nothing, so
+    there is nothing for the randomized comparator to compare, and a fixed list
+    says plainly which refusals are covered. Two of them go through the
+    adapters' `_submit` because the public `limit`/`market` helpers each pin
+    the order type, and those two cases are *about* the order type.
     """
-    legacy, inmemory = build_pair(tmp_path, PROFILES[0], name="grid")
+    from PyLOB.engine import PyLOBError
+
+    profile = PROFILES[0]
+    reference, engine = build_pair(tmp_path, profile, name="refusals")
+    try:
+        reference.limit("bid", 5, 100.0, 1)
+        engine.limit("bid", 5, 100.0, 1)
+        assert not differences(reference, engine, profile, known_ids=[1])
+
+        refusals = {
+            "non-positive quantity": lambda book: book.limit("bid", 0, 100.0, 1),
+            "negative quantity": lambda book: book.limit("ask", -3, 100.0, 1),
+            "unknown side": lambda book: book.limit("buy", 5, 100.0, 1),
+            "unknown order type": lambda book: book._submit(
+                "stop", "bid", 5, 1, price=100.0
+            ),
+            "limit order with no price": lambda book: book.limit("bid", 5, None, 1),
+            "market order carrying a price": lambda book: book._submit(
+                "market", "bid", 5, 1, price=100.0
+            ),
+            "cancel of an unknown identifier": lambda book: book.cancel(9999),
+            "modify of an unknown identifier": lambda book: book.modify(9999, qty=2),
+            "supplied identifier already in use": lambda book: book.limit(
+                "bid", 5, 100.0, 1, idNum=1, timestamp=1.0
+            ),
+            "modify to a different side": lambda book: book.modify(
+                1, qty=3, side="ask"
+            ),
+        }
+        sides = (
+            (reference, reference_matcher.ReferenceError),
+            (engine, PyLOBError),
+        )
+        for what, attempt in refusals.items():
+            for book, library_error in sides:
+                with pytest.raises(library_error):
+                    attempt(book)
+            found = differences(reference, engine, profile, known_ids=[1])
+            assert not found, "%s: %s" % (
+                what,
+                "; ".join(item.render() for item in found),
+            )
+
+        # And the book really is untouched, not merely equal on both sides.
+        assert reference.snapshot("bid") == (
+            BookEntry(idNum=1, price=100.0, available=5, qty=5, fulfilled=0),
+        )
+    finally:
+        reference.close()
+        engine.close()
+
+
+def test_the_grid_is_half_on_the_grid_and_half_off_it():
+    """The deleted `lob-we3` constraint, inverted into a requirement.
+
+    The old harness generated prices that were already exact multiples of the
+    tick, so both quantizers were the identity and neither was tested. Every
+    profile's grid is now whole *half*-ticks: the even ones land on a tick and
+    the odd ones land exactly between two, which is where a quantizer that
+    reads the tick as a binary double gets the answer wrong.
+
+    Both quantizers must agree over the whole of every grid -- they are
+    independent implementations of one clause (`order-lifecycle`: "Prices are
+    quantized to the tick"), and this is the direct comparison of them.
+    """
+    from PyLOB.engine import quantize_price
+
     for profile in PROFILES:
-        for ticks in profile.grid:
-            price = _price(ticks)
-            assert legacy.book.clipPrice(price) == price
-            assert inmemory.book.clipPrice(price) == price
-    legacy.close()
-    inmemory.close()
+        off_grid = 0
+        for half_ticks in profile.grid:
+            price = profile.price(half_ticks)
+            theirs = quantize_price(price, profile.tick_size)
+            ours = reference_matcher.quantize(price, profile.tick_size)
+            assert ours == theirs, (profile.name, price, ours, theirs)
+            if price != ours:
+                off_grid += 1
+        assert off_grid, "%s generates no off-grid price" % profile.name
+        assert off_grid < len(profile.grid), (
+            "%s generates nothing on the grid" % profile.name
+        )

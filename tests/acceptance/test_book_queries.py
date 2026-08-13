@@ -1,24 +1,21 @@
 """Acceptance tests for the book-queries contract.
 
-Contract: `openspec/changes/spec-book-queries/specs/book-queries/spec.md`.
-Every test here names the requirement and scenario it encodes, and asserts the
-*target* behaviour -- what an engine has to do, not what any engine does today.
-Known legacy divergences are recorded with `@pytest.mark.engine_xfail` (see
-`conftest.py`), never with a branch on the engine.
+Contract: `openspec/specs/book-queries/spec.md`. Every test here names the
+requirement and scenario it encodes, and asserts the *target* behaviour --
+what an engine has to do, not what any engine does today.
 
 The read side leans on one premise from the order-lifecycle contract: under
 immediate-or-cancel market orders the book holds priced limit orders only, so
 every query has a defined answer. Two scenarios below exercise exactly that
-premise -- they are the queries' view of `lob-0bl`, where a legacy market
-order's remainder rests with a null price: invisible to the best-price query
-while still counted by volume-at-price.
+premise, by asking the queries about a side a market order has just run
+through: an engine that rested the remainder instead of cancelling it would
+have an unpriced order in the book, invisible to the best-price query and
+still counted by volume-at-price.
 
-Fixtures come from `tests/acceptance/conftest.py`: `engine` is an empty book on
-the engine under test, and the suite is run once per registered engine.
+Fixtures come from `tests/acceptance/conftest.py`: `engine` is an empty book
+reached through the engine-neutral adapter surface, never through an engine's
+own API, so a scenario here states a contract rather than an implementation.
 """
-
-import pytest
-
 
 # --------------------------------------------------------------------------
 # Requirement: Best and worst prices reflect resting limit orders
@@ -48,12 +45,6 @@ def test_partially_filled_order_still_reports_a_price(engine):
     assert engine.worst("bid") == 99
 
 
-@pytest.mark.engine_xfail(
-    "legacy",
-    "lob-0bl: the remainder of a market order rests with a null price, which "
-    "sorts ahead of every priced order, so getBestBid reports None for a side "
-    "that holds a priced limit order",
-)
 def test_market_order_leaves_the_price_queries_intact(engine):
     """Best and worst prices reflect resting limit orders / Non-empty side always reports a price."""
     engine.limit("ask", 3, 101, tid=100)
@@ -84,12 +75,6 @@ def test_empty_side_reports_none(engine):
     assert engine.worst("ask") is None
 
 
-@pytest.mark.engine_xfail(
-    "legacy",
-    "lob-0bl: the remainder of a market order rests, so the side is not empty "
-    "-- it shows in the snapshot and in volume-at-price, while the null price "
-    "makes the best-price query answer None for the wrong reason",
-)
 def test_side_emptied_by_an_unfillable_market_order_reports_none(engine):
     """Best and worst prices reflect resting limit orders / Empty side reports None."""
     engine.limit("ask", 3, 101, tid=100)

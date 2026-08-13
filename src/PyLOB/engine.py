@@ -252,13 +252,12 @@ from __future__ import annotations
 
 import heapq
 from collections.abc import Iterator
-from contextlib import closing
 from dataclasses import dataclass, field
 from decimal import ROUND_HALF_EVEN, Context, Decimal, DecimalException
 from functools import lru_cache
 from math import isfinite
 from numbers import Real
-from typing import Any, Final
+from typing import Any, Final, NamedTuple
 
 from .events import (
     Accepted,
@@ -309,6 +308,12 @@ MAX_QTY: Final = 2**53
 _NOTIONAL_GUARD: Final = 1e292
 
 _INF: Final = float("inf")
+
+#: How many quantized prices a book keeps (`OrderBook.clipPrice`). Big enough
+#: to hold the grid of any book a research workload builds around a touch;
+#: small enough that a book that walks a wide grid forever cannot grow one
+#: entry per price it ever saw.
+_GRID_MEMO_SIZE: Final = 8192
 
 
 # --------------------------------------------------------------------------
@@ -422,6 +427,11 @@ def _tick_decimal(tick_size: float) -> Decimal:
 def _quantize(price: float, tick: Decimal) -> float:
     """`price` snapped to the nearest multiple of an already-decimalized tick.
 
+    Three `decimal` operations and two conversions, which makes it the most
+    expensive thing on the accept path. It is a pure function of
+    `(price, tick)` and a book asks it the same question over and over, so
+    `OrderBook.clipPrice` keeps the answers; this is what a miss costs.
+
     The `decimal` failures are translated rather than propagated: a price of
     1e40 on a 0.0001 tick, or any price at all on a 1e-40 tick, is a ratio
     too wide for `_CTX` and used to leak `decimal.InvalidOperation` -- not a
@@ -529,8 +539,7 @@ class Order:
         )
 
 
-@dataclass(frozen=True, slots=True)
-class Trade:
+class Trade(NamedTuple):
     """One execution, as reported to whoever caused it.
 
     The engine's answer to "what did my order just do", returned from `submit`
@@ -541,6 +550,19 @@ class Trade:
 
     `price` is the maker's limit and `qty` this execution alone -- neither is
     a cumulative total.
+
+    A `NamedTuple` and not a frozen dataclass, which is what it was. This is
+    the only object the engine builds on every execution whether or not
+    anyone is recording (ADR-0002 keeps the sinkless path free of `Filled`,
+    but a caller is always handed its trades), and a frozen dataclass pays
+    `object.__setattr__` per field to build one: measured at 3.1x the cost of
+    the tuple, ~9% of a sinkless run. Immutability is *not* what was traded
+    away for that -- a tuple is immutable and hashable where the frozen
+    dataclass was immutable and hashable. What changed is that a `Trade` is
+    now also a sequence: it unpacks, indexes and compares equal to a plain
+    tuple of its fields, and `dataclasses.asdict` and `replace` no longer
+    apply to it (`_asdict` and `_replace` do). Field *order* is therefore
+    part of the public surface in a way it was not before.
     """
 
     trade_id: int
@@ -799,8 +821,9 @@ class BookSide:
         forgotten, which is also how the heaps shed the duplicates they
         accumulate (lob-n3n).
 
-        Close the iterator -- `contextlib.closing`, or exhaust it -- or the
-        prices it walked past stay out of the heap until it is collected.
+        Close the iterator -- a `try`/`finally` around the walk, or exhaust it
+        -- or the prices it walked past stay out of the heap until it is
+        collected.
         """
         walked: set[float] = set()
         try:
@@ -1048,6 +1071,8 @@ class OrderBook:
     ) -> None:
         self._tick = _tick_decimal(tick_size)
         self.tick_size = tick_size
+        #: `clipPrice`'s memo: submitted price -> price on this book's grid.
+        self._grid: dict[float, float] = {}
         #: The engine clock. Advanced by one per non-replay operation; set
         #: from the caller's value on the data-replay path. Recorded data.
         self.time: float = timestamp
@@ -1087,7 +1112,36 @@ class OrderBook:
     # -- prices ------------------------------------------------------------
 
     def clipPrice(self, price: float) -> float:
-        """This book's tick grid applied to `price` (legacy name, kept)."""
+        """This book's tick grid applied to `price` (legacy name, kept).
+
+        Answers are kept, because `_quantize` is the most expensive thing on
+        the accept path and a book asks it about the same handful of prices
+        all session: a level is a price, and a workload that quotes around a
+        touch offers the same ones over and over. Measured hit rates run from
+        37% on a ten-thousand-level book to 100% on a book two ticks wide.
+
+        A plain dict and not an LRU: the cost that matters at this size is not
+        the lookup but the garbage collector's, and a dict of float keys and
+        float values holds no objects for it to trace, where an LRU's link
+        nodes are one traced object per entry. Both were measured; the LRU was
+        *slower than no memo at all* on the ten-thousand-level shape, which is
+        the one whose working set does not fit.
+
+        Full means cleared, not evicted one by one -- the price of a policy
+        cheap enough not to eat what it saves. `_grid` is per book because the
+        tick is: it is fixed at construction, so a price maps to one grid
+        point for this book's whole life, and nothing has to invalidate it.
+        Only exact floats are memoized, so the memo never has to answer for a
+        key type `dict` would refuse; `_check_price` has already made every
+        submitted price one.
+        """
+        if type(price) is float:
+            value = self._grid.get(price)
+            if value is None:
+                if len(self._grid) >= _GRID_MEMO_SIZE:
+                    self._grid.clear()
+                value = self._grid[price] = _quantize(price, self._tick)
+            return value
         return _quantize(price, self._tick)
 
     quantize = clipPrice
@@ -1572,7 +1626,14 @@ class OrderBook:
             return trades
         takers = book.side(taker.side)
         gated = not self.trader(taker.tid).allow_self_matching
-        with closing(makers.match_levels(taker.price)) as levels:
+        # `try`/`finally` rather than `contextlib.closing`: the walk has to be
+        # closed on every exit (that is what puts the popped prices back), and
+        # the context manager charges an object, an `__enter__` and an
+        # `__exit__` per submission for the same guarantee. Nothing may come
+        # between the two lines below: an exception there would leave the walk
+        # holding prices it popped off the heap.
+        levels = makers.match_levels(taker.price)
+        try:
             for level in levels:
                 if gated and level.sole_tid == taker.tid:
                     # Every order here is the taker's own, so the gate would
@@ -1605,6 +1666,8 @@ class OrderBook:
                     cursor = None
                 if taker.remaining <= 0:
                     break
+        finally:
+            levels.close()
         return trades
 
     def _execute(
@@ -2144,7 +2207,17 @@ def _report(trades: list[Trade], tid: int) -> None:
 
 
 def _as_side(side: Side | str) -> Side:
-    """`side` as a `Side`, or an `InvalidOrder` naming what was allowed."""
+    """`side` as a `Side`, or an `InvalidOrder` naming what was allowed.
+
+    The identity test first because the engine calls this on itself more often
+    than on a caller's string -- every `book.side(order.side)` and
+    `book.opposite(order.side)` passes a `Side` that is already one, and
+    `Side(member)` is a full enum lookup to hand back what it was given. An
+    enum with members cannot be subclassed, so `type(side) is Side` is the
+    whole membership test and not merely a common case of it.
+    """
+    if type(side) is Side:
+        return side
     try:
         return Side(side)
     except ValueError:
@@ -2155,6 +2228,8 @@ def _as_side(side: Side | str) -> Side:
 
 def _as_order_type(order_type: OrderType | str) -> OrderType:
     """`order_type` as an `OrderType`, or an `InvalidOrder`."""
+    if type(order_type) is OrderType:
+        return order_type
     try:
         return OrderType(order_type)
     except ValueError:

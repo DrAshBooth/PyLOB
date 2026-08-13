@@ -9,26 +9,59 @@ context: |
 
   Fixed constraints:
   - Python >= 3.11. uv manages Python versions and dependencies.
-  - Toolchain: ruff (format + lint), pytest. mypy joins once the code is typed.
-  - Packaging: setup.cfg/setup.py migrate to pyproject.toml (decided, not yet done).
+  - Toolchain: ruff (format + lint) and pytest, pinned in pyproject's dev
+    group and run by ./verify; pytest-timeout is pinned with them and enforces
+    pyproject's per-test timeout.
+  - Typing: src/PyLOB is fully annotated, every parameter and every return.
+    mypy is still not installed, not a dependency, and not a ./verify stage.
+    The old "mypy joins once the code is typed" was an intention, and its
+    condition passed without the decision being taken; taking it is the
+    maintainer's, since ./verify's stage list is not changed without asking.
+  - Packaging: pyproject.toml with the hatchling backend; setup.cfg and
+    setup.py are gone. The wheel ships src/PyLOB/**/*.py and nothing else.
+  - No runtime dependencies. The library imports the standard library only,
+    and the optional sink uses stdlib sqlite3.
   - Distribution: public GitHub repo, MIT licence, installable from GitHub.
     No PyPI publishing (the pylob name is held by an unrelated package).
-  - Single instrument, single currency.
-  - The current public API (OrderBook.processOrder(dict, fromData, verbose),
-    cancelOrder, modifyOrder, getVolumeAtPrice, getBest*/getWorst*) is kept
-    unless it proves a limiter of performance or clarity; changing it needs an ADR.
-  - Matching is moving to an in-memory engine (ADR-0001, accepted 2026-08-10):
-    price-time priority in one layer behind the existing public API. SQLite is
-    retained only as an optional off-hot-path recording/analytics sink. Never
-    put SQL in the matching path. The legacy SQL engine stays in tree as a
-    cross-check oracle until the in-memory engine passes the same test suite.
+  - The public API (OrderBook.processOrder(dict, fromData, verbose),
+    cancelOrder, modifyOrder, getVolumeAtPrice, getBest*/getWorst*, print) is
+    kept unless it proves a limiter of performance or clarity; changing it
+    needs an ADR. The constraint is about the API's shape, not about which
+    engine implements it.
+  - Matching is in-memory (ADR-0001, accepted 2026-08-10): price-time priority
+    in one layer behind that public API. SQLite is retained only as an
+    optional off-hot-path recording/analytics sink. Never put SQL in the
+    matching path.
+  - There is one engine. ADR-0003 (accepted 2026-08-13) retired the SQL engine
+    PR #7 brought in (merged 2023) and replaced the differential oracle with a
+    spec-derived reference matcher (tests/reference), which shares no code with
+    the engine and is driven through the acceptance suites' adapter surface.
+
+  Scope (this replaces the "single instrument, single currency" line that
+  archived proposals were written against; the engine outgrew it):
+  - One engine holds many instruments. Every mutating and querying method
+    names one, a book springs into being on first mention, and
+    configure_instrument gives each instrument its own settlement currency.
+    Balances are per (trader, symbol) for instruments and currencies alike.
+    This is what the frozen specs are written against -- book-queries per
+    instrument, commissions in the instrument's currency, trader-balances in
+    each instrument and each currency -- and the differential, replay,
+    sink-equality and projection suites all run two instruments, with two
+    currencies in play in every one of them. A proposal may assume this; it
+    may not reintroduce a single-instrument assumption without an ADR.
+  - Instruments and currencies share one balance namespace, so an instrument
+    must not be named the same as a currency it settles against.
+  - Nothing crosses instruments or currencies: no FX conversion, no
+    cross-instrument netting, margin or portfolio view, no multi-leg or
+    spread orders, and balances gate nothing (trader-balances). Each of those
+    is new capability and needs a spec, not an implementation detail.
 
   Definition of done: ./verify at the repo root exits 0. Performance work is in
   scope but benchmarks stay out of ./verify.
 
-  Out of scope: multi-instrument, multi-currency, PyPI publishing.
+  Out of scope: PyPI publishing.
 
   Conventions:
   - Architectural decision records live in docs/adr/; read the index before proposing.
-  - src/ layout; the package is src/PyLOB with SQL files loaded as attributes.
-  - Never mutate the committed src/lob.db; smoke tests run against a scratch copy.
+  - src/ layout; the package is src/PyLOB and is pure Python -- it ships no
+    data files and reads nothing off disk.

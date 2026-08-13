@@ -1,5 +1,21 @@
 # Pre-retirement review of the in-memory engine — 2026-08-12
 
+> **Status, 2026-08-13.** Its conditions were met and acted on. ADR-0003
+> records all six P1 findings as fixed and the retirement cliff as closed —
+> re-measured with the oracle excluded, three survivors, all deliberate no-op
+> controls — and the maintainer then retired the legacy engine. So the verdict
+> below, "do not retire the legacy engine yet", is a gate that has since
+> opened, not standing advice; the recommended sequence under it is done.
+>
+> Two present-tense remarks have changed with it. The **419x** ratio in "What
+> held up under attack" is against an engine that is no longer in tree and
+> cannot be re-measured; the performance claim that survives is ADR-0002's
+> sinkless figure, and this review's own method note already says to trust the
+> ratios rather than the absolutes. And `lob-kbx`'s "`config.yaml` still
+> declares the engine single-instrument" is closed: the `context:` block now
+> states what the engine supports and tests. Nothing else here is edited —
+> the findings are the record of what was found, and they stand as written.
+
 Requested by the maintainer before deciding whether to retire the legacy SQL
 engine. Five independent adversarial reviews: matching-core correctness,
 event/sink/replay soundness, API and spec alignment, test-suite adequacy

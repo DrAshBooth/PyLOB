@@ -27,7 +27,12 @@ dependencies = []
 [project.urls]
 Homepage = "https://github.com/DrAshBooth/PyLOB"
 Repository = "https://github.com/DrAshBooth/PyLOB"
-Documentation = "https://github.com/DrAshBooth/PyLOB/wiki"
+# Documentation points at the README, not the wiki: the wiki still describes
+# the red-black-tree implementation PR #7 replaced in 2023, and sending an
+# installing user to a description of code that is not in the package they
+# installed is worse than sending them nowhere. Point it back at the wiki when
+# `rewrite-docs` has rewritten it.
+Documentation = "https://github.com/DrAshBooth/PyLOB#readme"
 Issues = "https://github.com/DrAshBooth/PyLOB/issues"
 
 # Pinned exactly: these are the versions ./verify enforced as `uvx ruff@0.9.10`
@@ -69,10 +74,11 @@ testpaths = ["tests"]
 # means "something is spinning", and the failures say which tests.
 timeout = 30
 
-# The engine loads every *.sql sibling of orderbook.py as an attribute at
-# import time, so the .sql files are package data, not build inputs: an
-# installed copy without them is broken. Listed explicitly rather than left to
-# the backend's default file selection.
+# Python only. The wheel used to carry the twelve *.sql query files the SQL
+# engine loaded as attributes at import time; ADR-0003 retired that engine, and
+# nothing in the package reads a file off disk any more. Listed explicitly
+# rather than left to the backend's default file selection, so a stray .sql or
+# .db appearing under src/PyLOB cannot be picked up and shipped.
 [tool.hatch.build.targets.wheel]
 sources = ["src"]
-include = ["src/PyLOB/**/*.py", "src/PyLOB/**/*.sql"]
+include = ["src/PyLOB/**/*.py"]

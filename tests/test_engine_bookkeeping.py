@@ -1,11 +1,11 @@
 """The values the legacy oracle was checking, checked directly (lob-6oj).
 
-`tests/test_differential.py` runs both engines over a seeded workload and
-compares them. That is an excellent test and it is about to be deleted: it
-needs the legacy SQL engine, and retiring it takes the oracle with it. The
-2026-08 review measured what that costs by injecting 99 deliberate bugs --
-five of them survived every test in the suite *except* the differential one,
-and all five were in money-and-book code:
+`tests/test_differential.py` runs a seeded workload through two
+implementations and compares them. Until ADR-0003 the second implementation
+was the legacy SQL engine, and retiring that engine would have taken the
+oracle with it. The 2026-08 review measured what that would cost by injecting
+99 deliberate bugs -- five of them survived every test in the suite *except*
+the differential one, and all five were in money-and-book code:
 
     a level's cached volume counting gross quantity rather than what is left
     of an order that already has fills             `PriceLevel.append`
@@ -22,9 +22,13 @@ and all five were in money-and-book code:
     wrote, so the grid is 0.05000000000000000277 and not a twentieth
                                                    `_tick_decimal`
 
-None of those five is exotic. They are ordinary bookkeeping, and the reason
-the suite missed them is that ordinary bookkeeping is what a differential test
-picks up for free and what a scenario test has to ask about deliberately.
+The oracle was replaced rather than deleted (ADR-0003), so the differential
+harness is still there and still catching these -- but it catches them from a
+randomized workload, which reports *that* two implementations disagree and
+never *which rule* was broken. None of those five is exotic. They are ordinary
+bookkeeping, and the reason the suite missed them is that ordinary bookkeeping
+is what a differential test picks up for free and what a scenario test has to
+ask about deliberately.
 `PriceLevel.volume` has four update sites and only `fill` had a durable test;
 `last_price` was asserted only where the maker's limit and the taker's happen
 to be equal; the grid was asserted only at prices where a double and a decimal
@@ -331,10 +335,13 @@ def test_a_market_order_leaves_the_makers_price_behind_it():
 def test_an_exact_half_tick_rounds_to_even():
     """The grid introduces no directional bias, as Python's own `round` does not.
 
-    Excluded by generator constraint from the differential workloads -- half
-    ticks are exactly the inputs a random generator is told to avoid, because
-    two engines rounding differently is noise there. It is not noise here: a
-    grid that rounds every half tick up walks a whole book's prices upward.
+    Half ticks were excluded by generator constraint from the differential
+    workloads for as long as the oracle was the legacy engine, whose quantizer
+    disagreed (`lob-we3`); the spec-derived matcher rounds the way the contract
+    says, so the workloads generate them now. What that harness reports is
+    still only *disagreement*, on some price in some seeded session. This says
+    which way an exact half tick has to go, and why: a grid that rounds every
+    one of them up walks a whole book's prices upward.
     """
     assert quantize_price(100.00005, 0.0001) == 100.0
     assert quantize_price(100.00015, 0.0001) == 100.0002
@@ -611,6 +618,87 @@ def test_match_and_rest_still_refuse_an_order_from_another_engine():
         mine.match(stranger)
     with pytest.raises(UnknownOrder):
         mine.rest(stranger)
+
+
+# --------------------------------------------------------------------------
+# what a modify's cross does, and what a cancel leaves alone
+# --------------------------------------------------------------------------
+
+
+def test_an_ask_repriced_into_the_market_matches_at_the_makers_price():
+    """A reprice crosses on *both* sides, and prices at the maker either way.
+
+    The bid-side mirror of this is held down by three issue #8 tests; the ask
+    side was held by nothing but the differential harness. An ask repriced
+    down through the bids that failed to cross would rest inside the spread
+    and leave the book crossed -- two orders that are marketable against each
+    other, both still resting, which no query would report as wrong. The
+    price is the load-bearing assertion: 100.0 is the resting bid's, and
+    99.0 is the repriced ask's own.
+    """
+    book = make_book()
+    maker, _ = book.submit(1, INSTRUMENT, "bid", "limit", 5, 100.0)
+    order, _ = book.submit(2, INSTRUMENT, "ask", "limit", 5, 103.0)
+
+    trades, _ = book.modifyOrder(order.idNum, dict(side="ask", qty=5, price=99.0))
+
+    assert [
+        (trade.bid_idNum, trade.ask_idNum, trade.price, trade.qty) for trade in trades
+    ] == [(maker.idNum, order.idNum, 100.0, 5)]
+    assert maker.fulfilled == 5 and order.fulfilled == 5
+    assert list(book.snapshot(INSTRUMENT, "bid")) == []
+    assert list(book.snapshot(INSTRUMENT, "ask")) == []
+    assert book.getBestBid(INSTRUMENT) is None
+    assert book.getBestAsk(INSTRUMENT) is None
+
+
+def test_a_repriced_order_rests_its_remainder_at_the_new_price():
+    """What a crossing reprice cannot fill rests at the price it was moved to.
+
+    The order arrives at the level as a taker with fills already against it,
+    and the level it lands on is the *new* one: resting it back where it came
+    from would leave a bid at 99 while the caller was told it is at 101, and
+    every price query would answer from the stale level.
+    """
+    book = make_book()
+    maker, _ = book.submit(1, INSTRUMENT, "ask", "limit", 3, 101.0)
+    order, _ = book.submit(2, INSTRUMENT, "bid", "limit", 8, 99.0)
+
+    trades, _ = book.modifyOrder(order.idNum, dict(side="bid", qty=8, price=101.0))
+
+    assert [(trade.price, trade.qty) for trade in trades] == [(101.0, 3)]
+    assert maker.fulfilled == 3 and not maker.resting
+    assert [
+        (entry.idNum, entry.price, entry.qty, entry.fulfilled, entry.remaining)
+        for entry in book.snapshot(INSTRUMENT, "bid")
+    ] == [(order.idNum, 101.0, 8, 3, 5)]
+    assert book.getBestBid(INSTRUMENT) == 101.0
+    assert book.getVolumeAtPrice(INSTRUMENT, "bid", 101.0) == 5
+    assert book.getVolumeAtPrice(INSTRUMENT, "bid", 99.0) == 5, "and nothing at 99"
+    assert_volume_cache_is_honest(book)
+
+
+def test_a_cancel_leaves_the_orders_own_quantity_alone():
+    """Cancelling withdraws what is left; it does not restate what was asked for.
+
+    `qty` is the size the caller ordered and `fulfilled` what it traded, and
+    cancelling is a statement about neither. Zeroing `qty` on the way out
+    would make a cancelled order read as one that had been filled past its
+    size -- `fulfilled > qty` -- and `commissions` charges on the fills the
+    order keeps, so the two numbers have to survive it intact.
+    """
+    book = make_book(commission_min=2.5, commission_max_percnt=1.0)
+    maker, _ = book.submit(1, INSTRUMENT, "bid", "limit", 10, 100.0)
+    book.submit(2, INSTRUMENT, "ask", "limit", 5, 100.0)
+    assert (maker.qty, maker.fulfilled) == (10, 5)
+
+    book.cancelOrder("bid", maker.idNum)
+
+    assert maker.qty == 10, "the quantity the caller ordered is unchanged"
+    assert maker.fulfilled == 5
+    assert 0 <= maker.fulfilled <= maker.qty
+    assert maker.cancelled and not maker.resting
+    assert maker.commission == 2.5, "and the fills it keeps are still charged for"
 
 
 # --------------------------------------------------------------------------
