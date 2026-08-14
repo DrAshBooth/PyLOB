@@ -69,15 +69,29 @@ The generator is *not* retuned to make the labels come true: the labels are
 the knob, the realised mix is the consequence, and changing the consequence
 would mean `mixed-v2` and a re-baseline.
 
-`mixed-v1` is also traffic the differential harness checks. Its `benchmark`
-profile replays this stream through the engine and through the spec-derived
-reference matcher side by side, comparing both books, both trade logs and
-every trader's ledger after every order -- at 200 orders rather than 20,000,
-since a per-operation comparison is quadratic in the length of the run. So a
-throughput number here is measured on traffic that has been verified rather
-than merely executed. That harness is a *consumer* of this module and nothing
-flows the other way: this file has no knowledge of it, and imports nothing
-from `PyLOB`, so the engine can never influence the inputs it is judged on.
+`mixed-v1` is also traffic the differential harness checks, and it checks the
+canonical stream itself rather than another one from the same generator. Its
+`benchmark` profile takes eight disjoint 250-order *windows* of the seed-42,
+20,000-order list -- 2,000 of its orders, one tenth of the run, the first
+window starting at offset 0 -- and replays each through the engine and through
+the spec-derived reference matcher side by side, comparing both books, both
+trade logs and every trader's ledger after every order. Windows rather than
+the whole run because a per-operation comparison is quadratic in the length of
+it; windows rather than a shorter *request* because a shorter request is a
+different stream, not a truncation of this one (`_mixed` sizes its kind
+multiset to the request before shuffling, so `generate("mixed-v1", 42, 250)`
+shares no order with the canonical run at any position -- see
+`test_the_stream_is_identical_across_sizes_of_the_same_prefix_seed`).
+
+So a throughput number here is measured on traffic that has been verified
+rather than merely executed, for the tenth of it that is checked, and an edit
+to this file's composition fails the differential suite as well as this
+module's own tests -- the harness asks for the canonical stream, which is the
+request `generate` checks against the pin.
+
+That harness is a *consumer* of this module and nothing flows the other way:
+this file has no knowledge of it, and imports nothing from `PyLOB`, so the
+engine can never influence the inputs it is judged on.
 """
 
 from __future__ import annotations

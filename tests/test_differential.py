@@ -56,17 +56,54 @@ None)`                        form, which must produce the same outcome
 input, neither naming a defect in anything.
 
 
-One definition of `mixed-v1`, and what is *not* shared
-------------------------------------------------------
+One definition of `mixed-v1`, and one stream
+--------------------------------------------
 
 `PyLOB.bench.workloads` is a library module rather than a script so that the
 benchmark and this harness generate traffic from one definition: a throughput
 number and an agreement result should describe the same stream, not two that
-resemble each other. The `benchmark` profile below is that sharing -- it
-replays `mixed-v1` straight out of the benchmark's generator, and everything
-the two sides are configured with (tick, trader count, commission schedule,
-instrument, currency) is read off the workload's own `WorkloadSpec` rather
-than restated here.
+resemble each other. The `benchmark` profile below is that sharing, and it
+shares the *stream* and not merely the generator: it replays windows of the
+**canonical stream itself** -- the seed-42, 20,000-order list that `uv run
+python -m PyLOB.bench` measures by default and that `benchmarks/baselines.json`
+records a number against. Everything the two sides are configured with (tick,
+trader count, commission schedule, instrument, currency) is read off the
+workload's own `WorkloadSpec` rather than restated here.
+
+Windows of the canonical list, and not a short stream at some other seed,
+because a short stream is a *different* stream. `mixed-v1` draws its kind
+labels from a multiset sized to the request and then shuffles it, so
+`generate("mixed-v1", 42, 250)` is not the first 250 orders of the canonical
+run -- it shares no order with it at any position, and
+`test_the_stream_is_identical_across_sizes_of_the_same_prefix_seed` pins that
+as a property of the generator. This profile's first version did exactly that:
+imported the benchmark's generator, called it at this file's own seeds, and
+ran traffic that resembled the benchmark's while sharing not one order of it.
+Slicing the canonical list is the only way to hold the benchmark's own orders,
+and a slice changes nothing about the thing it is a slice of.
+
+Each entry in `SEEDS` selects one 250-order window, evenly spaced across the
+canonical run: eight windows covering 2,000 of its 20,000 orders and no order
+twice. Seed 1's window starts at offset 0, which makes it a literal prefix --
+the same orders meeting the same empty book, so 250 operations of the
+benchmark's own run are checked in the benchmark's own context. The later
+windows carry the benchmark's orders into a *fresh* book, which is not the
+benchmark's scenario and is not claimed to be; what they buy is the mid where
+it had drifted to by order 7,500 or 17,500, and so price regions that no
+250-order run from a cold start reaches (99.19-103.22 across the eight,
+against 98.68-101.31 for eight short runs that all begin at 100.00).
+
+Two things fall out of replaying the canonical stream that are worth more than
+the shared-definition claim itself:
+
+* **This harness now builds the checksummed stream.** `generate` verifies its
+  pin only on the canonical request -- same seed, same size -- so a profile
+  asking for 250 orders at seed 3 skipped the check entirely. Asking for the
+  canonical stream and slicing it means an edit to `mixed-v1`'s composition
+  fails the differential suite too, not only the benchmark's own tests.
+* **The benchmark's traffic is verified rather than merely executed**, for
+  10% of it and order by order. That was the sentence
+  `PyLOB.bench.workloads`'s docstring already made; it is now true.
 
 What is *not* shared is the rest of this file, and the reason is that the two
 generators answer different questions.
@@ -84,20 +121,20 @@ generators answer different questions.
   describe a workload that no longer exists. The input classes in the table
   above therefore stay with the profiles that own their prices.
 
-So the shared part is the whole of `mixed-v1` and none of the rest, and the
+So the shared part is `mixed-v1`'s own orders and none of the rest, and the
 four hand-written profiles are untouched: the `benchmark` profile is a fifth,
 added alongside them. `test_every_input_class_the_table_names_is_still_expected`
-is the guard that says so -- if sharing a generator ever cost this harness one
-of those classes, that test fails rather than the coverage quietly shrinking.
+is the guard that says so -- if sharing a stream ever cost this harness one of
+those classes, that test fails rather than the coverage quietly shrinking.
 
 What the fifth profile is worth on its own, beyond the shared-definition
 claim: `mixed-v1` walks a mid across a 500-tick band with most of its orders
 resting away from the touch -- 57.6% of the canonical stream does, measured
 against a live book rather than read off the generator's labels -- so it builds
 a book with more distinct price levels than the widest hand-written grid here
-and keeps creating, emptying and recreating them as the touch moves -- twenty traders' ledgers, quantities up
-to 100, and the level bookkeeping under a shape none of the fixed grids
-produce.
+and keeps creating, emptying and recreating them as the touch moves -- twenty
+traders' ledgers, quantities up to 100, and the level bookkeeping under a shape
+none of the fixed grids produce.
 
 
 Why money is compared within a tolerance
@@ -118,6 +155,7 @@ bit.
 """
 
 import ast
+import functools
 import random
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -275,14 +313,10 @@ class Profile:
     p_supplied: float = 0.0
     #: At most this many reloads, however the dice fall.
     max_reloads: int = 0
-    #: When set, submissions come from this shared benchmark workload instead
-    #: of from `Generator`'s own draws, and the mix weights above do not apply.
-    #: See `WorkloadGenerator` and the module docstring.
+    #: When set, submissions are a window of this shared benchmark workload's
+    #: canonical stream instead of `Generator`'s own draws, and the mix weights
+    #: above do not apply. See `WorkloadGenerator` and the module docstring.
     workload: str | None = None
-    #: Prices to ask volume-at-price about. Empty means "derive them from the
-    #: grid", which is what a grid profile wants; a workload-driven profile has
-    #: no grid and names them.
-    probes: tuple = ()
     #: Behaviour this profile must actually reach, or the run proves less than
     #: it claims. Checked at the end of every workload.
     expects: frozenset = frozenset()
@@ -306,8 +340,8 @@ def _halves(low, high, step):
     return tuple(range(low, high + 1, step))
 
 
-def _from_workload(name, workload, ops, probes, expects):
-    """A profile whose submissions are a shared benchmark workload.
+def _from_workload(name, workload, ops, expects):
+    """A profile whose submissions are windows of a shared benchmark workload.
 
     Every configuration value comes off the `WorkloadSpec` -- tick, trader
     count, commission schedule, instrument, currency -- rather than being
@@ -329,7 +363,6 @@ def _from_workload(name, workload, ops, probes, expects):
         traders=tuple(range(1, spec.traders + 1)),
         ops=ops,
         workload=workload,
-        probes=probes,
         expects=expects,
     )
 
@@ -395,34 +428,33 @@ PROFILES = (
         ),
     ),
     # The benchmark's own traffic, replayed. Not a fifth market shape chosen
-    # here but `mixed-v1` itself, so the stream the throughput number is
-    # measured on is a stream this harness has checked order by order. See the
-    # module docstring for what that shares and what it deliberately does not.
+    # here but orders lifted out of `mixed-v1`'s canonical stream, so the
+    # traffic the throughput number is measured on is traffic this harness has
+    # checked order by order. See the module docstring for what that shares and
+    # what it deliberately does not.
     #
-    # 200 orders rather than the canonical 20,000: the comparator asks both
-    # implementations everything after *every* operation, which is quadratic in
-    # the length of a run that only ever adds resting orders. 200 is what a
-    # correctness gate can afford; it is the same generator at the same name
-    # and seed, sampled shorter.
+    # 250 orders per window rather than the canonical 20,000: the comparator
+    # asks both implementations everything after *every* operation, which is
+    # quadratic in the length of a run that only ever adds resting orders, and
+    # 250 x 8 windows is what a correctness gate can afford. The size is not
+    # arbitrary -- it is the length at which the *narrowest* of the eight
+    # windows still builds a book wider than `WIDEST_GRID`, with the same
+    # margin (46 levels against 41) the previous independently-seeded sample
+    # had at its worst seed. Chosen by measuring, in the direction of running
+    # more of the shared stream rather than of expecting less from it.
     _from_workload(
         # No hyphen in the profile name, and not by taste: the failure message
         # hands the reader a `-k` expression, and `-k 'mixed-v1 and seed3'` is
         # a parse error rather than a selector.
         name="benchmark",
         workload="mixed-v1",
-        ops=200,
-        # Three on the tick and one exactly between two, all inside the band
-        # the mid walks. The off-grid probe is what compares the two quantizers
-        # on the *read* path, which is the one thing the grid profiles get from
-        # their half-tick grids that a pinned workload cannot supply.
-        probes=(99.50, 100.0, 100.005, 101.25),
+        ops=250,
         # What this profile must reach, and the pair is chosen from what it
         # reliably does rather than from what would sound impressive. A market
-        # remainder is *not* here: `mixed-v1` is a liquid workload, its market
-        # orders are small against the book they meet, and only one seed in
-        # eight outruns it. That class belongs to the four profiles above,
-        # every seed of which reaches it -- which is the argument for keeping
-        # them, in one line.
+        # remainder is *not* here: `mixed-v1` is a liquid workload and its
+        # market orders are small against the book they meet. That class
+        # belongs to the four profiles above, every seed of which reaches it --
+        # which is the argument for keeping them, in one line.
         expects=frozenset(
             {"book wider than any grid here", "partially filled resting order"}
         ),
@@ -430,11 +462,16 @@ PROFILES = (
 )
 
 #: The widest hand-written grid, as a yardstick for the shared workload's book.
-#: `mixed-v1` is included for its price *range*, so "it built a wider book than
-#: anything else here" is the claim worth asserting, and asserting it against
-#: the other profiles keeps it true if one of them widens.
+#: The workload-driven profile is excluded -- it has no grid, and it is the one
+#: being measured -- so "it built a wider book than anything else here" is the
+#: claim worth asserting, and asserting it against the other profiles keeps it
+#: true if one of them widens.
 WIDEST_GRID = max(len(profile.grid) for profile in PROFILES if profile.grid)
 
+#: For a grid profile, the seed of its random stream. For a workload-driven
+#: profile, which window of the canonical stream it replays -- see
+#: `window_offset`, which indexes into this tuple rather than reading a value
+#: out of it.
 SEEDS = (1, 2, 3, 4, 5, 6, 7, 8)
 
 
@@ -457,6 +494,21 @@ class Generator:
         self.rng = random.Random(seed)
         self.next_supplied = FIRST_SUPPLIED_ID
         self.reloads = 0
+
+    @property
+    def probes(self):
+        """Prices to ask volume-at-price about, read off this profile's grid.
+
+        The generator names them because the generator chose the prices: a
+        probe is only worth asking at a price something might rest on, and
+        half of every grid here is deliberately between two ticks, which is
+        what compares the two quantizers on the *read* path.
+        """
+        grid = self.profile.grid
+        return tuple(
+            self.profile.price(grid[index])
+            for index in (0, len(grid) // 4, len(grid) // 2, -1)
+        )
 
     def next_op(self, oracle):
         rng = self.rng
@@ -568,24 +620,68 @@ class Generator:
         )
 
 
+@functools.lru_cache(maxsize=None)
+def canonical_stream(workload):
+    """The canonical stream for `workload`: the exact list a baseline measures.
+
+    `generate`'s defaults are the canonical request -- `CANONICAL_SEED`, the
+    spec's own order count -- which is both what `python -m PyLOB.bench` runs
+    with no arguments and the only request whose checksum `generate` verifies.
+    Asking for it here is therefore how this harness comes to enforce
+    `mixed-v1`'s pin as well: a composition edited without a rename fails the
+    differential suite, not only the benchmark's own tests.
+
+    Cached because eight windows want one list, and building it costs ~40 ms
+    including the checksum pass. A tuple rather than the list `generate`
+    returns, so a cached stream cannot be mutated by whoever borrows it.
+    """
+    return tuple(bench_workloads.generate(workload))
+
+
+def window_offset(profile, seed):
+    """Where in the canonical stream this seed's window starts.
+
+    The windows are evenly spaced across the whole run and disjoint, so the
+    eight of them sample the beginning, the middle and the end of the traffic
+    the benchmark measures rather than eight variations on its first few
+    hundred orders. Indexed by position in `SEEDS` rather than by the seed's
+    value: for a workload-driven profile a "seed" selects a window, and
+    nothing here is fed to a random number generator.
+    """
+    spec = bench_workloads.WORKLOADS[profile.workload]
+    stride = spec.orders // len(SEEDS)
+    if profile.ops > stride:
+        raise ValueError(
+            "%s wants %d orders per window but the stride is %d, so the "
+            "windows would overlap and the same orders would be checked twice"
+            % (profile.name, profile.ops, stride)
+        )
+    return SEEDS.index(seed) * stride
+
+
 class WorkloadGenerator:
-    """A shared benchmark workload, replayed as differential operations.
+    """A window of a shared benchmark workload, replayed as differential ops.
 
-    The stream is `PyLOB.bench.workloads.generate(name, seed, ops)` and nothing
-    else. It is materialised in one call because that is what the benchmark
-    does -- the runner must not pay generation cost inside its timed region --
-    and replaying the identical list here is what makes "the same traffic" a
-    fact rather than a resemblance.
+    The stream is a slice of `canonical_stream(name)` and nothing else -- the
+    benchmark's own orders, in the benchmark's own order, not a fresh stream
+    from the same generator. That distinction is the whole of this class: a
+    request for `ops` orders at another seed would produce traffic of the same
+    shape sharing no order with the run a baseline was recorded against, which
+    is what this profile did before and what the module docstring records.
 
-    Two things it deliberately does not do.
+    Three things it deliberately does not do.
 
     It layers none of `Generator`'s adaptive operations on top. A cancel
     between two submissions changes the book every later order meets, so a
     stream with cancels interleaved would no longer be the stream the
-    throughput number was measured on, and the shared-definition claim would
+    throughput number was measured on, and the shared-stream claim would
     quietly become false. The operations it therefore never emits -- cancel,
     modify, reload, caller-supplied identifiers -- are not lost: they are what
     the four hand-written profiles exist for, and none of them was touched.
+
+    It does not reorder or resample the window. A slice is the one
+    transformation that leaves the orders and their sequence alone, which is
+    why it is the only one taken.
 
     It ignores the oracle it is handed. `Generator` needs the book in front of
     it to name a live order; a pre-built list needs nothing, and the argument
@@ -596,8 +692,33 @@ class WorkloadGenerator:
         self.profile = profile
         self.seed = seed
         self.instrument = profile.instruments[0][0]
-        self.stream = bench_workloads.generate(profile.workload, seed, profile.ops)
+        self.offset = window_offset(profile, seed)
+        self.stream = canonical_stream(profile.workload)[
+            self.offset : self.offset + profile.ops
+        ]
         self.position = 0
+
+    @property
+    def probes(self):
+        """Prices to ask volume-at-price about, read off this window.
+
+        Named here rather than on the `Profile` because this profile does not
+        choose its prices: the mid has walked somewhere different in each
+        window, and a fixed quartet would sit outside the book in most of them
+        and compare nothing against nothing. Three prices the window actually
+        submits at, plus one exactly half a tick above the middle of them --
+        the off-grid probe is what compares the two quantizers on the *read*
+        path, and it is the one thing the grid profiles get from their
+        half-tick grids that a checksum-pinned workload cannot supply.
+        """
+        prices = sorted({op.price for op in self.stream if op.price is not None})
+        middle = prices[len(prices) // 2]
+        return (
+            prices[0],
+            middle,
+            round(middle + self.profile.tick_size / 2, 12),
+            prices[-1],
+        )
 
     def next_op(self, oracle):
         order = self.stream[self.position]
@@ -619,8 +740,10 @@ def build_generator(profile, seed):
     """The generator this profile's operations come from.
 
     Two of them, and the split is the honest one rather than a convenience: a
-    workload-driven profile replays a stream generated in advance, and every
-    other profile has to read the book in front of it to name a live order.
+    workload-driven profile replays a window of a stream generated in advance,
+    and every other profile has to read the book in front of it to name a live
+    order. Both answer `next_op(oracle)` and both offer `probes`, which is the
+    whole of what `Run` asks of a generator.
     """
     if profile.workload is not None:
         return WorkloadGenerator(profile, seed)
@@ -858,20 +981,13 @@ class Run:
     def probes(self):
         """Prices to ask volume-at-price about: on the grid, and off it.
 
-        The off-grid probe is not decoration: `book-queries` puts the query
-        price on the grid before answering, so a probe between two ticks is
-        the only thing that compares the two quantizers on the *read* path.
-
-        A workload-driven profile names its own, since it has no grid to read
-        them off; the on/off-grid mix is the same either way.
+        The generator's, because whoever chose the prices is the only party
+        that knows where the book will be. The off-grid one is not decoration:
+        `book-queries` puts the query price on the grid before answering, so a
+        probe between two ticks is the only thing that compares the two
+        quantizers on the *read* path. Both generators supply that mix.
         """
-        if self.profile.probes:
-            return self.profile.probes
-        grid = self.profile.grid
-        return tuple(
-            self.profile.price(grid[index])
-            for index in (0, len(grid) // 4, len(grid) // 2, -1)
-        )
+        return self.generator.probes
 
     @property
     def levels(self):
@@ -1123,39 +1239,96 @@ BENCHMARK_PROFILE = next(profile for profile in PROFILES if profile.workload)
 
 
 def test_the_benchmark_and_the_differential_run_one_stream():
-    """`mixed-v1` has one definition, and this is what says so.
+    """`mixed-v1` has one definition and one stream, and this is what says so.
 
-    The `benchmark` profile does not describe traffic *like* the benchmark's.
-    It replays the benchmark's own generator at the same name and the same
-    seed, and every value the two implementations are configured with is read
-    off the same `WorkloadSpec` the runner builds its book from. Asserted
-    rather than trusted, because a second copy of a workload named `mixed-v1`
-    is exactly the failure that module's versioning rule exists to prevent, and
-    a copy made here would be invisible from over there.
+    The `benchmark` profile does not describe traffic *like* the benchmark's,
+    and -- the distinction this test exists for -- it does not call the
+    benchmark's generator at its own seeds either. It replays orders lifted
+    out of the canonical stream: the same list, at the same offsets, in the
+    same order, with every value the two implementations are configured with
+    read off the same `WorkloadSpec` the runner builds its book from.
 
-    The one difference is length: 200 orders against the canonical 20,000,
-    because the comparator asks both sides everything after every operation.
-    Same generator, same seed, shorter sample.
+    Asserted against `generate`'s canonical request rather than against
+    `canonical_stream`'s cache, so the claim is checked against the benchmark's
+    own entry point and not against this file's copy of it. That request is
+    also the one the recorded baseline is keyed on
+    (`mixed-v1|seed=42|orders=20000`), which is what makes "the throughput
+    number is measured on traffic this harness checked" a statement about the
+    same two things.
+
+    The differences from the benchmark's run are length and context, and both
+    are named rather than glossed: 250 orders per window against 20,000,
+    because the comparator asks both sides everything after every operation;
+    and every window but the first meets a book built by its own orders alone,
+    where the benchmark's met one built by everything before it.
     """
     profile = BENCHMARK_PROFILE
     spec = bench_workloads.WORKLOADS[profile.workload]
+    canonical = bench_workloads.generate(profile.workload)
 
+    # The list being sliced is the pinned one. `generate` enforces this on the
+    # canonical request; restating it here is what ties *this* harness's
+    # traffic to the checksum a baseline was recorded under.
+    assert len(canonical) == spec.orders
+    assert bench_workloads.checksum(canonical) == spec.checksum
+
+    seen = set()
     for seed in SEEDS:
-        stream = build_generator(profile, seed).stream
-        assert stream == bench_workloads.generate(profile.workload, seed, profile.ops)
-        assert len(stream) == profile.ops
-        # 70 / 20 / 10, which is what the name promises at any size.
-        assert bench_workloads.composition(stream) == {
-            "passive": profile.ops * 7 // 10,
-            "crossing": profile.ops // 5,
-            "market": profile.ops // 10,
-        }
+        generator = build_generator(profile, seed)
+        offset = generator.offset
+        assert tuple(generator.stream) == tuple(
+            canonical[offset : offset + profile.ops]
+        ), "seed %d does not replay the canonical stream" % seed
+        assert len(generator.stream) == profile.ops
+        window = range(offset, offset + profile.ops)
+        assert not seen.intersection(window), (
+            "seed %d overlaps a window already checked, so the same orders "
+            "would be compared twice and the coverage claim overcounts" % seed
+        )
+        seen.update(window)
+
+    # One window is a literal prefix -- same orders, same empty book -- and the
+    # rest reach the far end of the run rather than crowding its start.
+    assert min(seen) == 0
+    assert max(seen) >= spec.orders * 3 // 4
+    assert len(seen) == len(SEEDS) * profile.ops
 
     assert profile.tick_size == spec.tick_size
     assert profile.traders == tuple(range(1, spec.traders + 1))
     assert tuple(profile.commissions) == spec.commission
     assert profile.instruments == (
         (bench_workloads.INSTRUMENT, bench_workloads.CURRENCY),
+    )
+
+
+def test_a_short_stream_at_another_seed_would_share_no_order():
+    """Why the profile slices instead of calling `generate` at its own seed.
+
+    This is the trap the first version of the profile fell into, and it is not
+    obvious from the outside: `generate(name, seed, 250)` looks like a shorter
+    sample of `generate(name, seed)`, and is not one. `mixed-v1` sizes its kind
+    multiset to the request before shuffling, so a 250-order request consumes
+    the random stream differently from the first order onwards.
+
+    The consequence is total, not marginal -- at the *canonical seed*, asking
+    for 250 orders yields a stream with no order in common with the canonical
+    run at any position. A harness that imported the benchmark's generator and
+    called it that way would share the module, the spec and the composition
+    rule while sharing no traffic, and every docstring claiming otherwise would
+    read as true.
+    """
+    profile = BENCHMARK_PROFILE
+    canonical = bench_workloads.generate(profile.workload)
+    short = bench_workloads.generate(
+        profile.workload, bench_workloads.CANONICAL_SEED, profile.ops, verify=False
+    )
+
+    assert len(short) == profile.ops
+    positional = sum(1 for a, b in zip(short, canonical) if a == b)
+    assert positional == 0, (
+        "a short request has become a prefix of the canonical stream; if that "
+        "is now true by design, this profile can stop slicing -- but it is the "
+        "slicing, not the request, that this suite relies on"
     )
 
 
@@ -1232,8 +1405,8 @@ def test_both_refuse_what_the_specs_refuse(tmp_path):
 
     `order-lifecycle` names these: a non-positive quantity, an unknown side, an
     unknown order type, a limit order with no price, an identifier no order
-    has, an externally supplied identifier already in use, and a modify that
-    changes the side. Both implementations must refuse each one with *their own
+    has, an externally supplied identifier already in use, a modify that
+    changes the side, and a modify of an order the book has already filled. Both implementations must refuse each one with *their own
     library exception* -- "Submissions with ... SHALL raise a library
     exception. The API SHALL never terminate the host process" -- and leave the
     book exactly as it was: "an exception is raised, no state changes, and the
@@ -1257,7 +1430,16 @@ def test_both_refuse_what_the_specs_refuse(tmp_path):
     try:
         reference.limit("bid", 5, 100.0, 1)
         engine.limit("bid", 5, 100.0, 1)
-        assert not differences(reference, engine, profile, known_ids=[1])
+
+        # A fully filled order to aim the terminal-state refusal at. The pair
+        # consumes itself exactly -- ask 5 @ 105 met by bid 5 @ 105 -- so both
+        # books are left holding only order 1, and the closing assertion below
+        # still speaks for the whole book rather than for a remainder.
+        for book in (reference, engine):
+            book.limit("ask", 5, 105.0, 2)
+            book.limit("bid", 5, 105.0, 3)
+        known = [1, 2, 3]
+        assert not differences(reference, engine, profile, known_ids=known)
 
         refusals = {
             "non-positive quantity": lambda book: book.limit("bid", 0, 100.0, 1),
@@ -1278,6 +1460,10 @@ def test_both_refuse_what_the_specs_refuse(tmp_path):
             "modify to a different side": lambda book: book.modify(
                 1, qty=3, side="ask"
             ),
+            # Order 2 is fully filled and therefore gone from the book. The
+            # spec refuses raising it rather than silently returning a
+            # finished order to the book with a fresh priority stamp.
+            "modify of a fully filled order": lambda book: book.modify(2, qty=9),
         }
         sides = (
             (reference, reference_matcher.ReferenceError),
@@ -1287,7 +1473,7 @@ def test_both_refuse_what_the_specs_refuse(tmp_path):
             for book, library_error in sides:
                 with pytest.raises(library_error):
                     attempt(book)
-            found = differences(reference, engine, profile, known_ids=[1])
+            found = differences(reference, engine, profile, known_ids=known)
             assert not found, "%s: %s" % (
                 what,
                 "; ".join(item.render() for item in found),
@@ -1326,7 +1512,7 @@ def test_the_grid_is_half_on_the_grid_and_half_off_it():
             # workload that no longer exists. Off-grid *submissions* therefore
             # stay with the profiles below, which is why none of them was
             # replaced by the shared one -- and the shared profile still probes
-            # off-grid on the read path (`Run.probes`).
+            # off-grid on the read path (`WorkloadGenerator.probes`).
             assert profile.workload, (
                 "%s has no grid and no workload: a profile that chooses its "
                 "own prices must choose half-ticks" % profile.name
