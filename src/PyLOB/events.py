@@ -104,11 +104,21 @@ reason `IOC_REMAINDER` are engine *output*: re-issuing them would double-cancel
 or double-book. The replayed engine re-derives them, which is what makes
 replay a check on determinism and not merely a restore.
 
-Counters are restored from the stream, not from a sink's side table: the next
-order identifier is `max(idNum) + 1` over the stream, the next trade
-identifier `max(trade_id) + 1`, so an order submitted after a reload cannot
-collide with one from before it (`order-lifecycle`: identifiers are unique
-"including across reloads of persisted state").
+Counters are restored from the stream, not from a sink's side table, and not
+by scanning it either: nothing computes a maximum. Re-issuing an `Accepted`
+carries its original identifier, and accepting a supplied identifier pushes
+the counter past it -- so replaying every acceptance leaves the counter past
+every identifier the session issued, and an order submitted after a reload
+cannot collide with one from before it (`order-lifecycle`: identifiers are
+unique "across every instrument the engine holds, for that engine's lifetime,
+including across reloads of persisted state").
+
+The trade counter arrives at the same place by a different route, and that
+clause does not cover it -- it is about order identifiers. `Filled` is not
+replayable, so no recorded `trade_id` is ever read back; the replayed engine
+re-derives every execution and takes a fresh identifier for each, reaching the
+same count because it performs the same matches. Whether that agreement is a
+promise or an accident is not currently settled by any requirement.
 
 Notes for the engine implementer
 --------------------------------
