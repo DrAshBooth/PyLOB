@@ -65,7 +65,7 @@ from .replay import ReplayError, replay
 #: which version produced a session. `events.STREAM_VERSION` is the number
 #: that governs whether a recorded session can be replayed -- this one does
 #: not.
-__version__: Final = "0.1.0"
+__version__: Final = "1.0.0"
 
 __all__ = [
     "__version__",

@@ -29,11 +29,18 @@ project). Install it from GitHub; Python 3.11 or newer is required, and there
 are no runtime dependencies — the optional recording sink uses the standard
 library's `sqlite3`:
 
-    pip install "PyLOB @ git+https://github.com/DrAshBooth/PyLOB.git"
+    pip install "PyLOB @ git+https://github.com/DrAshBooth/PyLOB.git@v1.0.0"
 
 or, with [uv](https://docs.astral.sh/uv/):
 
-    uv add "PyLOB @ git+https://github.com/DrAshBooth/PyLOB.git"
+    uv add "PyLOB @ git+https://github.com/DrAshBooth/PyLOB.git@v1.0.0"
+
+**Name the tag.** Both commands work without the `@v1.0.0`, and then they
+install whatever is on the default branch at the moment you happen to run
+them — which means an experiment run today and re-run in six months is not the
+same experiment, and nothing in the results says so. Pin the tag for anything
+whose numbers you intend to keep, and record `PyLOB.__version__` alongside
+them. `CHANGELOG.md` lists the releases.
 
 To work on PyLOB itself, clone the repo and run `uv sync`; `./verify` is the
 definition of done.
