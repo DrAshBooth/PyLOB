@@ -227,7 +227,7 @@ import logging
 import os
 import sqlite3
 import time
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import asdict, dataclass, field
 from itertools import groupby
@@ -272,7 +272,19 @@ _log = logging.getLogger(__name__)
 #: bumps are for the same reason: an older file has no way to say whether it
 #: lost anything, or whether it was ever closed, and an absent table must not
 #: be read as the good answer to a question that file cannot answer.
-SCHEMA_VERSION = 3
+#:
+#: 4 added `session_meta`, `trade.currency` and the `trade_leg` view, in one
+#: revision rather than three. `CREATE TABLE IF NOT EXISTS` adds a missing
+#: table but never a missing column, so a build that stamped 4 while lacking
+#: `trade.currency` would write files indistinguishable from complete ones
+#: whose `trade_leg` was full of nulls -- the objects and the code that fills
+#: them therefore land together (researcher-ergonomics design.md decision 5).
+#: Unlike 2 and 3, this bump takes nothing away from an older file: no
+#: `session_meta` table means the caller supplied no metadata, which is a true
+#: and complete answer rather than a question the file cannot answer. What the
+#: *readers* do with that is ADR-0007's decision and not this constant's; the
+#: writer stays exact either way, for the reason `_check_schema_version` gives.
+SCHEMA_VERSION = 4
 
 #: Default events per transaction. Tuning only; design.md leaves the number to
 #: benchmark data, and the resulting database does not depend on it.
@@ -330,6 +342,24 @@ CREATE TABLE IF NOT EXISTS session (
     stream_version INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS session_meta (
+    -- What the experiment calls this recording: a seed, an episode number, a
+    -- label, whatever the caller named in `SQLiteSink(path, meta=...)`.
+    -- Written in the opening transaction, before the first event and before
+    -- any projection, so a sweep's file still says which run it was when the
+    -- process was killed with its whole buffer still in memory. Provenance
+    -- about the recording rather than part of what the engine did: it never
+    -- enters the event log, never affects matching, and is not an input to
+    -- replay. No rows means the caller supplied none, which is an answer and
+    -- not a defect.
+    key   TEXT PRIMARY KEY,
+    -- Deliberately untyped, so SQLite's dynamic typing hands back what was
+    -- put in: meta={"seed": 42} reads as 42 and not as '42'. One row per key
+    -- rather than a single JSON blob, because scanning a sweep for
+    -- `WHERE key = 'seed'` is the use this exists for.
+    value
+);
+
 CREATE TABLE IF NOT EXISTS instrument (
     symbol     TEXT PRIMARY KEY,
     currency   TEXT NOT NULL,
@@ -383,6 +413,17 @@ CREATE TABLE IF NOT EXISTS trade (
     seq                  INTEGER NOT NULL,
     timestamp            REAL    NOT NULL,
     instrument           TEXT    NOT NULL REFERENCES instrument (symbol),
+    -- The currency this trade's cash legs were actually settled in: the
+    -- instrument's currency as configured at the moment of the fill. NOT
+    -- `orders.currency`, which is stamped when an order is accepted -- an
+    -- order resting across a `configure_instrument` that re-denominates its
+    -- instrument was accepted under one currency and settled under another,
+    -- and the two sides of a single trade can disagree with each other. That
+    -- is why `trade_leg` reads this column instead of joining `orders`, and
+    -- why it is recorded rather than derived. NULL when the instrument had no
+    -- declared currency at the fill: the engine settled the instrument legs
+    -- and no cash legs, and `trade_leg` emits none.
+    currency             TEXT,
     -- The maker's limit price, and the instrument's new last price.
     price                REAL    NOT NULL,
     qty                  INTEGER NOT NULL,
@@ -427,6 +468,56 @@ CREATE VIEW IF NOT EXISTS trader_commission AS
     SELECT tid, currency, SUM(commission) AS commission
     FROM orders
     GROUP BY tid, currency;
+
+CREATE VIEW IF NOT EXISTS trade_leg AS
+    -- Each trade's balance movements, one row per (trader, symbol) leg. It is
+    -- the unpivot of `trade` whose running sum -- and only whose running sum
+    -- -- is what `balance` keeps, so it is the per-trade attribution `balance`
+    -- cannot give and everybody was rewriting by hand. The arithmetic is the
+    -- balance rule from PyLOB.events, verbatim:
+    --     bid side (buyer):  instrument += qty
+    --                        currency   -= qty * price + bid_commission_delta
+    --     ask side (seller): instrument -= qty
+    --                        currency   += qty * price - ask_commission_delta
+    --
+    -- A view and not a table: every number here is already on disk, so
+    -- storing it would add four row-writes per trade and no information.
+    --
+    -- SUM(amount) GROUP BY tid, symbol reproduces `balance` within a
+    -- floating-point tolerance, not bit for bit: `balance` accumulates in
+    -- `seq` order, SUM aggregates in whatever order SQLite picks, and float
+    -- addition is not associative.
+    --
+    -- The currency comes from `trade.currency` -- what was settled -- and
+    -- never from a join to `orders.currency`, which is what was stamped at
+    -- acceptance and is a different currency for any order resting across a
+    -- re-denomination. A trade whose instrument had no declared currency
+    -- carries NULL there and contributes its two instrument legs and no cash
+    -- legs, which is exactly what the engine settled.
+    --
+    -- `symbol` is the holding that moved -- an instrument or a currency, the
+    -- two kinds of key `balance` mixes -- and `leg` says which, because the
+    -- symbol alone cannot be asked. `side` is the side of the trade this
+    -- trader was on, so attribution needs no join back to `trade`.
+    SELECT trade_id, seq, timestamp, instrument, bid_tid AS tid,
+           'bid' AS side, 'instrument' AS leg, instrument AS symbol,
+           CAST(qty AS REAL) AS amount
+    FROM trade
+    UNION ALL
+    SELECT trade_id, seq, timestamp, instrument, ask_tid,
+           'ask', 'instrument', instrument,
+           -CAST(qty AS REAL)
+    FROM trade
+    UNION ALL
+    SELECT trade_id, seq, timestamp, instrument, bid_tid,
+           'bid', 'currency', currency,
+           -(qty * price + bid_commission_delta)
+    FROM trade WHERE currency IS NOT NULL
+    UNION ALL
+    SELECT trade_id, seq, timestamp, instrument, ask_tid,
+           'ask', 'currency', currency,
+           qty * price - ask_commission_delta
+    FROM trade WHERE currency IS NOT NULL;
 """
 
 _EVENT_INSERT = """
@@ -441,6 +532,15 @@ VALUES (?, ?, ?, ?, ?)
 
 _END_INSERT = """
 INSERT INTO session_end (recorded_at, last_seq, event_count) VALUES (?, ?, ?)
+"""
+
+# Upsert, like every other keyed projection here, so that pointing a second
+# sink at an existing file fails the way "Scope" says it does -- on the log's
+# primary key, with the whole session recorded as lost -- rather than in a
+# constructor before the first event.
+_META_UPSERT = """
+INSERT INTO session_meta (key, value) VALUES (?, ?)
+ON CONFLICT (key) DO UPDATE SET value = excluded.value
 """
 
 _LOG_EXTENT = "SELECT COUNT(*), MAX(seq) FROM event"
@@ -515,12 +615,13 @@ WHERE idNum = ?
 """
 
 _TRADE_INSERT = """
-INSERT INTO trade (trade_id, seq, timestamp, instrument, price, qty, taker_side,
+INSERT INTO trade (trade_id, seq, timestamp, instrument, currency, price, qty,
+                   taker_side,
                    bid_idNum, bid_tid, bid_fulfilled, bid_value,
                    bid_commission, bid_commission_delta,
                    ask_idNum, ask_tid, ask_fulfilled, ask_value,
                    ask_commission, ask_commission_delta)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 """
 
 _BALANCE_UPSERT = """
@@ -595,6 +696,37 @@ def _gaps(lost: Iterable[tuple[int, str]]) -> list[tuple[int, int, int, str]]:
     return runs
 
 
+def _meta_rows(
+    meta: Mapping[str, str | int | float | bool] | None,
+) -> list[_Params]:
+    """Validate caller-supplied provenance into `session_meta` rows.
+
+    Checked here rather than left to the bind, so a bad key or value is a
+    `TypeError` naming it while the caller is still looking at the constructor
+    call, and not a `sqlite3.InterfaceError` out of a write. `bool` is an `int`
+    subclass and stores as 0/1. Everything else SQLite would accept -- `None`,
+    `bytes` -- is refused: an absent key already means "not supplied", so a
+    NULL value would be a second spelling of it, and provenance is something a
+    human reads and a sweep filters on.
+    """
+    if not meta:
+        return []
+    rows: list[_Params] = []
+    for key, value in meta.items():
+        if not isinstance(key, str):
+            raise TypeError(
+                f"session metadata keys must be strings, got "
+                f"{type(key).__name__}: {key!r}"
+            )
+        if not isinstance(value, (str, int, float)):
+            raise TypeError(
+                f"session metadata values must be str, int, float or bool; "
+                f"meta[{key!r}] is {type(value).__name__}"
+            )
+        rows.append((key, value))
+    return rows
+
+
 class SQLiteSink:
     """Records an event stream into a SQLite database, in batches.
 
@@ -615,14 +747,30 @@ class SQLiteSink:
         path: str | os.PathLike[str],
         *,
         buffer_size: int = DEFAULT_BUFFER_SIZE,
+        meta: Mapping[str, str | int | float | bool] | None = None,
     ) -> None:
         """Open `path` and create the schema if it is not already there.
 
         `buffer_size` is how many events accumulate before a write. It affects
         throughput, not content.
+
+        `meta` is what this recording should be able to say about itself -- a
+        seed, an episode number, a label -- and goes into `session_meta` in the
+        opening transaction, before any event. A sweep whose fifty files are
+        told apart only by their filenames loses that the moment they are
+        moved; this is inside the file. It is provenance and not stream: the
+        engine never sees it, matching never reads it, and replaying the
+        recorded log does not reproduce it (a replay's provenance is "a replay
+        of X", which is the replaying sink's own `meta` to state).
+
+        Values keep their types, so `meta={"seed": 42}` reads back as `42`.
+        Keys are strings and values are strings, numbers or booleans; anything
+        else raises `TypeError` here rather than at the first write, since a
+        recording that cannot stamp its own provenance should not start.
         """
         if buffer_size < 1:
             raise ValueError(f"buffer_size must be >= 1, got {buffer_size}")
+        rows = _meta_rows(meta)
         self._buffer_size = buffer_size
         self._buffer: list[Event] = []
         self._currency: dict[str, str] = {}
@@ -650,6 +798,8 @@ class SQLiteSink:
         self._conn.execute("PRAGMA synchronous = NORMAL")
         self._check_schema_version()
         self._conn.executescript(SCHEMA)
+        if rows:
+            self._write_meta(rows)
 
     # -- the sink protocol -------------------------------------------------
 
@@ -761,6 +911,28 @@ class SQLiteSink:
             conn.execute("COMMIT")
         except BaseException:
             self._rollback()
+            raise
+
+    def _write_meta(self, rows: Sequence[_Params]) -> None:
+        """Commit the caller's provenance before anything else is written.
+
+        Its own transaction rather than part of a flush, because the whole
+        point of the table is that it is on disk before the first event: a
+        short episode killed with its buffer still full -- the ordinary end of
+        a run under `buffer_size` events -- leaves a file with no rows in it,
+        and this is the row that says which run it was.
+
+        A failure here raises out of the constructor instead of being
+        remembered for `close`: nothing has been recorded yet, and a recording
+        that cannot state what it is should not start.
+        """
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            self._conn.executemany(_META_UPSERT, rows)
+            self._conn.execute("COMMIT")
+        except BaseException:
+            self._rollback()
+            self._conn.close()
             raise
 
     def _rollback(self) -> None:
@@ -988,12 +1160,19 @@ class SQLiteSink:
 
     def _project_fill(self, event: Filled, batch: _Batch) -> None:
         """Fold one trade: the trade row, both order rows, four movements."""
+        # Resolved once, before the trade row is written, because the row
+        # records the currency the legs below are settled in and the two must
+        # not be able to disagree. It is the currency in force *now*, which is
+        # not the one stamped on either order if the instrument has been
+        # re-denominated since -- see `trade.currency` in SCHEMA.
+        currency = self._currency.get(event.instrument)
         batch.trades.append(
             (
                 event.trade_id,
                 event.seq,
                 event.timestamp,
                 event.instrument,
+                currency,
                 event.price,
                 event.qty,
                 event.taker_side,
@@ -1049,10 +1228,12 @@ class SQLiteSink:
         #                        currency   += qty * price - ask_commission_delta
         # The commission increments are the engine's own numbers (design.md
         # decision 3); the formula that produced them lives in the engine and
-        # is not repeated here.
+        # is not repeated here. The `trade_leg` view is this same rule in SQL,
+        # reading the row written above -- these two are the pair to keep in
+        # step, and the tests compare the view's aggregate against what this
+        # accumulates.
         batch.balances.append((event.bid_tid, event.instrument, float(event.qty)))
         batch.balances.append((event.ask_tid, event.instrument, -float(event.qty)))
-        currency = self._currency.get(event.instrument)
         if currency is None:
             self._warn_missing_currency(event.instrument)
         else:
@@ -1083,6 +1264,15 @@ class SQLiteSink:
         )
 
     def _check_schema_version(self) -> None:
+        """Refuse to write any file this module did not stamp itself.
+
+        Exact, and deliberately stricter than whatever the readers accept:
+        ADR-0007 keeps the writer at equality because the schema DDL would
+        give an older file the new tables and views but never a new *column* --
+        SQLite does not retrofit one into existing rows -- so the file would
+        present as this version while being structurally unable to answer what
+        this version promises.
+        """
         version = self._conn.execute("PRAGMA user_version").fetchone()[0]
         if version == 0:
             self._conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
@@ -1196,8 +1386,8 @@ def check_log(source: str | os.PathLike[str] | sqlite3.Connection) -> None:
     separately, because it is not a version mismatch at all and the honest
     diagnosis saves a session: it is what a killed run's `.db` looks like when
     it was copied without its `-wal` sidecar (see Durability), and a reader
-    told "version 0 is not version 3" goes looking for an old release of this
-    module instead of for the file holding their events.
+    told "version 0 is not this module's version" goes looking for an old
+    release of this module instead of for the file holding their events.
 
     **The sink recorded a loss.** Any `event_loss` row is a loss this sink
     knew about, wherever in the stream it fell, and it is on disk without

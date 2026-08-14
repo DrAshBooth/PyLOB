@@ -30,6 +30,8 @@ same questions.
     trade              == the `Trade` list the engine returned
     instrument         == `getLastPrice()`
     trader_commission  == commission summed per trader per currency
+    trade_leg          == `balance`, once the per-trade movements are summed
+                          by trader and symbol
 
 Both workloads run at `buffer_size` 1 and 100,000 -- one event per
 transaction, and the whole session in one -- because `SQLiteSink` claims those
@@ -437,6 +439,56 @@ def assert_commission_view_matches(book, conn):
         )
 
 
+def assert_trade_legs_match(conn):
+    """`trade_leg` unpivots each trade into the movements `balance` sums.
+
+    Compared against the `balance` table rather than against `holdings()`:
+    `assert_balances_match` has already pinned those two to each other, and
+    the claim the view is for is this one -- the per-trade legs and the
+    running ledger cannot drift apart, so PnL attribution built on the legs
+    reconciles with the balances by construction.
+
+    A tolerance and not equality, for the reason the view's own comment gives:
+    `balance` accumulates in `seq` order and `SUM` aggregates in whatever
+    order SQLite picks, and float addition is not associative.
+    """
+    legs = {
+        (tid, symbol): amount
+        for tid, symbol, amount in rows(
+            conn,
+            "SELECT tid, symbol, SUM(amount) FROM trade_leg GROUP BY tid, symbol",
+        )
+    }
+    ledger = {
+        (tid, symbol): amount
+        for tid, symbol, amount in rows(conn, "SELECT tid, symbol, amount FROM balance")
+    }
+    assert set(legs) == set(ledger), (
+        "trade_leg and balance disagree about which holdings moved: "
+        "legs-only %r, balance-only %r"
+        % (sorted(set(legs) - set(ledger)), sorted(set(ledger) - set(legs)))
+    )
+    for key, amount in ledger.items():
+        assert legs[key] == pytest.approx(amount, **MONEY), (
+            "trade_leg%r sums to %r, balance holds %r" % (key, legs[key], amount)
+        )
+
+    # And every trade contributes its own legs and no others: the two
+    # instrument movements always, the two currency movements when there was a
+    # currency to settle in. A view that dropped a trade could still add up if
+    # something else made the difference.
+    counted = rows(
+        conn,
+        "SELECT t.trade_id, t.currency IS NULL, COUNT(l.trade_id) FROM trade t "
+        "LEFT JOIN trade_leg l ON l.trade_id = t.trade_id GROUP BY t.trade_id",
+    )
+    assert counted, "the session must have traded"
+    for trade_id, unpriced, legs_of_trade in counted:
+        assert legs_of_trade == (2 if unpriced else 4), (
+            "trade %d unpivots into %d legs" % (trade_id, legs_of_trade)
+        )
+
+
 def assert_projections_match(book, db_path, trades):
     """Every projection, against the engine that wrote it."""
     conn = sqlite3.connect(db_path)
@@ -447,6 +499,7 @@ def assert_projections_match(book, db_path, trades):
         assert_trades_match(book, conn, trades)
         assert_last_prices_match(book, conn)
         assert_commission_view_matches(book, conn)
+        assert_trade_legs_match(conn)
     finally:
         conn.close()
 
@@ -512,6 +565,144 @@ def test_the_two_buffer_sizes_project_identically(tmp_path):
     assert dumps[0] == dumps[1]
 
 
+#: The `trade_leg` anyone writes by hand: the same unpivot, taking each leg's
+#: currency from the order it belongs to. Exact in every session that never
+#: re-denominates an instrument -- which is every session anyone had run when
+#: this was verified -- and the reason `trade.currency` is recorded rather
+#: than joined. Kept here as the counter-example the test below runs.
+NAIVE_LEGS = """
+    SELECT t.bid_tid AS tid, o.currency AS symbol,
+           -(t.qty * t.price + t.bid_commission_delta) AS amount
+    FROM trade t JOIN orders o ON o.idNum = t.bid_idNum
+    WHERE o.currency IS NOT NULL
+    UNION ALL
+    SELECT t.ask_tid, o.currency, t.qty * t.price - t.ask_commission_delta
+    FROM trade t JOIN orders o ON o.idNum = t.ask_idNum
+    WHERE o.currency IS NOT NULL
+"""
+
+
+def redenominated(db_path):
+    """A session whose instrument changes currency under a resting order.
+
+    `configure_instrument` may be called again, and naming a different
+    currency re-denominates the legs of every *later* trade. The bid below
+    rests across that call, so it is accepted in USD and settled twice: once
+    in USD and once, for the same order, in EUR. That is the state in which
+    the order's stamped currency and the trade's settled currency disagree --
+    and the two sides of the second trade disagree with each other, since the
+    ask that fills it was accepted after the change.
+    """
+    book = OrderBook(tick_size=TICK, sink=SQLiteSink(db_path, buffer_size=1))
+    book.configure_instrument("FAKE", "USD")
+    for tid in (1, 2, 3):
+        book.configure_trader(
+            tid,
+            name="t%d" % tid,
+            commission_min=1.0,
+            commission_max_percnt=1.0,
+            commission_per_unit=0.01,
+        )
+    book.submit(1, "FAKE", "bid", "limit", 10, 100.00)
+    book.submit(2, "FAKE", "ask", "limit", 4, 100.00)  # settles in USD
+    book.configure_instrument("FAKE", "EUR")
+    book.submit(3, "FAKE", "ask", "limit", 6, 100.00)  # settles in EUR
+    book.close()
+    return book
+
+
+def test_the_legs_follow_a_mid_session_redenomination(tmp_path):
+    """The case `trade.currency` exists for, and the one a join gets wrong.
+
+    The sink books a fill in the currency in force *at the fill*;
+    `orders.currency` is the currency stamped *at acceptance*. They agree in
+    every session that never re-denominates, so the hand-written unpivot --
+    join `orders`, take its currency -- reproduces `balance` to 1e-9 right up
+    until an instrument changes currency under a resting order, and is
+    silently wrong from there on.
+
+    Both halves are asserted: the view reproduces `balance`, and the join does
+    not. The second is what stops the column being quietly replaced by a join
+    later, since without a re-denomination in the workload nothing would
+    notice.
+    """
+    db_path = tmp_path / "redenominated.db"
+    book = redenominated(db_path)
+
+    conn = sqlite3.connect(db_path)
+    try:
+        # The setup actually happened: one trade settled in each currency,
+        # both against a bid that was accepted, and stamped, in USD.
+        assert rows(
+            conn, "SELECT trade_id, currency, bid_idNum FROM trade ORDER BY trade_id"
+        ) == [(1, "USD", 1), (2, "EUR", 1)]
+        assert rows(conn, "SELECT currency FROM orders WHERE idNum = 1") == [("USD",)]
+
+        assert_balances_match(book, conn)
+        assert_trade_legs_match(conn)
+
+        # The buyer's cash moved in both currencies, which is the fact the
+        # order's stamped currency cannot express.
+        assert sorted(
+            rows(
+                conn,
+                "SELECT symbol, SUM(amount) FROM trade_leg "
+                "WHERE tid = 1 AND leg = 'currency' GROUP BY symbol",
+            )
+        ) == [("EUR", -600.0), ("USD", -401.0)]
+
+        naive = {
+            (tid, symbol): amount
+            for tid, symbol, amount in rows(
+                conn,
+                "SELECT tid, symbol, SUM(amount) FROM (%s) GROUP BY tid, symbol"
+                % NAIVE_LEGS,
+            )
+        }
+    finally:
+        conn.close()
+
+    # The counter-example: joining `orders` books the buyer's whole cash
+    # movement under the currency the order was accepted in, so the EUR
+    # holding disappears and the USD one is wrong by the size of the second
+    # trade. Not a rounding difference -- a different ledger.
+    engine = {(tid, symbol): amount for tid, symbol, amount in book.holdings()}
+    assert naive[(1, "USD")] == pytest.approx(-1001.0, **MONEY)
+    assert (1, "EUR") not in naive
+    assert naive[(1, "USD")] != pytest.approx(engine[(1, "USD")], **MONEY)
+
+
+def test_the_legs_are_derived_and_add_no_information(tmp_path):
+    """Re-folding the log reproduces `trade_leg` exactly, currencies and all.
+
+    The view reads recorded `trade` rows and nothing the sink kept in memory,
+    so a fresh sink fed only the log has to produce the same movements. Run
+    over the re-denominating session on purpose: `trade.currency` is the one
+    column behind the view that comes out of state the fold maintains -- the
+    currency memo -- and a fold that took it from anywhere else would show up
+    here as a difference.
+    """
+    db_path = tmp_path / "derived.db"
+    redenominated(db_path)
+
+    refolded_path = tmp_path / "derived-refold.db"
+    sink = SQLiteSink(refolded_path, buffer_size=1)
+    for event in read_events(db_path):
+        sink.consume(event)
+    sink.close()
+
+    def legs(path):
+        conn = sqlite3.connect(path)
+        try:
+            return rows(conn, "SELECT * FROM trade_leg ORDER BY trade_id, tid, leg")
+        finally:
+            conn.close()
+
+    recorded = legs(db_path)
+    assert recorded, "the session must have traded"
+    assert legs(refolded_path) == recorded
+
+
 def test_an_instrument_with_no_currency_books_no_currency_leg(tmp_path):
     """The sink says so rather than inventing one, and the engine agrees.
 
@@ -537,6 +728,17 @@ def test_an_instrument_with_no_currency_books_no_currency_leg(tmp_path):
             (1, "NAKED", -5.0),
             (2, "NAKED", 5.0),
         ]
+        # `trade.currency` records the absence rather than a guess, so the
+        # unpivot emits the two instrument movements and no cash movements --
+        # what the engine settled -- and still adds up to the balances.
+        assert rows(conn, "SELECT currency FROM trade") == [(None,)]
+        assert rows(
+            conn, "SELECT tid, symbol, leg, amount FROM trade_leg ORDER BY tid"
+        ) == [
+            (1, "NAKED", "instrument", -5.0),
+            (2, "NAKED", "instrument", 5.0),
+        ]
+        assert_trade_legs_match(conn)
     finally:
         conn.close()
 

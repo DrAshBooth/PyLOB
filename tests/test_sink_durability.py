@@ -149,9 +149,9 @@ def stream(count, poison_at=()):
 # --------------------------------------------------------------------------
 
 
-def build(db_path, buffer_size=DEFAULT_BUFFER_SIZE, currency=CURRENCY):
+def build(db_path, buffer_size=DEFAULT_BUFFER_SIZE, currency=CURRENCY, meta=None):
     """A configured engine recording to `db_path`, and its sink."""
-    sink = SQLiteSink(db_path, buffer_size=buffer_size)
+    sink = SQLiteSink(db_path, buffer_size=buffer_size, meta=meta)
     book = OrderBook(tick_size=TICK, sink=sink)
     book.configure_instrument(INSTRUMENT, currency)
     for tid in range(1, 5):
@@ -214,7 +214,10 @@ def workload(book, rng, n_ops=400):
 #:
 #: `session_end` is deliberately absent: it carries a wall clock, which no two
 #: runs share and which is not content. `ended()` reads the parts of it that
-#: are.
+#: are. `session_meta` is absent for a different reason -- it is the caller's
+#: provenance rather than anything the log implies, so two runs of the same
+#: workload need not carry the same metadata and a re-fold of the log cannot
+#: reproduce any. `meta_rows()` reads it where it is the point.
 TABLES = {
     "event": "seq",
     "event_loss": "first_seq",
@@ -270,6 +273,22 @@ def ended(path):
     try:
         return conn.execute(
             "SELECT last_seq, event_count FROM session_end ORDER BY rowid"
+        ).fetchall()
+    finally:
+        conn.close()
+
+
+def meta_rows(path):
+    """`session_meta` as the file holds it, with SQLite's own type for each.
+
+    The type is read as well as the value because "values keep their types" is
+    the claim: an untyped column and SQLite's dynamic typing are what make
+    `meta={"seed": 42}` come back as `42` rather than as `'42'`.
+    """
+    conn = sqlite3.connect(path)
+    try:
+        return conn.execute(
+            "SELECT key, value, typeof(value) FROM session_meta ORDER BY key"
         ).fetchall()
     finally:
         conn.close()
@@ -647,7 +666,7 @@ def test_a_closed_sink_stops_the_engine_rather_than_swallowing_its_events(tmp_pa
 # --------------------------------------------------------------------------
 
 
-def killed_session(path, buffer_size=4, n_orders=20, close=False):
+def killed_session(path, buffer_size=4, n_orders=20, close=False, meta=None):
     """Record `n_orders` and walk away without closing. Returns the sink.
 
     What a killed process leaves behind: everything flushed is committed, and
@@ -655,7 +674,7 @@ def killed_session(path, buffer_size=4, n_orders=20, close=False):
     Nothing was attempted and nothing failed, so there is no `event_loss` row
     and the surviving `seq` run from 0 with no gap.
     """
-    book, sink = build(path, buffer_size=buffer_size)
+    book, sink = build(path, buffer_size=buffer_size, meta=meta)
     for index in range(n_orders):
         book.submit(
             tid=1 + index % 4,
@@ -707,7 +726,7 @@ def test_a_killed_db_copied_without_its_wal_names_the_wal(tmp_path):
     committed event sits in the `-wal` beside it. Copy the `.db` alone -- the
     obvious thing to do with something named `session.db` -- and the file that
     arrives has no schema at all, which the version check reported as "schema
-    version 0 is not this module's version 3". That sends a reader looking for
+    version 0 is not this module's version N". That sends a reader looking for
     an old release of this module, when what they need is a file they left
     behind, and the run is recoverable the whole time they are not looking.
     """
@@ -1040,11 +1059,20 @@ def test_a_missing_prefix_is_refused_even_though_the_rest_is_contiguous(tmp_path
         check_log(path)
 
 
-def test_a_foreign_schema_version_is_refused(tmp_path):
+@pytest.mark.parametrize("version", (1, SCHEMA_VERSION + 1))
+def test_a_foreign_schema_version_is_refused(tmp_path, version):
     """A file this module did not write cannot be vouched for either.
 
     A version-1 database has no `event_loss` table, so reading one would mean
-    treating "this file cannot record a loss" as "this file lost nothing".
+    treating "this file cannot record a loss" as "this file lost nothing". A
+    version this module has not been written for yet is the same problem from
+    the other end: nothing here knows what it would have to check.
+
+    Both are named outright rather than reached as `SCHEMA_VERSION - 1`, which
+    is a different question: ADR-0007 decided that the readers accept a
+    *window* down to `MIN_READABLE_SCHEMA_VERSION`, so the version immediately
+    below this one is on its way to being read rather than refused. These two
+    sit outside any window, which is what this test is about.
     """
     path = tmp_path / "old.db"
     sink = SQLiteSink(path, buffer_size=100)
@@ -1053,7 +1081,7 @@ def test_a_foreign_schema_version_is_refused(tmp_path):
 
     conn = sqlite3.connect(path)
     try:
-        conn.execute("PRAGMA user_version = %d" % (SCHEMA_VERSION - 1))
+        conn.execute("PRAGMA user_version = %d" % version)
     finally:
         conn.close()
 
@@ -1303,6 +1331,114 @@ def test_commission_is_reported_in_the_currency_it_was_charged_in(tmp_path):
     # And the total is unmoved: the fix splits the commission by currency, it
     # does not recompute it.
     assert math.isclose(sum(charged.values()), 4.0, rel_tol=1e-9)
+
+
+# --------------------------------------------------------------------------
+# what the recording says about itself
+# --------------------------------------------------------------------------
+
+#: A sweep's worth of provenance: the two identifiers that tell fifty
+#: otherwise identical `.db` files apart, a label, and a bool -- which SQLite
+#: stores as an integer, so the round trip is asserted rather than assumed.
+META = {"seed": 20260814, "episode": 7, "label": "sweep-a", "warmed_up": True}
+
+RECORDED_META = [
+    ("episode", 7, "integer"),
+    ("label", "sweep-a", "text"),
+    ("seed", 20260814, "integer"),
+    ("warmed_up", 1, "integer"),
+]
+
+
+def test_metadata_survives_a_session_killed_before_its_first_flush(tmp_path):
+    """The file with nothing in it still says which run it was.
+
+    A session shorter than `buffer_size` that is killed rather than closed
+    leaves a database with no events at all -- the ordinary outcome, per the
+    module docstring, and precisely the run a sweep wants to identify, since
+    the one that died is the one worth looking at. Metadata is committed in
+    the opening transaction, before the first event, so it is the one thing in
+    that file the buffer could not take with it.
+
+    The alternative -- writing it at `close` -- would put the identifier in
+    exactly the sessions that do not need it and in none of the ones that do.
+    """
+    path = tmp_path / "killed-meta.db"
+    sink = killed_session(path, buffer_size=DEFAULT_BUFFER_SIZE, n_orders=5, meta=META)
+
+    assert sink.buffered > 0, "nothing was actually lost with the process"
+    assert seqs(path) == [], "the file with no events in it is the case that matters"
+    assert meta_rows(path) == RECORDED_META
+
+    # And it is still an unfinished log: naming itself is not a claim to be
+    # complete.
+    with pytest.raises(IncompleteLogError):
+        check_log(path)
+
+
+def test_a_metadata_carrying_session_records_the_same_stream_as_one_without(tmp_path):
+    """Provenance is about the recording, so it must not reach the recording.
+
+    Metadata deliberately does not travel in the event stream: it is what the
+    experimenter wants to remember, not what the engine did, and the sink is
+    where it lives so that `events.py` and `STREAM_VERSION` are untouched. The
+    check is the direct one -- the same seeded workload recorded twice, once
+    labelled and once not -- because a `meta` that perturbed the clock, the
+    engine or the fold would produce a recording comparable with nothing.
+    """
+    labelled = tmp_path / "labelled.db"
+    book, _ = build(labelled, buffer_size=64, meta=META)
+    workload(book, random.Random(4242), n_ops=150)
+    book.close()
+
+    plain = tmp_path / "plain.db"
+    book, _ = build(plain, buffer_size=64)
+    workload(book, random.Random(4242), n_ops=150)
+    book.close()
+
+    assert dump(labelled) == dump(plain)
+
+    def legs(path):
+        conn = sqlite3.connect(path)
+        try:
+            return conn.execute(
+                "SELECT * FROM trade_leg ORDER BY trade_id, tid, leg"
+            ).fetchall()
+        finally:
+            conn.close()
+
+    assert legs(labelled) == legs(plain)
+    assert legs(labelled), "the workload must have traded"
+
+    assert meta_rows(labelled) == RECORDED_META, "the labelled run kept its labels"
+    assert meta_rows(plain) == [], "and supplying none is not an error"
+
+
+def test_metadata_that_cannot_be_recorded_is_refused_before_anything_opens(tmp_path):
+    """A recording that cannot state what it is does not start.
+
+    For a value SQLite refuses outright the alternative is a
+    `sqlite3.InterfaceError` out of the opening write, which names neither the
+    key nor the caller's line. For one it would happily store -- a `None` that
+    reads back indistinguishably from a key nobody supplied -- the alternative
+    is worse: a file whose provenance says something other than what was
+    meant. Both are caught in front of the connection, so a refused call
+    leaves no file behind either.
+    """
+    path = tmp_path / "badmeta.db"
+    with pytest.raises(TypeError, match="values must be"):
+        SQLiteSink(path, meta={"seed": [1, 2, 3]})
+    with pytest.raises(TypeError, match="values must be"):
+        SQLiteSink(path, meta={"seed": None})
+    with pytest.raises(TypeError, match="keys must be strings"):
+        SQLiteSink(path, meta={7: "seven"})
+    assert not path.exists(), "the refusal happened before the file was opened"
+
+    # An empty mapping is not metadata that failed, it is metadata nobody
+    # supplied: the same state as omitting the keyword.
+    sink = SQLiteSink(path, meta={})
+    sink.close()
+    assert meta_rows(path) == []
 
 
 # --------------------------------------------------------------------------
