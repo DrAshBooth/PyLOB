@@ -15,9 +15,13 @@ Three facts about the engine bear on it.
 
 **The order store is never pruned.** `_orders` maps `idNum` to `Order` for the
 life of the book. That is not an accident of implementation: `order-lifecycle`
-requires identifiers unique "within the book's lifetime, including across
-reloads", and `create_order` enforces it by testing membership of the store —
-so the store *is* the uniqueness check. A filled or cancelled order also stays
+requires identifiers unique "across every instrument the engine holds, for
+that engine's lifetime, including across reloads of persisted state", and
+`create_order` enforces it by testing membership of the store — so the store
+*is* the uniqueness check. (That clause read "within the book's lifetime" when
+this ADR was written; `identifiers-unique-per-engine` resolved the ambiguity
+without changing the behaviour, which only strengthens the argument below —
+the space a `reset()` would have to clear is engine-wide.) A filled or cancelled order also stays
 addressable, because the acceptance surface asks a finished order for its
 `fulfilled` and `commission` long after it has left the book.
 
