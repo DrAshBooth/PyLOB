@@ -15,7 +15,16 @@ still counted by volume-at-price.
 Fixtures come from `tests/acceptance/conftest.py`: `engine` is an empty book
 reached through the engine-neutral adapter surface, never through an engine's
 own API, so a scenario here states a contract rather than an implementation.
+Two requirements here are written *per instrument* -- the snapshot and the
+last-trade price -- and one instrument cannot tell a book apart from the
+engine holding it, so those tests take `engine_factory(instruments=...)` and
+ask their queries of one instrument while a second one is loaded.
 """
+
+#: The second instrument those tests load. It sorts alphabetically *before*
+#: the default "FAKE", so a query that pooled the books, or answered from
+#: whichever one it reached first, would answer with this one.
+OTHER = "AAA"
 
 # --------------------------------------------------------------------------
 # Requirement: Best and worst prices reflect resting limit orders
@@ -153,6 +162,32 @@ def test_last_price_survives_reload(engine):
     assert reloaded.last_price() == 101.0
 
 
+def test_last_price_is_reported_per_instrument(engine_factory):
+    """Last-trade price is reporting, not matching state / requirement statement.
+
+    "the price of the most recent trade per instrument" -- the clause has no
+    scenario of its own, and a single last-trade price for the whole engine
+    would satisfy both scenarios above. A second instrument is what makes
+    "most recent" ambiguous, and the contract resolves it per instrument: a
+    trade in one is not news about the other.
+    """
+    engine = engine_factory(instruments=((OTHER, "USD"),))
+
+    engine.limit("ask", 5, 101.0, tid=1)
+    engine.limit("bid", 5, 101.0, tid=2)
+
+    assert engine.last_price() == 101.0
+    assert engine.last_price(OTHER) is None  # no trade there yet
+
+    engine.limit("ask", 3, 97.0, tid=3, instrument=OTHER)
+    engine.limit("bid", 3, 97.0, tid=4, instrument=OTHER)
+
+    # The later trade is the last one in its own instrument only; the first
+    # instrument still reports the last trade that happened in it.
+    assert engine.last_price(OTHER) == 97.0
+    assert engine.last_price() == 101.0
+
+
 # --------------------------------------------------------------------------
 # Requirement: Book snapshot is complete and consistent
 # --------------------------------------------------------------------------
@@ -196,3 +231,66 @@ def test_snapshot_agrees_with_queries(engine):
     assert engine.volume_at("bid", bids[-1].price) == sum(e.available for e in bids)
     assert engine.volume_at("ask", asks[-1].price) == sum(e.available for e in asks)
     assert engine.volume_at("bid", bids[0].price) == bids[0].available
+
+
+def test_snapshot_and_queries_are_scoped_to_one_instrument(engine_factory):
+    """Book snapshot is complete and consistent / requirement statement.
+
+    "A book snapshot for an instrument SHALL list every resting order ...
+    exactly once ... and SHALL agree with the price and volume queries taken
+    at the same moment" -- *for an instrument* has no scenario of its own,
+    and in a one-instrument engine there is nothing for a query to be scoped
+    to. The second instrument here is quoted inside the first one's spread
+    and the wrong way round, so pooling the two books would move every price
+    query: the best bid would read 100 instead of 99 and the best ask 100.5
+    instead of 101.
+    """
+    engine = engine_factory(instruments=((OTHER, "USD"),))
+
+    best_bid = engine.limit("bid", 5, 99, tid=1)
+    deep_bid = engine.limit("bid", 7, 98, tid=2)
+    best_ask = engine.limit("ask", 4, 101, tid=3)
+    deep_ask = engine.limit("ask", 6, 102, tid=4)
+
+    other_best_bid = engine.limit("bid", 3, 100, tid=5, instrument=OTHER)
+    other_deep_bid = engine.limit("bid", 4, 99.5, tid=100, instrument=OTHER)
+    other_best_ask = engine.limit("ask", 2, 100.5, tid=101, instrument=OTHER)
+    other_deep_ask = engine.limit("ask", 8, 103, tid=102, instrument=OTHER)
+
+    bids = engine.snapshot("bid")
+    asks = engine.snapshot("ask")
+    other_bids = engine.snapshot("bid", OTHER)
+    other_asks = engine.snapshot("ask", OTHER)
+
+    # Every resting order appears in the snapshot of the instrument it was
+    # submitted in, in matching-priority order, and in no other snapshot.
+    assert [entry.idNum for entry in bids] == [best_bid.idNum, deep_bid.idNum]
+    assert [entry.idNum for entry in asks] == [best_ask.idNum, deep_ask.idNum]
+    assert [entry.idNum for entry in other_bids] == [
+        other_best_bid.idNum,
+        other_deep_bid.idNum,
+    ]
+    assert [entry.idNum for entry in other_asks] == [
+        other_best_ask.idNum,
+        other_deep_ask.idNum,
+    ]
+
+    # ... and the price and volume queries agree with the snapshot of the
+    # instrument they name, not with the other one's.
+    assert engine.best("bid") == bids[0].price == 99
+    assert engine.worst("bid") == bids[-1].price == 98
+    assert engine.best("ask") == asks[0].price == 101
+    assert engine.worst("ask") == asks[-1].price == 102
+    assert engine.best("bid", OTHER) == other_bids[0].price == 100
+    assert engine.worst("bid", OTHER) == other_bids[-1].price == 99.5
+    assert engine.best("ask", OTHER) == other_asks[0].price == 100.5
+    assert engine.worst("ask", OTHER) == other_asks[-1].price == 103
+
+    # Volume is the named instrument's alone: pooled, the bid side would
+    # answer 19 at a price both books' bids are marketable against.
+    assert engine.volume_at("bid", 98) == sum(entry.available for entry in bids) == 12
+    assert (
+        engine.volume_at("bid", 98, OTHER)
+        == sum(entry.available for entry in other_bids)
+        == 7
+    )

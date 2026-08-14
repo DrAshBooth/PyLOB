@@ -245,20 +245,32 @@ def build_inmemory(
     self_matching=(),
     instrument=INSTRUMENT,
     currency=CURRENCY,
+    instruments=(),
     tick_size=DEFAULT_TICK,
 ):
     """Build the in-memory engine (ADR-0001, epic lob-5rt), recording to `db_path`.
 
+    `instrument`/`currency` are the *default* instrument -- the one every
+    surface call means when it names none. `instruments` are further
+    `(symbol, currency)` pairs to declare beside it, for a suite that has to
+    say what is scoped to one instrument and what is not; each gets its own
+    settlement currency, so a second instrument may settle in a second
+    currency.
+
     Configuration goes through the engine's own calls rather than through
     seeded rows, so the commission schedule and the self-matching flags reach
-    the recorded stream as `TraderConfigured` events -- which is what makes
-    `reopen()` able to rebuild a book that charges the same commissions.
+    the recorded stream as `TraderConfigured` events, and each instrument as
+    an `InstrumentConfigured` -- which is what makes `reopen()` able to
+    rebuild every book, charging the same commissions and settling in the
+    same currencies.
     """
     schedule = as_commissions(commissions)
     allowed = self_matching_set(self_matching, traders)
 
     book = OrderBook(tick_size=tick_size, sink=SQLiteSink(db_path))
     book.configure_instrument(instrument, currency)
+    for symbol, settles_in in instruments:
+        book.configure_instrument(symbol, settles_in)
     for tid in traders:
         book.configure_trader(
             tid,

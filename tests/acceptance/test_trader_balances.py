@@ -15,6 +15,11 @@ off for everyone.
 FAKE = "FAKE"
 USD = "USD"
 
+#: A second instrument settling in a second currency, loaded by the one test
+#: that has to show *which* currency a trade's cash leg moves.
+BAZ = "BAZ"
+EUR = "EUR"
+
 
 # --------------------------------------------------------------------------
 # Requirement: Trades move balances symmetrically
@@ -89,6 +94,35 @@ def test_movements_offset_across_several_trades(engine, approx_money):
 
     assert engine.balance(1, FAKE) + engine.balance(2, FAKE) == approx_money(0)
     assert engine.balance(1, USD) + engine.balance(2, USD) == approx_money(0)
+
+
+def test_the_cash_leg_moves_the_instruments_own_currency(engine_factory, approx_money):
+    """Trades move balances symmetrically / requirement text: C is the instrument's currency.
+
+    "For each trade ... in an instrument denominated in currency C" -- with
+    one instrument in the engine, C is the only currency there is and the
+    clause names nothing. A second instrument denominated in EUR gives the
+    cash leg a choice: the trade moves that instrument and EUR, and leaves
+    the first instrument and its USD exactly where they were.
+    """
+    engine = engine_factory(instruments=((BAZ, EUR),))
+
+    engine.limit("ask", 5, 101, tid=1, instrument=BAZ)
+    taker = engine.limit("bid", 5, 101, tid=2, instrument=BAZ)
+
+    assert taker.fulfilled == 5
+
+    # The same four movements as a FAKE/USD trade, in the pair this
+    # instrument settles in.
+    assert engine.balance(2, BAZ) == approx_money(5)
+    assert engine.balance(2, EUR) == approx_money(-505)
+    assert engine.balance(1, BAZ) == approx_money(-5)
+    assert engine.balance(1, EUR) == approx_money(505)
+
+    # Nothing reaches the other instrument or the currency it settles in.
+    for tid in (1, 2):
+        assert engine.balance(tid, FAKE) == approx_money(0)
+        assert engine.balance(tid, USD) == approx_money(0)
 
 
 # --------------------------------------------------------------------------

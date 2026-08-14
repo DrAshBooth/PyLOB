@@ -18,6 +18,12 @@ that measurement.
 INSTRUMENT = "FAKE"
 CURRENCY = "USD"
 
+#: A second instrument settling in a second currency, loaded by the one test
+#: that has to show the charge *choosing* a currency rather than always
+#: landing in the only one there is.
+OTHER_INSTRUMENT = "BAZ"
+OTHER_CURRENCY = "EUR"
+
 
 def _charged(commissioned, control, tid, instrument=CURRENCY):
     """What the schedule cost `tid`: the balance the control kept and this one did not.
@@ -211,6 +217,40 @@ def test_usd_instrument_charges_usd(engine_factory, approx_money):
     # is exactly what the same trade produced with no schedule at all.
     assert _charged(engine, control, tid=2, instrument=CURRENCY) == approx_money(2.5)
     assert engine.balance(2, INSTRUMENT) == approx_money(control.balance(2, INSTRUMENT))
+
+
+def test_a_eur_instrument_charges_eur(engine_factory, approx_money):
+    """Settles in the instrument's currency / the currency of the traded instrument.
+
+    That clause has no scenario of its own. The scenario above pins the
+    USD case, and an engine that debited one fixed currency would pass it,
+    because a one-instrument engine has only one currency to debit. A second
+    instrument settling in EUR gives the charge somewhere else it could
+    wrongly land: the trade is in that instrument, so the commission is EUR,
+    and the first instrument's USD never moves.
+    """
+    options = dict(instruments=((OTHER_INSTRUMENT, OTHER_CURRENCY),))
+    engine = engine_factory(
+        commissions=dict(min=2.5, max_pct=1, per_unit=0.01), **options
+    )
+    control = engine_factory(**options)
+
+    def script(book):
+        book.limit("ask", 5, 101, tid=1, instrument=OTHER_INSTRUMENT)
+        return book.limit("bid", 5, 101, tid=2, instrument=OTHER_INSTRUMENT)
+
+    taker = _mirror(script, engine, control)
+
+    assert taker.commission == approx_money(2.5)
+    assert _charged(engine, control, tid=2, instrument=OTHER_CURRENCY) == approx_money(
+        2.5
+    )
+    # And nowhere else: not out of the USD the default instrument settles in,
+    # and not out of the position the trade itself created.
+    assert _charged(engine, control, tid=2, instrument=CURRENCY) == approx_money(0.0)
+    assert engine.balance(2, OTHER_INSTRUMENT) == approx_money(
+        control.balance(2, OTHER_INSTRUMENT)
+    )
 
 
 # --------------------------------------------------------------------------

@@ -33,6 +33,12 @@ def engine_factory(tmp_path):
         the trader ids allowed to match their own resting orders -- an
         iterable of ids, or True for all (default: none)
     `tick_size`, `instrument`, `currency`
+        the tick, and the default instrument every surface call means when it
+        names none
+    `instruments`
+        further `(symbol, currency)` pairs to declare beside the default one,
+        for a scenario that has to distinguish "for an instrument" from "for
+        the book" (default: none, i.e. a one-instrument engine)
 
     All engines are closed at teardown.
     """
