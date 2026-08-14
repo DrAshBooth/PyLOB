@@ -58,6 +58,7 @@ Costs, in the number of price levels L on a side and orders N in a level:
     step over k gated orders    O(k) per level, O(1) when the whole level is
                                 the taker's own (lob-rp4)
     volume at price             O(L)   -- levels, not orders: `volume` is cached
+    depth ladder                O(L log L) -- levels again; the sort is the cost
     snapshot                    O(L log L + N)
 
 Two heaps rather than one sorted structure because matching only ever asks for
@@ -185,7 +186,10 @@ true.
 **Most operations emit.** `submit`, `cancelOrder`, `modifyOrder`,
 `processOrder`, `configure_instrument` and `configure_trader` each emit the
 event that describes what they did, and a replayer re-issues those events as
-the same calls (`events`, "Replay").
+the same calls (`events`, "Replay"). `cancel` and `modify` -- the same two
+operations addressed by identifier and keyword -- emit nothing of their own:
+they delegate, so there is one behaviour under two names rather than two
+behaviours to keep in step.
 
 **A mutation no event can express is refused, not performed quietly.**
 `configure_instrument(symbol, None)` used to withdraw an instrument's currency
@@ -1030,11 +1034,13 @@ class OrderBook:
     operations
         `submit`, `cancelOrder`, `modifyOrder`, and `processOrder` -- the
         legacy dict-quote shape, kept because the public API is a standing
-        constraint
+        constraint -- and `cancel`/`modify`, the last two addressed by
+        identifier and keyword, which delegate to them
     the store
         `create_order`, `order`, `orders`
     the book
-        `book`, `rest`, `match`, `snapshot`, the `get*` queries, and `print`
+        `book`, `rest`, `match`, `snapshot`, `depth`, the `get*` queries, and
+        `print`
     the ledgers
         `balance`, `holdings`
     the counters
@@ -1538,6 +1544,11 @@ class OrderBook:
 
         `side` may be `None` to address the order by identifier alone.
 
+        `cancel` is this operation spelled by keyword -- `cancel(idNum,
+        side=..., timestamp=...)` -- and delegates here, so the refusals above
+        are the only copy of themselves and either spelling records the same
+        `Cancelled`.
+
         Commission already charged on the filled part stays charged
         (`commissions`: cancelling does not refund), which is why `Cancelled`
         carries no commission field: nothing moves.
@@ -1594,6 +1605,11 @@ class OrderBook:
         `Modified` is emitted after the change and before any fills the new
         price causes, so a sink applying events in order never sees a fill
         against a stale price.
+
+        `modify` is this operation spelled by keyword -- `modify(idNum,
+        qty=..., price=..., timestamp=...)`, returning `(order, trades)` as
+        `submit` does -- and delegates here, so every rule above is the only
+        copy of itself and either spelling records the same stream.
         """
         order = self.require_order(idNum)
         side = _required(orderUpdate, "side", idNum)
@@ -1672,6 +1688,80 @@ class OrderBook:
         if verbose:
             _report(trades, order.tid)
         return trades, orderUpdate
+
+    def cancel(
+        self,
+        idNum: int,
+        *,
+        side: Side | str | None = None,
+        timestamp: float | None = None,
+    ) -> Order:
+        """`cancelOrder` addressed by identifier and keyword. Returns the order.
+
+        The identifier comes first and everything else is keyword-only, so the
+        misbinding this spelling exists to remove -- an identifier bound to the
+        `side` that `cancelOrder(side, idNum)` takes first -- is not
+        expressible. The clock is `timestamp=`, spelled as `submit` spells it.
+
+        `side` is optional and omitting it addresses the order by identifier
+        alone; naming one the order does not have raises, as it does through
+        the other spelling.
+
+        It delegates and does nothing else. Every refusal, the state change and
+        the `Cancelled` all stay in `cancelOrder`, so `order-lifecycle` has one
+        behaviour under two names and a stream cannot say which was called.
+        """
+        return self.cancelOrder(side, idNum, timestamp)
+
+    def modify(
+        self,
+        idNum: int,
+        *,
+        qty: int | None = None,
+        price: float | None = None,
+        side: Side | str | None = None,
+        timestamp: float | None = None,
+    ) -> tuple[Order, list[Trade]]:
+        """`modifyOrder` addressed by identifier and keyword. Returns (order, trades).
+
+        The return shape is `submit`'s rather than `modifyOrder`'s `(trades,
+        orderUpdate)`: the two things a caller wants after changing an order --
+        the order, and what the change traded -- come back in the shape and the
+        order a submission already hands them back. The clock is `timestamp=`,
+        spelled as `submit` spells it. `side` is optional and omitting it
+        addresses the order by identifier alone.
+
+        An omitted `qty` or `price` leaves that one alone, which is what
+        `modifyOrder` reads a `None` as. **Naming neither raises.** This
+        spelling cannot tell an omitted argument from one passed as `None`, so
+        the alternative is a `modify(idNum)` that changes nothing, advances the
+        clock and writes a `Modified` into every recorded log -- and refusing is
+        the same call the dict form makes when an update is malformed, in the
+        stricter direction. `modifyOrder({side, qty: None, price: None})` stays
+        legal and stays a no-op modification: this is a rule of the new
+        spelling, not a change to the old one.
+
+        Beyond that refusal it delegates and does nothing else. The clamp rule,
+        the reprioritization rule and the order the validations run in stay in
+        `modifyOrder`, so a session driven through either spelling records the
+        same stream.
+        """
+        if qty is None and price is None:
+            raise InvalidOrder(
+                "modifying order %r needs a qty or a price: naming neither "
+                "would record a modification that changes nothing" % (idNum,)
+            )
+        order = self.require_order(idNum)
+        trades, _ = self.modifyOrder(
+            idNum,
+            {
+                "side": order.side if side is None else side,
+                "qty": qty,
+                "price": price,
+            },
+            timestamp,
+        )
+        return order, trades
 
     # -- matching ----------------------------------------------------------
 
@@ -2043,6 +2133,52 @@ class OrderBook:
         grid point it names.
         """
         return self.book(instrument).side(side).volume_at(self.quantize(price))
+
+    def depth(
+        self, instrument: str, side: Side | str, levels: int | None = None
+    ) -> tuple[tuple[float, int], ...]:
+        """The aggregated price ladder for one side: (price, volume), best first.
+
+        One pair per distinct price at which orders rest -- the price, and the
+        total unfulfilled quantity resting at exactly that price. The order is
+        `snapshot`'s order and matching's order, best price first, because all
+        three read the same levels: one rule, three queries.
+
+        `levels` bounds the answer to the best N; `None` is the whole ladder. A
+        bound that is not a positive whole number raises rather than answering,
+        because "the best zero levels" and "the whole ladder" are the two things
+        `0` could have meant and neither is worth guessing at -- ask with `None`
+        for the second.
+
+        A side with nothing resting answers an empty ladder and does not raise:
+        an empty book is a book, and every other read-side query says so too.
+
+        The volume is the level's own running total (`PriceLevel`), so a ladder
+        costs the sort over prices and nothing per order. Levels aggregate by
+        exact price and every resting price is already on the tick grid, so no
+        level can be split in two by a rounding difference.
+
+        `book-queries` requires this to agree with the queries taken beside it,
+        and it agrees by construction rather than by arrangement: the ends of
+        the ladder are `getBest*` and `getWorst*`, its volumes accumulated from
+        the best level down are `getVolumeAtPrice` at each of those prices, and
+        its pairs are `snapshot`'s remainders aggregated by price.
+        """
+        if levels is not None:
+            if not isinstance(levels, int) or isinstance(levels, bool):
+                raise InvalidOrder(
+                    "levels must be an integer, or None for the whole ladder, "
+                    "got %r" % (levels,)
+                )
+            if levels < 1:
+                raise InvalidOrder(
+                    "levels must be at least 1, got %r: pass None for the whole "
+                    "ladder" % (levels,)
+                )
+        ladder = self.book(instrument).side(side).levels()
+        if levels is not None:
+            ladder = ladder[:levels]
+        return tuple((level.price, level.volume) for level in ladder)
 
     def getLastPrice(self, instrument: str) -> float | None:
         """The most recent trade price, or None before the first trade."""

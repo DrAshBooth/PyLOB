@@ -7,6 +7,14 @@ what an engine has to do, not what any engine does today.
 Fixtures come from `tests/acceptance/conftest.py`: `engine` is an empty book
 reached through the engine-neutral adapter surface, never through an engine's
 own API, so a scenario here states a contract rather than an implementation.
+
+The keyword-surface requirements below are about a library offering *two*
+spellings of one operation, so their tests need to say which spelling they
+mean. `engine.cancel(..., keyword=True)` and `engine.modify(..., keyword=True)`
+are that switch: which spelling is which, and what each names its clock, is
+engine knowledge and lives in `tests/harness/` with the rest of it. The
+scenarios that assert on what was *recorded* rather than on the book take
+`engine_factory(capture=True)` and read `engine.recorded()`.
 """
 
 import pytest
@@ -291,3 +299,211 @@ def test_non_decimal_tick(engine_factory):
 
     assert resting.price == pytest.approx(100.05)
     assert [entry.price for entry in engine.snapshot("bid")] == [pytest.approx(100.05)]
+
+
+# --------------------------------------------------------------------------
+# Requirement: Cancel and modify are reachable by identifier and keyword
+# --------------------------------------------------------------------------
+
+
+def test_cancelling_by_identifier_alone(engine_factory):
+    """Cancel and modify are reachable by identifier and keyword / Cancelling by identifier alone.
+
+    Three orders share a price, so an operation that took the identifier for
+    something else -- a side, a position in the queue -- would reach the wrong
+    one of them rather than nothing at all.
+    """
+    engine = engine_factory(capture=True)
+    first = engine.limit("bid", 5, 100, tid=100)
+    doomed = engine.limit("bid", 5, 100, tid=101)
+    third = engine.limit("bid", 5, 100, tid=102)
+
+    engine.cancel(doomed, side=None, keyword=True)
+
+    assert doomed.cancelled and not doomed.resting
+    assert not first.cancelled and first.resting
+    assert not third.cancelled and third.resting
+    assert [entry.idNum for entry in engine.snapshot("bid")] == [
+        first.idNum,
+        third.idNum,
+    ]
+
+    # ... and the stream carries the cancellation the other spelling emits:
+    # the caller's own cancel, not the engine cancelling a remainder of its
+    # own, which is the distinction a replay re-issues on.
+    cancellations = [
+        event for event in engine.recorded() if event["kind"] == "cancelled"
+    ]
+    assert [(event["idNum"], event["reason"]) for event in cancellations] == [
+        (doomed.idNum, "requested")
+    ]
+
+
+def _mixed_workload(engine, keyword):
+    """Submissions, cancellations and modifications, in one spelling or the other.
+
+    Every shape the two operations have: a modification that raises quantity
+    and so re-queues, one that lowers it and so does not, a reprice of an order
+    that has *already traded* with its quantity left unnamed -- which is where
+    "leave that one alone" and "leave what is left of it" come apart, and so
+    the one modification a second copy of the rule is likeliest to get wrong --
+    a cancel addressed by identifier alone and one that names the side, and an
+    arrival that trades against what a reprice moved.
+    """
+    resting = engine.limit("ask", 5, 101, tid=1)
+    deep = engine.limit("ask", 7, 102, tid=2)
+    bid = engine.limit("bid", 4, 99, tid=3)
+
+    engine.modify(bid, qty=6, keyword=keyword)
+    engine.modify(bid, qty=5, keyword=keyword)
+    engine.limit("ask", 2, 99, tid=5)  # takes 2 of the bid, leaving 3
+    engine.modify(bid, price=98, keyword=keyword)
+    engine.modify(deep, price=101.5, keyword=keyword)
+    engine.cancel(resting, side=None, keyword=keyword)
+    engine.limit("bid", 3, 102, tid=4)  # crosses the repriced ask
+    engine.cancel(bid, side="bid", keyword=keyword)
+
+
+def test_either_spelling_records_the_same_stream(engine_factory):
+    """Cancel and modify are reachable by identifier and keyword / Either spelling records the same stream.
+
+    Against a real recorded stream, event for event, rather than by reading
+    the two implementations: a keyword spelling that re-derived the clamp rule
+    or the re-queueing rule instead of delegating would pass every scenario
+    written about its *own* behaviour and fail here, which is the only place
+    the second copy would show.
+    """
+    keyworded = engine_factory(capture=True)
+    positional = engine_factory(capture=True)
+
+    _mixed_workload(keyworded, keyword=True)
+    _mixed_workload(positional, keyword=False)
+
+    recorded = keyworded.recorded()
+    assert recorded == positional.recorded()
+
+    # The comparison is only worth what the workload put in it: two identical
+    # empty streams would pass the line above.
+    kinds = {event["kind"] for event in recorded}
+    assert {"accepted", "modified", "cancelled", "filled"} <= kinds
+    requeued = {
+        event["reprioritized"] for event in recorded if event["kind"] == "modified"
+    }
+    assert requeued == {True, False}, "both halves of the priority rule ran"
+
+
+def test_a_side_that_is_not_the_orders_still_raises(engine):
+    """Cancel and modify are reachable by identifier and keyword / A side that is not the order's still raises."""
+    resting = engine.limit("bid", 5, 100, tid=100)
+    before = engine.snapshot("bid")
+
+    with pytest.raises(Exception):
+        engine.cancel(resting, side="ask", keyword=True)
+
+    assert not resting.cancelled
+    assert resting.resting
+    assert engine.snapshot("bid") == before
+
+
+def test_an_unknown_identifier_still_raises_on_the_keyword_surface(engine):
+    """Cancel and modify are reachable by identifier and keyword / An unknown identifier still raises."""
+    resting = engine.limit("bid", 5, 100, tid=100)
+    before = engine.snapshot("bid")
+
+    with pytest.raises(Exception):
+        engine.cancel(resting.idNum + 4242, side=None, keyword=True)
+    with pytest.raises(Exception):
+        engine.modify(resting.idNum + 4242, qty=3, side=None, keyword=True)
+
+    assert engine.snapshot("bid") == before
+
+
+# --------------------------------------------------------------------------
+# Requirement: The keyword operations name the clock once
+# --------------------------------------------------------------------------
+
+
+def test_one_name_across_the_three_operations(engine_factory):
+    """The keyword operations name the clock once / One name across the three operations.
+
+    The "same keyword name" half of the scenario is enforced where the name is
+    known: `tests/harness/` passes the clock to submission, modification and
+    cancellation under one keyword, so a surface that spelled any of the three
+    differently would not reach this assertion at all. What is left to assert
+    here is the other half -- that each emitted event carries the value its own
+    call supplied, rather than a clock the engine kept for itself.
+
+    The three values are far apart and not consecutive on purpose: an engine
+    that dropped the clock it was handed and advanced its own by one would
+    land on the right answer for stamps chosen 1000, 1001, 1002.
+    """
+    engine = engine_factory(capture=True)
+
+    order = engine.limit("bid", 5, 100, tid=100, idNum=11, timestamp=1000.0)
+    engine.modify(order, qty=3, timestamp=1010.0, keyword=True)
+    engine.cancel(order, side=None, timestamp=1025.0, keyword=True)
+
+    stamped = {
+        event["kind"]: event["timestamp"]
+        for event in engine.recorded()
+        if event["kind"] in ("accepted", "modified", "cancelled")
+    }
+    assert stamped == {"accepted": 1000.0, "modified": 1010.0, "cancelled": 1025.0}
+
+
+# --------------------------------------------------------------------------
+# Requirement: A modification names what it changes
+# --------------------------------------------------------------------------
+
+
+def test_an_omitted_field_is_left_alone(engine):
+    """A modification names what it changes / An omitted field is left alone."""
+    resting = engine.limit("bid", 5, 100, tid=100)
+
+    engine.modify(resting, qty=3, keyword=True)
+
+    assert resting.qty == 3
+    assert resting.price == 100
+    assert resting.resting
+    # "and it does not become a market order": an unpriced order would cross
+    # every level and never rest, so both halves of this matter.
+    assert resting.state.order_type == "limit"
+    assert [entry.price for entry in engine.snapshot("bid")] == [100]
+
+
+def test_a_modification_that_names_nothing_raises(engine_factory):
+    """A modification names what it changes / A modification that names nothing raises."""
+    engine = engine_factory(capture=True)
+    resting = engine.limit("bid", 5, 100, tid=100)
+    before = engine.snapshot("bid")
+    quiet = len(engine.recorded())
+
+    with pytest.raises(Exception):
+        engine.modify(resting, keyword=True)
+
+    assert resting.qty == 5
+    assert resting.price == 100
+    assert resting.resting
+    assert engine.snapshot("bid") == before
+    # "and no event is emitted": a modification that changed nothing would
+    # still cost every recorded session a row, which is the reason to refuse it
+    # rather than apply it.
+    assert len(engine.recorded()) == quiet
+
+
+def test_clamping_and_priority_rules_are_unchanged(engine):
+    """A modification names what it changes / Clamping and priority rules are unchanged.
+
+    The same scenario as "Quantity reduced below fills clamps" above, asked of
+    the keyword spelling: "exactly as the existing modify would have done".
+    """
+    resting = engine.limit("bid", 10, 100, tid=100)
+    engine.limit("ask", 6, 100, tid=101)
+    assert resting.fulfilled == 6
+
+    engine.modify(resting, qty=4, keyword=True)
+
+    assert resting.qty == 6
+    assert resting.fulfilled == 6
+    assert not resting.resting
+    assert engine.snapshot("bid") == ()

@@ -10,8 +10,9 @@ orders and observing the result.
 operations
     `limit`, `market`, `cancel`, `modify`, `reopen`, `close`
 observation
-    `order_state`, `snapshot`, `trades`, `best`, `worst`, `volume_at`,
-    `last_price`, `balance`
+    `order_state`, `snapshot`, `depth`, `trades`, `best`, `worst`,
+    `volume_at`, `last_price`, `balance`, and `recorded` for the sessions
+    built with `capture=True`
 
 The suites never touch `processOrder`'s dict quotes or the engine's own
 objects; they call `engine.limit(...)`, read `order.fulfilled`, ask for

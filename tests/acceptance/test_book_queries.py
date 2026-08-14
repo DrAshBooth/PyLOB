@@ -21,6 +21,8 @@ engine holding it, so those tests take `engine_factory(instruments=...)` and
 ask their queries of one instrument while a second one is loaded.
 """
 
+import pytest
+
 #: The second instrument those tests load. It sorts alphabetically *before*
 #: the default "FAKE", so a query that pooled the books, or answered from
 #: whichever one it reached first, would answer with this one.
@@ -294,3 +296,157 @@ def test_snapshot_and_queries_are_scoped_to_one_instrument(engine_factory):
         == sum(entry.available for entry in other_bids)
         == 7
     )
+
+
+# --------------------------------------------------------------------------
+# Requirement: Depth is available as an aggregated price ladder
+# --------------------------------------------------------------------------
+
+
+def test_orders_at_one_price_aggregate_into_one_level(engine):
+    """Depth is available as an aggregated price ladder / Orders at one price aggregate into one level.
+
+    Both sides, because "best price first" means opposite directions on the
+    two of them: a ladder that always sorted ascending would satisfy the bid
+    side of this and reverse the ask side of it.
+    """
+    engine.limit("bid", 5, 99, tid=1)
+    engine.limit("bid", 3, 99, tid=2)
+    engine.limit("bid", 4, 98, tid=3)
+
+    assert engine.depth("bid") == ((99, 8), (98, 4))
+
+    engine.limit("ask", 6, 101, tid=4)
+    engine.limit("ask", 2, 101, tid=5)
+    engine.limit("ask", 7, 102, tid=100)
+
+    assert engine.depth("ask") == ((101, 8), (102, 7))
+
+
+def test_partial_fills_are_excluded_from_the_levels_volume(engine):
+    """Depth is available as an aggregated price ladder / Partial fills are excluded from the level's volume."""
+    engine.limit("bid", 10, 99, tid=1)
+    engine.limit("ask", 4, 99, tid=2)  # takes 4 of the 10
+
+    assert engine.depth("bid") == ((99, 6),)
+
+
+def test_the_ladder_is_bounded_to_the_best_levels(engine):
+    """Depth is available as an aggregated price ladder / The ladder is bounded to the best levels."""
+    engine.limit("bid", 5, 99, tid=1)
+    engine.limit("bid", 4, 98, tid=2)
+    engine.limit("bid", 3, 97, tid=3)
+
+    assert engine.depth("bid", levels=2) == ((99, 5), (98, 4))
+
+    # A bound wider than the book is the whole book, not an error and not
+    # padding: "the best N" is a bound, not a length.
+    assert engine.depth("bid", levels=9) == engine.depth("bid")
+
+
+def test_empty_side_yields_an_empty_ladder(engine):
+    """Depth is available as an aggregated price ladder / Empty side yields an empty ladder."""
+    cancelled = engine.limit("bid", 5, 99, tid=1)
+    engine.limit("ask", 5, 101, tid=2)
+
+    engine.cancel(cancelled)
+    engine.limit("bid", 5, 101, tid=3)  # fills the ask in full, and itself
+
+    assert engine.depth("bid") == ()
+    assert engine.depth("ask") == ()
+    assert engine.depth("bid", levels=3) == ()
+
+
+@pytest.mark.parametrize("bound", [0, -1])
+def test_a_non_positive_bound_raises(engine, bound):
+    """Depth is available as an aggregated price ladder / A non-positive bound raises."""
+    engine.limit("bid", 5, 99, tid=1)
+
+    # An `Exception`, not a `BaseException`: a library error the caller can
+    # catch, never a process exit.
+    with pytest.raises(Exception):
+        engine.depth("bid", levels=bound)
+
+    assert engine.depth("bid") == ((99, 5),)
+
+
+# --------------------------------------------------------------------------
+# Requirement: The ladder agrees with the other read-side queries
+# --------------------------------------------------------------------------
+
+
+def _laddered(engine):
+    """Several levels a side, two orders sharing a price, a partial fill, a cancel.
+
+    The book the agreement scenarios below are taken against. It is built so
+    that no single relation could hold by accident: the levels are uneven, one
+    of them holds two orders, one holds an order that has already traded, and
+    one price was occupied and then vacated.
+    """
+    engine.limit("bid", 5, 99, tid=1)
+    engine.limit("bid", 3, 99, tid=2)
+    engine.limit("bid", 7, 98, tid=3)
+    engine.limit("bid", 4, 97, tid=4)
+    engine.limit("ask", 6, 101, tid=5)
+    engine.limit("ask", 2, 101, tid=100)
+    engine.limit("ask", 9, 103, tid=101)
+
+    vacated = engine.limit("bid", 2, 96, tid=102)
+    engine.cancel(vacated)
+
+    # Takes 2 of the ask at 101 that trader 5 rests, leaving 4 of it there.
+    engine.limit("bid", 2, 101, tid=103)
+
+
+def test_the_ends_of_the_ladder_are_the_ends_of_the_side(engine):
+    """The ladder agrees with the other read-side queries / The ends of the ladder are the ends of the side."""
+    _laddered(engine)
+
+    for side in ("bid", "ask"):
+        ladder = engine.depth(side)
+
+        assert ladder, "the scripted book leaves both sides occupied"
+        assert ladder[0][0] == engine.best(side)
+        assert ladder[-1][0] == engine.worst(side)
+
+
+def test_cumulative_depth_equals_volume_at_price(engine):
+    """The ladder agrees with the other read-side queries / Cumulative depth equals volume at price.
+
+    The relation `tests/test_sink_projections.py` already checks by hand
+    against the SQL projection, asked of the engine's own ladder: volume at a
+    price is the marketable question, so accumulating the ladder from the best
+    level down has to answer it at each of the ladder's own prices.
+    """
+    _laddered(engine)
+
+    for side in ("bid", "ask"):
+        running = 0
+        for price, volume in engine.depth(side):
+            running += volume
+            assert running == engine.volume_at(side, price)
+
+        # ... and the whole side, which is the last running total, is what an
+        # order priced at the worst level could take.
+        assert running == engine.volume_at(side, engine.worst(side))
+
+
+def test_the_ladder_is_the_snapshot_aggregated(engine):
+    """The ladder agrees with the other read-side queries / The ladder is the snapshot, aggregated.
+
+    "levels and order alike": the snapshot is in matching-priority order, so
+    orders sharing a price are already adjacent in it, and folding each run
+    into one pair has to reproduce the ladder as a sequence -- not merely as a
+    set of pairs that happen to be present.
+    """
+    _laddered(engine)
+
+    for side in ("bid", "ask"):
+        aggregated = []
+        for entry in engine.snapshot(side):
+            if aggregated and aggregated[-1][0] == entry.price:
+                aggregated[-1] = (entry.price, aggregated[-1][1] + entry.available)
+            else:
+                aggregated.append((entry.price, entry.available))
+
+        assert engine.depth(side) == tuple(aggregated)

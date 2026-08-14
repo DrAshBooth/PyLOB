@@ -39,6 +39,10 @@ def engine_factory(tmp_path):
         further `(symbol, currency)` pairs to declare beside the default one,
         for a scenario that has to distinguish "for an instrument" from "for
         the book" (default: none, i.e. a one-instrument engine)
+    `capture`
+        keep the recorded event stream in memory as well, for the scenarios
+        that assert on what was recorded rather than on the book (default:
+        off). `adapter.recorded()` is what reads it.
 
     All engines are closed at teardown.
     """

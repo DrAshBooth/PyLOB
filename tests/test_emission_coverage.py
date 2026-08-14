@@ -590,6 +590,17 @@ SURFACE = {
     "processOrder": (EMITS, "submit in the legacy dict shape"),
     "cancelOrder": (EMITS, "Cancelled(REQUESTED)"),
     "modifyOrder": (EMITS, "Modified, then any Filled the new price causes"),
+    "cancel": (
+        EMITS,
+        "cancelOrder addressed by identifier and keyword. It delegates, so it "
+        "is classified by what its delegate emits -- and if it ever stopped "
+        "delegating, this is where the second copy would show up",
+    ),
+    "modify": (
+        EMITS,
+        "modifyOrder addressed by identifier and keyword, delegating for the "
+        "same reason and classified the same way",
+    ),
     "create_order": (EMITS, "Accepted -- but see NOT_REPLAY_COHERENT"),
     "match": (EMITS, "Filled per execution"),
     # -- refusals: mutations no event can express (lob-9fu)
@@ -637,6 +648,7 @@ SURFACE = {
     "getBestAsk": (QUERY, "book-queries"),
     "getWorstAsk": (QUERY, "book-queries"),
     "getVolumeAtPrice": (QUERY, "book-queries"),
+    "depth": (QUERY, "book-queries: the aggregated price ladder"),
     "getLastPrice": (QUERY, "book-queries"),
     "balance": (QUERY, "trader-balances"),
     "holdings": (QUERY, "trader-balances"),
@@ -713,6 +725,13 @@ RECIPES = {
         b.snapshot(INSTRUMENT, "bid")[0].idNum,
         dict(side="bid", qty=None, price=100.0),
     ),
+    # The two recipes above, in the keyword spelling and on the same order, so
+    # a divergence between the two spellings shows up as a divergence between
+    # neighbouring rows of this table.
+    "cancel": lambda b: lambda: b.cancel(b.snapshot(INSTRUMENT, "bid")[0].idNum),
+    "modify": lambda b: lambda: b.modify(
+        b.snapshot(INSTRUMENT, "bid")[0].idNum, price=100.0
+    ),
     "create_order": lambda b: lambda: _accepted(b),
     "match": _match_recipe,
     "setLastPrice": lambda b: lambda: b.setLastPrice(INSTRUMENT, 999.0),
@@ -737,6 +756,7 @@ RECIPES = {
     "getBestAsk": lambda b: lambda: b.getBestAsk(INSTRUMENT),
     "getWorstAsk": lambda b: lambda: b.getWorstAsk(INSTRUMENT),
     "getVolumeAtPrice": lambda b: lambda: b.getVolumeAtPrice(INSTRUMENT, "bid", 99.0),
+    "depth": lambda b: lambda: b.depth(INSTRUMENT, "bid"),
     "getLastPrice": lambda b: lambda: b.getLastPrice(INSTRUMENT),
     "balance": lambda b: lambda: b.balance(1, CURRENCY),
     "holdings": lambda b: lambda: list(b.holdings()),

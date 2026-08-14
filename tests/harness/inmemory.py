@@ -8,8 +8,11 @@ engine wants its own module here, against `harness.surface`, and a params
 list back over the two.
 """
 
+from dataclasses import asdict
+
 from PyLOB import replay
 from PyLOB.engine import OrderBook
+from PyLOB.sinks import ListSink
 from PyLOB.sinks.sqlite import SQLiteSink, read_events
 
 from .surface import (
@@ -28,6 +31,39 @@ from .surface import (
 )
 
 
+class _Recorder:
+    """A `ListSink` teed onto the session's real sink, for `recorded()`.
+
+    An engine takes one sink, and the acceptance engines already spend theirs
+    on the `SQLiteSink` that `reopen()` reloads from. A suite that has to read
+    the stream back therefore needs the stream to go two places at once, and
+    this is the whole of that: it forwards each event on, in order, and keeps
+    a copy. It reads nothing and calls nothing back, which is the contract
+    `events.EventSink` puts on a sink and the reason this is not simply a
+    second `OrderBook` reference.
+
+    Off by default -- `build_inmemory(capture=True)` -- so a suite that never
+    asks for the stream pays nothing for it.
+    """
+
+    __slots__ = ("_sink", "_captured")
+
+    def __init__(self, sink):
+        self._sink = sink
+        self._captured = ListSink()
+
+    def consume(self, event, /):
+        self._captured.consume(event)
+        self._sink.consume(event)
+
+    def close(self):
+        self._sink.close()
+
+    @property
+    def events(self):
+        return self._captured.events
+
+
 class InMemoryAdapter:
     """`PyLOB.engine.OrderBook` behind the engine-neutral acceptance surface.
 
@@ -40,7 +76,7 @@ class InMemoryAdapter:
     stream, not a book on disk.
     """
 
-    def __init__(self, book, db_path, instrument, currency, tick_size):
+    def __init__(self, book, db_path, instrument, currency, tick_size, recorder=None):
         self.book = book
         self.db_path = db_path
         self.instrument = instrument
@@ -48,6 +84,7 @@ class InMemoryAdapter:
         self.tick_size = tick_size
         self._trades = []
         self._reloads = 0
+        self._recorder = recorder
 
     # -- operations --------------------------------------------------------
 
@@ -59,14 +96,58 @@ class InMemoryAdapter:
         """Submit a market order; return an `OrderRef`."""
         return self._submit("market", side, qty, tid, price=None, **kwargs)
 
-    def cancel(self, order, side=UNSET):
-        """Cancel an order, addressed by `OrderRef` or by raw identifier."""
-        idNum, side = self._target(order, side)
-        self.book.cancelOrder(side, idNum)
+    def cancel(self, order, side=UNSET, timestamp=None, keyword=False):
+        """Cancel an order, addressed by `OrderRef` or by raw identifier.
 
-    def modify(self, order, qty=UNSET, price=UNSET, side=UNSET, tid=UNSET):
-        """Modify an order; return the executions the modification produced."""
+        `side=None` names no side, so the order is addressed by identifier
+        alone; leaving it unsupplied takes the side from the reference.
+
+        `keyword=True` reaches the library's keyword-addressed spelling rather
+        than its positional one -- the two operations `order-lifecycle`
+        requires to be indistinguishable in the recorded stream. Which
+        spelling is which, and what each names its clock, is engine knowledge
+        and lives here rather than in a suite: an engine that renamed the
+        keyword surface's `timestamp` would break this line, which is the
+        point of writing it out.
+        """
         idNum, side = self._target(order, side)
+        if keyword:
+            self.book.cancel(idNum, side=side, timestamp=timestamp)
+        else:
+            self.book.cancelOrder(side, idNum, timestamp)
+
+    def modify(
+        self,
+        order,
+        qty=UNSET,
+        price=UNSET,
+        side=UNSET,
+        tid=UNSET,
+        timestamp=None,
+        keyword=False,
+    ):
+        """Modify an order; return the executions the modification produced.
+
+        `timestamp` and `keyword` mean what they mean for `cancel`. The
+        keyword spelling reads an unsupplied `qty` or `price` as "leave that
+        one alone" itself, so this passes on only what it was given; the
+        positional one requires all three fields, so this fills the missing
+        ones in from the order's current state. Both are "leave it alone", and
+        the two produce the same event -- which is a claim a suite tests
+        rather than one this docstring settles.
+        """
+        idNum, side = self._target(order, side)
+        if keyword:
+            named = {}
+            if qty is not UNSET:
+                named["qty"] = qty
+            if price is not UNSET:
+                named["price"] = price
+            _, trades = self.book.modify(
+                idNum, side=side, timestamp=timestamp, **named
+            )
+            return self._record(trades)
+
         state = self.order_state(idNum)
         if qty is UNSET:
             qty = state.qty if state else None
@@ -76,7 +157,7 @@ class InMemoryAdapter:
             tid = self._owner(idNum)
 
         trades, _ = self.book.modifyOrder(
-            idNum, dict(side=side, qty=qty, price=price, tid=tid)
+            idNum, dict(side=side, qty=qty, price=price, tid=tid), timestamp
         )
         return self._record(trades)
 
@@ -94,7 +175,10 @@ class InMemoryAdapter:
         did.
 
         The reloaded session records to a new file, since the log's `seq` is
-        its primary key and a second session cannot append to the first.
+        its primary key and a second session cannot append to the first. A
+        capturing adapter gets a fresh capture with it: `recorded()` means what
+        *this* session recorded, and after a reload that is the replay's stream
+        and not the stream it was replayed from.
         """
         self.book.close()
 
@@ -104,7 +188,11 @@ class InMemoryAdapter:
             "%s.reload%d.db" % (self.db_path.stem, self._reloads)
         )
 
-        self.book, trades = replay(events, sink=SQLiteSink(self.db_path))
+        sink = SQLiteSink(self.db_path)
+        if self._recorder is not None:
+            self._recorder = _Recorder(sink)
+            sink = self._recorder
+        self.book, trades = replay(events, sink=sink)
         self._trades = list(trades)
         return self
 
@@ -171,6 +259,31 @@ class InMemoryAdapter:
 
     def volume_at(self, side, price, instrument=None):
         return self.book.getVolumeAtPrice(instrument or self.instrument, side, price)
+
+    def depth(self, side, levels=None, instrument=None):
+        """The aggregated price ladder for `side`: (price, volume), best first.
+
+        `levels` bounds it to the best N and is passed through untouched, so a
+        suite can hand it a bound the contract says has to be refused.
+        """
+        return self.book.depth(instrument or self.instrument, side, levels)
+
+    def recorded(self):
+        """Every event this session recorded, as plain dicts, in stream order.
+
+        `kind` plus the event's own fields, so a suite can compare two recorded
+        streams, or read the stamp an operation put on its event, without
+        importing an engine's event classes. Needs `capture=True` at build
+        time, because the stream has to be teed to get here.
+        """
+        assert self._recorder is not None, (
+            "this engine is not capturing its stream: build it with "
+            "engine_factory(capture=True)"
+        )
+        return tuple(
+            dict(kind=type(event).KIND, **asdict(event))
+            for event in self._recorder.events
+        )
 
     def last_price(self, instrument=None):
         return self.book.getLastPrice(instrument or self.instrument)
@@ -247,6 +360,7 @@ def build_inmemory(
     currency=CURRENCY,
     instruments=(),
     tick_size=DEFAULT_TICK,
+    capture=False,
 ):
     """Build the in-memory engine (ADR-0001, epic lob-5rt), recording to `db_path`.
 
@@ -263,11 +377,17 @@ def build_inmemory(
     an `InstrumentConfigured` -- which is what makes `reopen()` able to
     rebuild every book, charging the same commissions and settling in the
     same currencies.
+
+    `capture` tees the recorded stream into memory as well, which is what
+    `InMemoryAdapter.recorded` reads. Off by default: a suite that never asks
+    for the stream should not pay a list append per event for it.
     """
     schedule = as_commissions(commissions)
     allowed = self_matching_set(self_matching, traders)
 
-    book = OrderBook(tick_size=tick_size, sink=SQLiteSink(db_path))
+    sink = SQLiteSink(db_path)
+    recorder = _Recorder(sink) if capture else None
+    book = OrderBook(tick_size=tick_size, sink=recorder or sink)
     book.configure_instrument(instrument, currency)
     for symbol, settles_in in instruments:
         book.configure_instrument(symbol, settles_in)
@@ -287,4 +407,5 @@ def build_inmemory(
         instrument=instrument,
         currency=currency,
         tick_size=tick_size,
+        recorder=recorder,
     )
