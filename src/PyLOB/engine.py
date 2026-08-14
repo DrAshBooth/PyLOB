@@ -1492,9 +1492,15 @@ class OrderBook:
         The rules, all from `order-lifecycle`:
 
         - a `side` that is not the order's raises, and the order is unchanged;
+        - a fully filled order raises, exactly as `cancelOrder` refuses one
+          (lob-8r6, where the two disagreed: modify accepted `qty=25` on an
+          order of 10 with 10 fulfilled and put the finished order back in the
+          book with 15 available and a fresh priority stamp). Wanting quantity
+          after an order finishes means wanting a *new* order;
         - a quantity below what is already fulfilled clamps up to it, which
           finishes the order -- reported as `Modified` with the clamped
-          quantity, not as a cancellation;
+          quantity, not as a cancellation, and finished by that route is as
+          finished as by trading: the next modify raises;
         - a price change or a quantity increase costs time priority: the order
           goes to the back of its (possibly new) level with a fresh stamp. A
           pure quantity decrease keeps its place and its stamp.
@@ -1517,6 +1523,14 @@ class OrderBook:
             raise InvalidOrder("order %r is cancelled" % (idNum,))
         if order.order_type is not OrderType.LIMIT:
             raise InvalidOrder("order %r is a market order and never rested" % (idNum,))
+        if order.filled:
+            raise InvalidOrder(
+                "order %r is fully filled, nothing left to modify: raising its "
+                "quantity would return a finished order to the book with a fresh "
+                "priority stamp, carrying the fills and the timestamp of the "
+                "trade that finished it. Submit a new order for the quantity you "
+                "want" % (idNum,)
+            )
         if qty is not None:
             _check_qty(qty)
 

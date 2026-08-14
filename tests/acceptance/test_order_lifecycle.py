@@ -181,6 +181,37 @@ def test_quantity_reduced_below_fills_clamps(engine):
     assert engine.snapshot("bid") == ()
 
 
+def test_a_fully_filled_order_cannot_be_modified(engine):
+    """Modify is validated and priority-aware / Fully filled order cannot be modified."""
+    resting = engine.limit("bid", 10, 100, tid=100)
+    engine.limit("ask", 10, 100, tid=101)
+    assert resting.fulfilled == 10 and not resting.resting
+
+    with pytest.raises(Exception):
+        engine.modify(resting, qty=25)
+
+    assert resting.qty == 10
+    assert resting.fulfilled == 10
+    assert not resting.resting
+    assert engine.snapshot("bid") == ()
+
+
+def test_an_order_finished_by_the_clamp_stays_finished(engine):
+    """Modify is validated and priority-aware / An order finished by the clamp stays finished."""
+    resting = engine.limit("bid", 10, 100, tid=100)
+    engine.limit("ask", 6, 100, tid=101)
+    engine.modify(resting, qty=4)
+    assert resting.qty == 6 and not resting.resting
+
+    with pytest.raises(Exception):
+        engine.modify(resting, qty=20)
+
+    assert resting.qty == 6
+    assert resting.fulfilled == 6
+    assert not resting.resting
+    assert engine.snapshot("bid") == ()
+
+
 def test_price_change_loses_time_priority(engine):
     """Modify is validated and priority-aware / Price change loses time priority."""
     first = engine.limit("bid", 5, 100, tid=100)

@@ -1,10 +1,15 @@
 """The in-memory engine at its boundaries: bad input, gated walks, heap hygiene.
 
-Three P1 findings from the pre-retirement review (`docs/engine-review-2026-08.md`),
+Four findings from the pre-retirement review (`docs/engine-review-2026-08.md`),
 one section each. They are together in one module because they are one kind of
-test -- none of them is a scenario from a frozen spec, and none of them would
-be caught by asking the engine to trade correctly. They are the cases where an
-engine that trades correctly still ends up wrong.
+test -- none of them would be caught by asking the engine to trade correctly.
+They are the cases where an engine that trades correctly still ends up wrong.
+
+The first three are P1 and none of them is a scenario from a frozen spec. The
+fourth, `lob-8r6`, is: a spec change ratified the refusal, so the requirement's
+own scenarios are covered in `tests/acceptance/test_order_lifecycle.py` like
+every other scenario, and what is here is what the acceptance suite deliberately
+cannot see -- the exact refusal, and that nothing at all moved.
 
 `lob-d6i` -- the input gate
     A limit price of `float("nan")` was accepted. Every comparison against NaN
@@ -33,6 +38,15 @@ engine that trades correctly still ends up wrong.
     process (499,000 entries and a 234ms first query, measured at 1M
     operations). And a price can be in a heap twice, which let one match walk
     receive the same level twice with its skip cursor reset.
+
+`lob-8r6` -- what "finished" means
+    `cancelOrder` refused an order with `qty=10, fulfilled=10` and
+    `modifyOrder` accepted one, raising its quantity to 25 and returning the
+    completed order to the book with 15 available and a fresh priority stamp.
+    The maintainer settled it (`openspec/changes/modify-refuses-filled-orders`,
+    2026-08-14): modify refuses too. Both routes into the filled state are
+    tested, because the clamp reaches it without a trade ever touching the
+    order again.
 
 The engine is exercised through its public surface wherever the finding can be
 seen there. It cannot always be: a heap's length is the subject of `lob-n3n`,
@@ -746,3 +760,109 @@ def test_the_heaps_still_answer_correctly_after_heavy_churn():
     assert {level.price for level in bids.levels()} == live
     assert len(bids._worst) <= 2 * len(live) + 16
     assert len(bids._best) <= 2 * len(live) + 16
+
+
+# --------------------------------------------------------------------------
+# lob-8r6: what "finished" means
+# --------------------------------------------------------------------------
+
+
+def test_a_filled_order_refuses_a_modification():
+    """The asymmetry itself: modify accepted what cancel refused.
+
+    `qty=25` on an order of 10 with 10 fulfilled used to be accepted, and a
+    quantity increase is not a passive change -- so the finished order took a
+    fresh priority stamp and went back into the book with 15 available. The
+    assertions after the refusal are the resurrection stated as its absence:
+    the order keeps its size, stays out of the book, and no clock, event or
+    volume moved on the way to the exception.
+    """
+    sink = ListSink()
+    book = make_book(sink=sink)
+    order, _ = book.submit(1, INSTRUMENT, "bid", "limit", 10, 100.0)
+    book.submit(2, INSTRUMENT, "ask", "limit", 10, 100.0)
+    assert order.filled and not order.resting and order.remaining == 0
+
+    before_events = list(sink.events)
+    before_time = book.time
+
+    with pytest.raises(InvalidOrder, match="nothing left to modify") as refusal:
+        book.modifyOrder(order.idNum, dict(side="bid", qty=25, price=100.0))
+
+    assert "Submit a new order" in str(refusal.value), (
+        "the message says the order is finished but not what to do instead: %s"
+        % refusal.value
+    )
+    assert order.qty == 10 and order.fulfilled == 10 and order.remaining == 0
+    assert not order.resting
+    assert book.snapshot(INSTRUMENT, "bid") == ()
+    assert book.getVolumeAtPrice(INSTRUMENT, "bid", 100.0) == 0
+    assert sink.events == before_events
+    assert book.time == before_time
+
+
+def test_an_order_clamped_to_its_fills_refuses_the_next_modification():
+    """The second route in, and the one the old spec text left ambiguous.
+
+    A quantity reduction below `fulfilled` clamps up to it, which finishes the
+    order without a trade ever touching it again -- `order-lifecycle` called
+    that "treated as fully filled", and the delta makes the treatment complete:
+    finished by the clamp is as finished as finished by trading.
+    """
+    book = make_book()
+    order, _ = book.submit(1, INSTRUMENT, "ask", "limit", 10, 100.0)
+    book.submit(2, INSTRUMENT, "bid", "limit", 6, 100.0)
+    assert order.fulfilled == 6 and order.resting
+
+    book.modifyOrder(order.idNum, dict(side="ask", qty=4, price=None))
+    assert order.qty == 6 and order.filled and not order.resting
+
+    with pytest.raises(InvalidOrder, match="nothing left to modify"):
+        book.modifyOrder(order.idNum, dict(side="ask", qty=20, price=None))
+
+    assert order.qty == 6 and order.fulfilled == 6
+    assert book.snapshot(INSTRUMENT, "ask") == ()
+    assert book.getVolumeAtPrice(INSTRUMENT, "ask", 100.0) == 0
+
+
+def test_cancel_and_modify_now_agree_about_a_finished_order():
+    """One order, both operations, the same answer -- which is the whole point.
+
+    A price-only modify is included because it names no quantity at all: the
+    resurrection needed an increase, but "finished" is a property of the order
+    and not of the update, so a reprice of a finished order is refused too
+    rather than repricing something that will never trade again.
+    """
+    book = make_book()
+    order, _ = book.submit(1, INSTRUMENT, "bid", "limit", 4, 100.0)
+    book.submit(2, INSTRUMENT, "ask", "limit", 4, 100.0)
+    assert order.filled
+
+    with pytest.raises(InvalidOrder, match="fully filled"):
+        book.cancelOrder("bid", order.idNum)
+    with pytest.raises(InvalidOrder, match="fully filled"):
+        book.modifyOrder(order.idNum, dict(side="bid", qty=None, price=99.0))
+    with pytest.raises(InvalidOrder, match="fully filled"):
+        book.modifyOrder(order.idNum, dict(side="bid", qty=9, price=None))
+
+    assert order.qty == 4 and order.fulfilled == 4 and not order.cancelled
+
+
+def test_a_partly_filled_order_still_modifies_freely():
+    """The refusal is `filled`, not "has traded" -- the line it must not cross.
+
+    A resting order with fills against it is the ordinary case the clamp rule
+    is written for, and a guard reading `fulfilled > 0` instead of
+    `fulfilled >= qty` would freeze every order the moment it first traded.
+    """
+    book = make_book()
+    order, _ = book.submit(1, INSTRUMENT, "bid", "limit", 10, 100.0)
+    book.submit(2, INSTRUMENT, "ask", "limit", 3, 100.0)
+    assert order.fulfilled == 3 and order.resting
+
+    book.modifyOrder(order.idNum, dict(side="bid", qty=8, price=None))
+    assert order.qty == 8 and order.remaining == 5
+
+    book.modifyOrder(order.idNum, dict(side="bid", qty=None, price=99.0))
+    assert order.price == 99.0 and order.resting
+    assert book.getVolumeAtPrice(INSTRUMENT, "bid", 99.0) == 5

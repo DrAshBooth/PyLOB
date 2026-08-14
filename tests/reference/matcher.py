@@ -428,6 +428,10 @@ class ReferenceBook:
 
         * "reject a side change" -- a `side` that is not the order's raises
           and the order is unchanged;
+        * "reject an order that is already fully filled" -- "whether it
+          reached that state by trading or by the clamp", so it is read off
+          `remaining`, which an earlier clamp drives to zero just as a fill
+          does;
         * "clamp a quantity reduction below the already-fulfilled amount to
           the fulfilled amount";
         * "a price change or a quantity increase moves the order to the back
@@ -450,6 +454,8 @@ class ReferenceBook:
             raise ReferenceInvalid("order %r is cancelled" % (idNum,))
         if order.order_type != LIMIT:
             raise ReferenceInvalid("order %r is a market order" % (idNum,))
+        if order.remaining <= 0:
+            raise ReferenceInvalid("order %r is fully filled" % (idNum,))
         if qty is not None:
             _check_qty(qty)
 
