@@ -224,7 +224,8 @@ class InstrumentConfigured:
     currency instead of emitting a withdrawal (`engine.configure_instrument`;
     lob-9fu): admitting `None` here would widen the wire format, oblige every
     sink to unlearn a currency it has already stamped on orders, and buy a
-    single-currency library nothing at all.
+    library that converts nothing between currencies (`config.yaml`: no FX)
+    nothing at all.
     """
 
     KIND: ClassVar[str] = "instrument_configured"

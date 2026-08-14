@@ -107,43 +107,27 @@ tick, exact for decimal ticks. Legacy computed `round(price, log10(1/tick))`,
 which is a digit count, not a grid: it treats 0.25, 1 and 5 as the same tick
 and quantizes 100.03 to 100.0 on a 0.05 tick. Here the grid is real -- divide
 by the tick, round to an integer, multiply back -- carried out in `decimal` so
-that 0.05 is a twentieth and not 0.05000000000000000277. The float that comes
-back is the nearest double to the exact decimal multiple.
+that 0.05 is a twentieth and not 0.05000000000000000277, and what comes back
+is the nearest double to the exact decimal multiple.
 
-The intermediate quotient is carried at 40 significant digits, and it is the
-price/tick *ratio* that has to fit: a tick of 1e-40 is accepted at
-construction and then refuses every ordinary price, so the usable range is
-"prices within forty digits of the tick". Past that the quantizer raises
-`InvalidOrder` naming the ratio rather than letting `decimal.InvalidOperation`
-out (lob-d6i).
+It is the price/tick *ratio* that has to fit the 40 significant digits the
+quotient is carried at, so the usable range is "prices within forty digits of
+the tick" and a wider ratio raises `InvalidOrder` naming it (`quantize_price`).
 
 What a submission has to be
 ---------------------------
 
-`order-lifecycle` says an invalid submission raises a library exception and
-never terminates the host process, and the reason the gate below is one gate,
-run before the clock moves or an identifier is allocated, is that this engine
-has already been taught what a partly-applied bad input costs: a NaN limit
-price used to rest, and since every comparison against NaN is false it buried
-the real best price in the heap and could never be evicted from it, leaving
-the book crossed between two different traders -- permanently, silently, and
-faithfully reproduced by replay (lob-d6i).
+One gate, run before the clock moves or an identifier is allocated, because
+`order-lifecycle` requires an invalid submission to raise a library exception
+rather than half-apply. A price is a finite, strictly positive real number
+(never a `bool`, which is an `int` in Python); a quantity is a positive `int`
+no larger than `MAX_QTY`; `qty * price` has to be finite; and a market order
+that carries a price is refused rather than quietly ignoring it.
 
-So a price is a finite, strictly positive real number (never a `bool`, which
-is an `int` in Python), a quantity is a positive `int` no larger than
-`MAX_QTY`, `qty * price` has to be finite, and a market order that carries a
-price is refused rather than quietly ignoring it -- the same reasoning that
-made `modifyOrder(price=None)` mean "leave it alone" instead of "become a
-market order" (lob-crf).
-
-Two of those the specs do not state, and both are decisions rather than
-readings. Non-positive prices are rejected because `_charge` on a negative
-price returns a negative commission delta and `_settle` *credits* it: the
-ledger would pay the trader to trade. The quantity ceiling is `2**53`, the
-largest integer a float represents exactly, so that the value and balance
-arithmetic downstream of a fill stays exact; without a ceiling `qty * price`
-raised `OverflowError` from the middle of `_execute`, after both fills had
-been committed and before either was settled.
+Positivity and the `2**53` ceiling are decisions rather than readings of the
+specs, and both cost a book to learn: `_check_price`, `_check_qty` and
+`_check_notional` each say what their own rule costs to get wrong.
+`create_order` is where the gate runs.
 
 Matching
 --------
@@ -166,22 +150,14 @@ Two rules bend the walk, and both are book state rather than special cases:
   at a time and puts back what the caller did not empty, so a level nobody
   was allowed to trade with does not stop the walk at the top of the book.
 
-Stepping over a gated order is where the walk pays for the dict: `match`
-holds *one* cursor over the level and advances it, because asking the level
-for its k-th order re-reads the queue from the front and made a walk past k
-of the taker's own orders cost O(k^2) -- 10 orders/sec on the single-agent
-gym ADR-0002 names, 30x slower than the engine this one replaces (lob-rp4).
-A fill takes its maker out of the dict and so invalidates the cursor; the
-skipped prefix in front of it cannot move, so the replacement cursor is
-walked back to where the old one was and the fill, not the skip, pays for it.
-The level also knows when every order in it belongs to one trader, which
-turns the gym's own case -- taker crossing a level entirely its own -- into
-one comparison instead of k.
-
-A modify that changes price re-enters the same loop with the resting order as
-the taker, which is why every fill goes through `BookSide.fill` on *both*
-sides: the taker may itself be in the book, and its level's cached volume has
-to stay honest either way.
+Stepping over a gated order is where the walk pays for the dict: `match` holds
+*one* cursor over the level rather than re-indexing it, which is what keeps a
+walk past k of the taker's own orders from costing O(k^2)
+(`docs/engine-review-2026-08.md`, lob-rp4), and a level whose orders all belong
+to one trader answers that case in a single comparison. A modify that changes
+price re-enters the same loop as a taker, which is why every fill goes through
+`BookSide.fill` on *both* sides: the taker may itself be in the book, and its
+level's cached volume has to stay honest either way.
 
 The ledgers
 -----------
@@ -189,27 +165,22 @@ The ledgers
 Commissions and balances are computed here, not in a sink (design.md decision
 3): online PnL is a required feature and a sink is optional, so `order.
 commission` and `balance()` cannot depend on one being attached.
-
-Commission is a function of an order's *cumulative* fills, recomputed from
-(Q, V) on every execution, and only the difference is charged
-(`commission_for` is the one implementation of the formula; `Filled` carries
-both the new total and the increment so a sink never re-derives it). The
-percentage cap binds ahead of the floor, and nothing is rounded or quantized
-to currency precision -- the contract is the exact value of the formula.
+`commission_for` is the one implementation of the formula and states it.
 
 Balances track; they do not gate. No margin check, no sufficient-funds check,
 negative balances permitted and recorded on both sides. That absence is a
 requirement of `trader-balances`, not an omission: a well-meaning funds check
-here would break short-selling research workloads.
+here would break short-selling research workloads. A trade's four movements
+are `_settle`'s, and the arithmetic every consumer shares is stated once in
+`PyLOB.events`.
 
 What the stream records
 -----------------------
 
 `recording-sink` requires the persisted stream to be sufficient to reconstruct
-the book *and the reporting values*, and that is a claim about the public
-surface: every public call that changes engine state has to leave something a
-replayer can re-issue. There are two ways to keep the claim true, and both are
-used here.
+the book *and the reporting values*, so every public call that changes engine
+state has to leave something a replayer can re-issue. Two mechanisms keep that
+true.
 
 **Most operations emit.** `submit`, `cancelOrder`, `modifyOrder`,
 `processOrder`, `configure_instrument` and `configure_trader` each emit the
@@ -218,34 +189,29 @@ the same calls (`events`, "Replay").
 
 **A mutation no event can express is refused, not performed quietly.**
 `configure_instrument(symbol, None)` used to withdraw an instrument's currency
-while emitting nothing: the engine then stopped booking currency legs, a sink
-holding the currency it was last told went on booking them, and the replay
-reproduced the sink's ledger rather than the engine's. `setLastPrice`
-overwrote the value `book-queries` defines as "the price of the most recent
-trade" with a price no trade made, unrecorded, so the engine and its own log
-disagreed about a reporting value the spec says the log must reconstruct. Both
-raise now (lob-9fu). Shrinking the mutation set is the fix available in this
-module: growing the emission set instead would mean a new event kind, which is
-a change to the stream format *and* to every sink that folds it.
+and `setLastPrice` used to overwrite the last-trade price, both silently, both
+leaving the engine and its own log describing different sessions; each raises
+now and says why where it is defined. Shrinking the mutation set is the fix
+available in this module, because growing the emission set instead means a new
+event kind -- a change to the stream format *and* to every sink that folds it.
 
 **What is left is the decomposition `submit` is built from** --
 `create_order`, `rest`, `match`, `emit`, `next_priority`, `next_trade_id`,
-`next_seq`. They are public, they are what a harness reaches for, and used as
-a *partial* sequence they are not replay-coherent: `create_order` emits
-`Accepted` and stops, while a replayer turns an `Accepted` into a whole
-`submit`, so a session that accepted an order without matching it replays as
-one that matched it -- inventing trades that never happened. Each of those
-methods says so in its own docstring, and `tests/test_emission_coverage.py`
-walks the public surface and fails on any new public method that changes state
-without emitting and without being listed there. Whether they should be public
-at all is a change to the public API, which `openspec/config.yaml` makes a
-maintainer's decision rather than this module's.
+`next_seq`. They are public, and used as a *partial* sequence they are not
+replay-coherent: `create_order` emits `Accepted` and stops, while a replayer
+turns an `Accepted` into a whole `submit`, so a session that accepted an order
+without matching it replays as one that matched it -- inventing trades that
+never happened. Each says so in its own docstring, and
+`tests/test_emission_coverage.py` fails on any new public method that changes
+state without emitting and without being listed there. `match` and `rest` go
+further and refuse outright an `Order` this engine never accepted, that
+failure having been live rather than merely a replay mismatch (`match`).
 
-`match` is guarded rather than merely documented, because its failure was not
-a replay mismatch but a live one: handed a hand-built `Order` the engine had
-never accepted, it traded against real resting liquidity and moved four
-balances for an order `order()` could not find. It now refuses a taker that is
-not its own.
+Identifiers of the form `lob-d6i` name findings in this repository's issue
+tracker, which an installed copy of the package cannot open -- nothing here
+depends on them, because every docstring carries the substance inline; the
+citations that matter to a reader are the ADRs under `docs/adr/` and the two
+2026-08 review documents under `docs/`.
 """
 
 from __future__ import annotations
@@ -337,11 +303,9 @@ class InvalidOrder(PyLOBError, ValueError):
     Also a `ValueError`, because that is what a caller who has never read
     these docs will already be catching around bad input.
 
-    It covers two kinds of refusal, and the second is not about the input
-    being malformed: a call whose effect the event stream could not express
-    is refused too, because performing it would leave the engine and its own
-    log describing different sessions (`configure_instrument` withdrawing a
-    currency, `setLastPrice`; module docstring, "What the stream records").
+    It covers two kinds of refusal: malformed input, and a call whose effect
+    the event stream could not express (module docstring, "What the stream
+    records").
     """
 
 
@@ -378,18 +342,16 @@ _ONE: Final = Decimal(1)
 def _positive_real(value: Any, what: str) -> float:
     """`value` as a positive finite float, or an `InvalidOrder` saying why not.
 
-    The one shape test behind both the price gate and the tick gate, because
-    the two want exactly the same thing of a number and had drifted into
-    wanting it differently -- a string tick raised `TypeError`, `True` raised
-    `decimal.InvalidOperation`, and neither is the library exception
-    `order-lifecycle` promises (lob-d6i).
-
-    `bool` is refused before anything else: `True` is an `int` in Python, so
-    every numeric test below would pass it, and a price of `True` is a mistake
-    rather than a price. Anything else that is a real number is taken -- a
-    `numpy` scalar or a `Fraction` counts -- and converted once, so what the
-    engine stores and quantizes is an ordinary float rather than whatever the
-    caller's array library hands back from arithmetic.
+    The one shape test behind both the price gate and the tick gate: the two
+    want exactly the same thing of a number, and while they asked separately a
+    string tick raised `TypeError` and `True` raised
+    `decimal.InvalidOperation` -- neither the library exception
+    `order-lifecycle` promises. `bool` is refused before anything else, since
+    `True` is an `int` in Python and would pass every numeric test below.
+    Anything else that is a real number is taken -- a `numpy` scalar or a
+    `Fraction` counts -- and converted once, so what the engine stores and
+    quantizes is an ordinary float rather than whatever the caller's array
+    library hands back from arithmetic.
     """
     if isinstance(value, bool) or not isinstance(value, (int, float, Real)):
         raise InvalidOrder("%s must be a real number, got %r" % (what, value))
@@ -428,15 +390,10 @@ def _quantize(price: float, tick: Decimal) -> float:
     """`price` snapped to the nearest multiple of an already-decimalized tick.
 
     Three `decimal` operations and two conversions, which makes it the most
-    expensive thing on the accept path. It is a pure function of
-    `(price, tick)` and a book asks it the same question over and over, so
-    `OrderBook.clipPrice` keeps the answers; this is what a miss costs.
-
-    The `decimal` failures are translated rather than propagated: a price of
-    1e40 on a 0.0001 tick, or any price at all on a 1e-40 tick, is a ratio
-    too wide for `_CTX` and used to leak `decimal.InvalidOperation` -- not a
-    `PyLOBError`, so a caller catching this library's errors did not catch it
-    (lob-d6i).
+    expensive thing on the accept path; `OrderBook.clipPrice` keeps the
+    answers, and this is what a miss costs. A ratio too wide for `_CTX` raises
+    `InvalidOrder` rather than leaking `decimal.InvalidOperation`, which is
+    not an error a caller catching this library's own would catch.
     """
     try:
         multiples = _CTX.divide(Decimal(str(price)), tick).quantize(
@@ -482,6 +439,13 @@ def quantize_price(price: float, tick_size: float) -> float:
 @dataclass(slots=True)
 class Order:
     """One order, from acceptance until the end of the session.
+
+    **Yours to read, not to write.** This object is the engine's live record,
+    not a copy: `order.qty = 5` on an order the book is holding leaves its
+    price level's cached `volume` describing the old quantity, and emits no
+    event, so the book, the queries and the log disagree from then on. Change
+    a resting order through `modifyOrder` or `cancelOrder`, which is the same
+    request routed through `BookSide` and recorded.
 
     Mutable and identity-addressed: the book, the level, and `_orders` all
     hold the same object, so a fill updates one place. It outlives its stay in
@@ -551,18 +515,14 @@ class Trade(NamedTuple):
     `price` is the maker's limit and `qty` this execution alone -- neither is
     a cumulative total.
 
-    A `NamedTuple` and not a frozen dataclass, which is what it was. This is
-    the only object the engine builds on every execution whether or not
-    anyone is recording (ADR-0002 keeps the sinkless path free of `Filled`,
-    but a caller is always handed its trades), and a frozen dataclass pays
-    `object.__setattr__` per field to build one: measured at 3.1x the cost of
-    the tuple, ~9% of a sinkless run. Immutability is *not* what was traded
-    away for that -- a tuple is immutable and hashable where the frozen
-    dataclass was immutable and hashable. What changed is that a `Trade` is
-    now also a sequence: it unpacks, indexes and compares equal to a plain
-    tuple of its fields, and `dataclasses.asdict` and `replace` no longer
-    apply to it (`_asdict` and `_replace` do). Field *order* is therefore
-    part of the public surface in a way it was not before.
+    A `NamedTuple` and not the frozen dataclass it used to be (ADR-0004, for
+    the measurement and the rejected alternatives). What that changed for a
+    caller is the type's width, not its guarantees: a `Trade` is still
+    immutable and hashable, and it is now also a sequence -- it unpacks,
+    indexes and compares equal to a plain tuple of its fields, while
+    `dataclasses.asdict` and `replace` no longer apply to it (`_asdict` and
+    `_replace` do). Field *order* is therefore part of the public surface in a
+    way it was not before.
     """
 
     trade_id: int
@@ -645,12 +605,11 @@ class PriceLevel:
 
     `sole_tid` is the same trick applied to ownership: the tid every order
     here belongs to, or `_MIXED`. Matching reads it to answer "is this whole
-    level the taker's own?" -- the single-agent case, where the answer would
-    otherwise cost one self-matching test per resting order (lob-rp4) -- and
-    it is maintained only where it is cheap, on `append`. It is therefore
-    conservative in one direction: a level that *became* single-owner by
-    losing its other trader's orders reads `_MIXED` until it empties. Never
-    the other way, which is the direction that would matter.
+    level the taker's own?" in one comparison, and it is maintained only where
+    it is cheap, on `append`. It is therefore conservative in one direction: a
+    level that *became* single-owner by losing its other trader's orders reads
+    `_MIXED` until it empties. Never the other way, which is the direction
+    that would matter.
     """
 
     __slots__ = ("price", "volume", "sole_tid", "_orders")
@@ -810,16 +769,12 @@ class BookSide:
         not delete.
 
         A price already handed out is dropped rather than yielded again. The
-        heap can hold a price twice -- `add` re-creating a level whose stale
-        entry has not surfaced, or a `_compact` firing mid-walk (some level
-        emptying) and rebuilding from the live levels, which re-adds a price
-        this walk is holding and pushes back on the way out. Duplicates are
-        harmless in the heap, where a price is only a price; they are not
-        harmless *here*, because handing the same level over twice restarts
-        the caller's cursor into it from the front. So `walked` is the set of
-        prices this walk has yielded, and a second copy is popped and
-        forgotten, which is also how the heaps shed the duplicates they
-        accumulate (lob-n3n).
+        heap can hold a price twice (module docstring, "The structures"), and
+        a duplicate is harmless there, where a price is only a price, but not
+        *here*: handing the same level over twice restarts the caller's cursor
+        into it from the front. So `walked` is the set of prices this walk has
+        yielded, and a second copy is popped and forgotten -- which is also
+        how the heaps shed the duplicates they accumulate.
 
         Close the iterator -- a `try`/`finally` around the walk, or exhaust it
         -- or the prices it walked past stay out of the heap until it is
@@ -983,10 +938,9 @@ class BookSide:
         The gate reads whichever heap is longer, and it has to: `_best` is
         drained by every match, so gating on it alone meant the gate never
         opened, and `_worst` -- peeked only by the reporting queries -- grew
-        one entry per level creation for the life of the process. Measured at
-        20,001 entries over a single live level after 20k churn cycles, and
-        at 499,000 entries and a 234ms first `getWorst*` call over a million
-        operations (lob-n3n).
+        one entry per level creation for the life of the process, until a
+        first `getWorst*` call cost hundreds of milliseconds
+        (`docs/engine-review-2026-08.md`, lob-n3n).
         """
         live = len(self._levels)
         if max(len(self._best), len(self._worst)) <= 2 * live + 16:
@@ -1046,9 +1000,6 @@ class OrderBook:
     the sink
         `recording`, `emit`, `close`
 
-    Construction emits `SessionStarted`, so a stream always opens with the
-    tick size a replay needs in order to quantize the same way.
-
     The configuration calls and the operations emit, and a replayer re-issues
     what they emitted as the same calls. The store, the book and the counters
     are the decomposition `submit` is built from: each one that changes state
@@ -1069,6 +1020,33 @@ class OrderBook:
         sink: EventSink | None = None,
         timestamp: float = 0.0,
     ) -> None:
+        """Build an engine. It takes orders as soon as this returns.
+
+        `tick_size` is the price grid: every submitted price is snapped to the
+        nearest multiple of it, so an order at 100.03 rests at 100.03 on the
+        default 0.0001 grid and at 100.05 on a 0.05 one. It is fixed for this
+        book's life -- every resting price and the `clipPrice` memo assume it
+        -- so a different grid means a different `OrderBook`, not a setter.
+
+        `sink` is optional and `None` by default. With no sink the engine
+        constructs no events at all (ADR-0002) and still hands every caller its
+        `Trade` list; pass one -- a `SQLiteSink`, or any object with a
+        `consume(event)` method -- to persist the session. Construction emits
+        `SessionStarted`, so a recorded stream always opens with the tick size
+        a replay needs in order to quantize the same way.
+
+        `timestamp` seeds the engine clock. The clock starts there and
+        advances by one per operation, unless the caller supplies a time of
+        their own (`submit(..., timestamp=t)`, `cancelOrder(..., time=t)`,
+        `modifyOrder(..., time=t)`), in which case it is set to that value:
+        stepping simulated time is simply passing it in, and every event an
+        operation emits carries the operation's own stamp. The clock is
+        recorded data and **never a sort key** -- matching sorts by (price,
+        priority), and two orders may legitimately carry the same timestamp.
+
+        Construction is cheap and reserves nothing, so a fresh engine per
+        episode is the intended way to reset state; there is no `reset()`.
+        """
         self._tick = _tick_decimal(tick_size)
         self.tick_size = tick_size
         #: `clipPrice`'s memo: submitted price -> price on this book's grid.
@@ -1117,23 +1095,18 @@ class OrderBook:
         Answers are kept, because `_quantize` is the most expensive thing on
         the accept path and a book asks it about the same handful of prices
         all session: a level is a price, and a workload that quotes around a
-        touch offers the same ones over and over. Measured hit rates run from
-        37% on a ten-thousand-level book to 100% on a book two ticks wide.
+        touch offers the same ones over and over.
 
-        A plain dict and not an LRU: the cost that matters at this size is not
-        the lookup but the garbage collector's, and a dict of float keys and
-        float values holds no objects for it to trace, where an LRU's link
-        nodes are one traced object per entry. Both were measured; the LRU was
-        *slower than no memo at all* on the ten-thousand-level shape, which is
-        the one whose working set does not fit.
-
-        Full means cleared, not evicted one by one -- the price of a policy
-        cheap enough not to eat what it saves. `_grid` is per book because the
-        tick is: it is fixed at construction, so a price maps to one grid
-        point for this book's whole life, and nothing has to invalidate it.
-        Only exact floats are memoized, so the memo never has to answer for a
-        key type `dict` would refuse; `_check_price` has already made every
-        submitted price one.
+        A plain dict and not an LRU, because at this size the cost that
+        matters is the garbage collector's rather than the lookup's: a dict of
+        float keys and float values holds nothing for it to trace, where an
+        LRU's link nodes are one traced object per entry. Full means cleared,
+        not evicted one by one -- the price of a policy cheap enough not to eat
+        what it saves. `_grid` is per book because the tick is fixed at
+        construction, so a price maps to one grid point for this book's whole
+        life and nothing has to invalidate it. Only exact floats are memoized,
+        so the memo never has to answer for a key type `dict` would refuse;
+        `_check_price` has already made every submitted price one.
         """
         if type(price) is float:
             value = self._grid.get(price)
@@ -1151,8 +1124,18 @@ class OrderBook:
     def configure_instrument(self, symbol: str, currency: str) -> None:
         """Declare an instrument and the currency it settles in.
 
-        A sink cannot book the cash leg of a trade without the currency, so
-        this is a recorded event and not merely local state.
+        **Call this before trading the instrument.** Until it is called, a
+        trade moves only the instrument leg: no cash changes hands, and
+        `balance(tid, "USD")` stays 0.0 for every trader for the whole
+        session. Nothing raises and nothing warns, so a skipped call reads as
+        a strategy that made no money rather than as a book that was never
+        told what money is. Trading an unconfigured instrument is a supported
+        state, not an error -- the fills are real and the cash leg is
+        recoverable from them -- but PnL cannot be read off `balance` until
+        the currency is declared.
+
+        A sink cannot book the cash leg without the currency either, so this
+        is a recorded event and not merely local state.
 
         Re-callable: naming a different currency re-denominates the legs of
         every *later* trade, and the event says so, so a replay re-denominates
@@ -1168,10 +1151,8 @@ class OrderBook:
         sink's (lob-9fu). Refusing it is the fix this module can make on its
         own: the alternative, an `InstrumentConfigured` carrying no currency,
         is a change to the stream format and to every sink that folds it, and
-        a single-currency library (`config.yaml`) has nothing to spend that
-        on. An instrument with no currency is still a supported state -- it is
-        what an instrument that was never configured has, and `_settle` moves
-        its instrument leg and leaves the cash leg recoverable from the fill.
+        a library that converts nothing between currencies (`config.yaml`: no
+        FX, no cross-instrument netting) has nothing to spend that on.
         """
         if not isinstance(currency, str) or not currency:
             raise InvalidOrder(
@@ -1291,17 +1272,14 @@ class OrderBook:
 
         The input gate is here and nowhere else on the submission path, and
         every check it makes runs before the clock moves (module docstring,
-        "What a submission has to be"; lob-d6i).
+        "What a submission has to be").
 
-        Not replay-coherent on its own. `Accepted` is the record of a
-        submission, and a replayer re-issues it as a whole `submit` -- accept,
-        cross, then rest or cancel -- because that is what an acceptance
-        means in every stream `submit` writes. A caller that accepts an order
-        and stops therefore records a session it did not run: a bid left
-        unmatched over a crossing ask replays as a bid that took it, trades
-        and all (lob-9fu). Use `submit` unless you are going on to `match` and
-        `rest` yourself, and expect the stream of a session that did not to
-        describe the submission rather than the acceptance.
+        Not replay-coherent on its own. A replayer turns an `Accepted` into a
+        whole `submit` -- accept, cross, then rest or cancel -- so a caller
+        that accepts an order and stops records a session it did not run: a
+        bid left unmatched over a crossing ask replays as a bid that took it,
+        trades and all. Use `submit` unless you are going on to `match` and
+        `rest` yourself.
         """
         side = _as_side(side)
         order_type = _as_order_type(order_type)
@@ -1382,7 +1360,10 @@ class OrderBook:
         Returns the order and the executions it caused, in match order. The
         order goes on answering for itself afterwards -- `fulfilled`,
         `commission`, `resting` -- so a caller needs nothing else to see what
-        became of it.
+        became of it. It is yours to read, not to write: assigning to the
+        returned order's `qty` or `price` desynchronizes its level's cached
+        volume and emits nothing, so change it through `modifyOrder` or
+        `cancelOrder` (`Order`).
 
         What is left over rests only if it may: a limit order joins the back
         of its price level, a market order's remainder is cancelled, because
@@ -1481,14 +1462,12 @@ class OrderBook:
 
         `orderUpdate` states `side`, `qty` and `price`. All three keys are
         required -- a missing one is an `InvalidOrder` naming it, never a
-        `KeyError` from inside the engine (lob-crf: the legacy engine leaked a
-        `sqlite3.ProgrammingError` here). `qty` or `price` given as `None`
-        means *leave that one alone*.
-
-        `price=None` is emphatically not "become a market order": the legacy
-        engine read it that way and matched a limit order at 99 against an ask
-        at 105 while keeping 99 as its stored price (lob-crf). An order that
-        named a limit keeps it until someone names a different one.
+        `KeyError` from inside the engine. `qty` or `price` given as `None`
+        means *leave that one alone*, and emphatically not "become a market
+        order": the legacy engine read `price=None` that way and matched a
+        limit order at 99 against an ask at 105 while keeping 99 as its stored
+        price (lob-crf). An order that named a limit keeps it until someone
+        names a different one.
 
         The rules, all from `order-lifecycle`:
 
@@ -1599,10 +1578,6 @@ class OrderBook:
         why the taker's own side is filled through `BookSide.fill` rather than
         by touching `fulfilled` directly.
 
-        The walk within a level is one cursor, advanced; it used to be an
-        index, re-read from the front of the queue on every step, which made
-        stepping over k of the taker's own orders cost O(k^2) (lob-rp4).
-
         Not replay-coherent on its own: this is half of `submit`, and what it
         leaves unmatched neither rests nor is cancelled until a caller says
         so. The trades it does execute are emitted as they happen, so it
@@ -1682,12 +1657,11 @@ class OrderBook:
         """One execution: fill both orders, charge both, move four balances.
 
         The arithmetic comes first and the fills second, so that an execution
-        is all-or-nothing with respect to its own numbers. `value` used to be
-        computed between the two fills and the settlement, where an
-        `OverflowError` out of `qty * price` left both orders recording a fill
-        that no balance had moved for and no `Filled` described (lob-d6i). The
-        input gate makes that overflow unreachable; the ordering makes it
-        harmless.
+        is all-or-nothing with respect to its own numbers: computed between
+        the fills and the settlement, an `OverflowError` out of `qty * price`
+        left both orders recording a fill that no balance had moved for and no
+        `Filled` described. The input gate makes that overflow unreachable;
+        the ordering makes it harmless.
         """
         qty = min(taker.remaining, maker.remaining)
         value = qty * price
@@ -1916,20 +1890,18 @@ class OrderBook:
         """Refused: the last-trade price is output, and cannot be dictated.
 
         `book-queries` defines the value this would overwrite as "the price of
-        the most recent trade", and requires that after a reload it equal the
+        the most recent trade" and requires that after a reload it equal the
         last trade in the persisted record. An assignment satisfies neither
-        clause: it names a price no trade made, and it emitted nothing, so the
-        engine reported 999.0 while its own log -- the thing `recording-sink`
-        says must reconstruct the reporting values -- said the price of the
-        last real trade, and a replay landed on the log's answer (lob-9fu).
+        clause: it names a price no trade made and emits nothing, so the engine
+        and its own log report different last prices and a replay lands on the
+        log's (module docstring, "What the stream records"). `_execute` sets
+        the value where it is defined, on every execution.
 
-        `_execute` sets the value where it is defined, on every execution.
         Seeding an opening price before the first trade is the use this
         refuses; it would need an event of its own, which is a stream-format
-        change and a maintainer's call, not a setter's.
-
-        Raises `InvalidOrder` always. Kept as a name that says why rather than
-        deleted, because removing a public name needs an ADR (`config.yaml`).
+        change and a maintainer's call. Raises `InvalidOrder` always, and is
+        kept as a name that says why because removing a public name needs an
+        ADR (`config.yaml`).
         """
         raise InvalidOrder(
             "the last-trade price of %r is engine output, set by executions "
@@ -1951,13 +1923,10 @@ class OrderBook:
         little for anyone else's, and `getVolumeAtPrice` is the query to ask
         directly.
 
-        One section differs, and not by omission. Legacy dumped every trade the
-        instrument had ever seen out of its `trade_detail` table. This engine
-        keeps no trade log -- an execution is returned to its submitter as a
-        `Trade` and, with a sink attached, persisted by it -- and growing one
-        here would put unbounded memory on the sinkless path that ADR-0002
-        exists to keep free, in order to serve a debug print. `last_price` is
-        what the engine does retain about executions, so that is what the
+        The trades section differs, and not by omission: this engine keeps no
+        trade log, because growing one would put unbounded memory on the
+        sinkless path ADR-0002 exists to keep free in order to serve a debug
+        print. `last_price` is what it does retain, so that is what the
         section shows; a full history is `select * from trade` against a
         `SQLiteSink` database.
         """
@@ -2077,7 +2046,7 @@ class OrderBook:
         not merely a test of what is resting. The high-water mark is what
         survives a reload: replay supplies every identifier it saw, each one
         pushes the counter past itself, and the first order submitted
-        afterwards lands above all of them (lob-7e7).
+        afterwards lands above all of them.
         """
         if idNum is None:
             idNum = self._next_idNum
@@ -2097,13 +2066,13 @@ def _check_qty(qty: int) -> None:
 
     `order-lifecycle`: an invalid submission raises a library exception and
     the API never terminates the host process -- the legacy engine called
-    `sys.exit` here (lob-ihv). `bool` is excluded because `True` is an `int`
-    and an order for `True` units is a mistake, not a quantity.
+    `sys.exit` here. `bool` is excluded because `True` is an `int` and an
+    order for `True` units is a mistake, not a quantity.
 
     Python integers have no ceiling and floats do, so the range is bounded at
     the top as well: `MAX_QTY` is where `qty * price` stops being arithmetic
     and starts being an `OverflowError` raised from the middle of an
-    execution (lob-d6i).
+    execution.
     """
     if not isinstance(qty, int) or isinstance(qty, bool):
         raise InvalidOrder("quantity must be an integer, got %r" % (qty,))
@@ -2122,21 +2091,19 @@ def _check_price(price: Any) -> float:
     handed to `_positive_real`, because this runs on every submission and the
     accept path is the one ADR-0002 measures.
 
-    Finite, real, and strictly positive. The specs require a limit order to
-    carry a price and say nothing about its sign, so positivity is a decision
-    (module docstring, "What a submission has to be"): a negative price makes
-    `commission_for` return a negative charge, and `_settle` adds the
-    commission delta to the trader's currency leg, so the ledger would credit
-    a trader for the privilege of trading. Zero is refused with it, as the
-    price at which every fill is worth nothing and the percentage cap collapses
-    to zero commission for both sides.
+    Finite, real, and strictly positive. Positivity is a decision rather than
+    a reading of the specs (module docstring, "What a submission has to be"):
+    a negative price makes `commission_for` return a negative charge and
+    `_settle` credits it, so the ledger would pay a trader to trade. Zero goes
+    with it, as the price at which every fill is worth nothing.
 
     Non-finite is the one that cost a book: `float("nan")` compares false
-    against everything, so a NaN price in a price heap is never the minimum,
-    never evicted, and buries every better price underneath it (lob-d6i).
-    That same property is what the fast path leans on -- `0.0 < price` is
-    already false for a NaN and for `-inf`, so the bounded comparison below
-    is the whole finiteness test and no `isfinite` call is needed for it.
+    against everything, so a NaN price that rests is never the minimum of its
+    heap, never evicted, and buries every better price underneath it -- a book
+    left crossed between two traders, permanently and silently, and faithfully
+    reproduced by replay. That same property is what the fast path leans on:
+    `0.0 < price` is already false for a NaN and for `-inf`, so the bounded
+    comparison below is the whole finiteness test.
     """
     if type(price) is float and 0.0 < price < _INF:
         return price
@@ -2148,14 +2115,12 @@ def _check_notional(qty: int, price: float) -> None:
 
     The product is what `_execute` charges commission on and settles in cash.
     Two individually legal operands can have an illegal product, and floats
-    overflow quietly: the review's 10**300 units at 1e30 came to `value = inf`,
-    took the ledger to +/-inf, and made the percentage commission cap stop
-    capping, since `min(inf, x)` is `x` -- with nothing raised anywhere
-    (lob-d6i).
-
-    That quantity is refused by `MAX_QTY` now, which leaves only the other
-    end: a quantity at the ceiling against a price above `_NOTIONAL_GUARD`,
-    which is the only case the caller need ask about.
+    overflow quietly: 10**300 units at 1e30 came to `value = inf`, took the
+    ledger to +/-inf, and made the percentage commission cap stop capping,
+    since `min(inf, x)` is `x` -- with nothing raised anywhere
+    (`docs/engine-review-2026-08.md`, lob-d6i). `MAX_QTY` refuses that
+    quantity now, leaving only a quantity at the ceiling against a price above
+    `_NOTIONAL_GUARD` for the caller to ask about.
     """
     if not isfinite(qty * price):
         raise InvalidOrder(
