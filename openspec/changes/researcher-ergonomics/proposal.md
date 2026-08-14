@@ -1,5 +1,12 @@
 # Proposal: researcher-ergonomics
 
+> **Approved by the maintainer, 2026-08-14.** Accepted as proposed, all four
+> items. The task 1.1 gate is **decided**: the readers take a `[3, 4]`
+> window as `MIN_READABLE_SCHEMA_VERSION = 3`, the writer stays exact, and
+> the reasoning is recorded in
+> [ADR-0007](../../../docs/adr/0007-sink-readers-accept-a-schema-version-window.md).
+> Task 1.1 no longer blocks 4.1. Not yet converted into beads.
+
 ## Why
 
 The clarity review (`docs/clarity-review-2026-08.md`, bead `lob-gv6`) filed four

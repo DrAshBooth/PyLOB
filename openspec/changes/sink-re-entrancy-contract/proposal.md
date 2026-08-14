@@ -1,5 +1,9 @@
 # Proposal: sink-re-entrancy-contract
 
+> **Approved by the maintainer, 2026-08-14.** Accepted as proposed,
+> including the non-enforcement clause — a future re-entrancy guard is
+> therefore a spec change, not a tidy-up. Not yet converted into beads.
+
 ## Why
 
 `EventSink.consume` is called synchronously from inside the operation being

@@ -1,5 +1,9 @@
 # Proposal: identifiers-unique-per-engine
 
+> **Approved by the maintainer, 2026-08-14.** Accepted as proposed. No
+> behaviour change: this ratifies the reading both implementations already
+> took. Not yet converted into beads.
+
 ## Why
 
 `order-lifecycle`'s "Order identifiers are unique and stable" opens:
