@@ -143,9 +143,7 @@ class InMemoryAdapter:
                 named["qty"] = qty
             if price is not UNSET:
                 named["price"] = price
-            _, trades = self.book.modify(
-                idNum, side=side, timestamp=timestamp, **named
-            )
+            _, trades = self.book.modify(idNum, side=side, timestamp=timestamp, **named)
             return self._record(trades)
 
         state = self.order_state(idNum)

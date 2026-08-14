@@ -15,9 +15,19 @@ are that switch: which spelling is which, and what each names its clock, is
 engine knowledge and lives in `tests/harness/` with the rest of it. The
 scenarios that assert on what was *recorded* rather than on the book take
 `engine_factory(capture=True)` and read `engine.recorded()`.
+
+The identifier requirement is written about *the engine* and every instrument
+in it, and one instrument cannot tell a book apart from the engine holding it,
+so those scenarios take `engine_factory(instruments=...)` and submit on two.
 """
 
 import pytest
+
+#: The second instrument the identifier scenarios load. It sorts
+#: alphabetically *before* the default "FAKE", so an engine that answered an
+#: unqualified question from the wrong book -- the first one it holds, or the
+#: first one it reaches -- would answer with this one.
+OTHER = "AAA"
 
 
 # --------------------------------------------------------------------------
@@ -88,6 +98,42 @@ def test_cancel_targets_exactly_one_order(engine):
     ]
 
 
+def test_cancel_needs_no_instrument(engine_factory):
+    """Order identifiers are unique and stable / Cancel needs no instrument.
+
+    "Operations addressing an identifier SHALL affect at most one order, and
+    SHALL reach that order without being told which instrument it belongs to."
+
+    Every order here rests on one side at one price, and the doomed one is in
+    the middle of the second instrument's queue, so an engine that read the
+    identifier as anything else -- a position in a queue, a handle only its own
+    book's orders answer to -- would cancel one of the others rather than
+    nothing at all. Nothing in the call names an instrument or a side: the
+    identifier is the whole of the address.
+    """
+    engine = engine_factory(instruments=((OTHER, "USD"),))
+    first = engine.limit("bid", 5, 100, tid=100)
+    second = engine.limit("bid", 5, 100, tid=101)
+    kept = engine.limit("bid", 5, 100, tid=102, instrument=OTHER)
+    doomed = engine.limit("bid", 5, 100, tid=103, instrument=OTHER)
+    last = engine.limit("bid", 5, 100, tid=104, instrument=OTHER)
+    untouched = engine.snapshot("bid")
+
+    engine.cancel(doomed, side=None, keyword=True)
+
+    assert doomed.cancelled and not doomed.resting
+    assert [entry.idNum for entry in engine.snapshot("bid", OTHER)] == [
+        kept.idNum,
+        last.idNum,
+    ]
+
+    # ... and the first instrument's book is exactly where it was: an
+    # identifier the engine holds means one order, not one order per book.
+    assert engine.snapshot("bid") == untouched
+    assert not first.cancelled and first.resting
+    assert not second.cancelled and second.resting
+
+
 def test_cancel_with_an_unknown_identifier_raises(engine):
     """Order identifiers are unique and stable / Unknown identifier raises."""
     resting = engine.limit("bid", 5, 100, tid=100)
@@ -113,9 +159,10 @@ def test_modify_with_an_unknown_identifier_raises(engine):
 def test_identifiers_stay_unique_across_a_reload(engine):
     """Order identifiers are unique and stable / requirement statement.
 
-    "unique within the book's lifetime, including across reloads of persisted
-    state" -- the clause has no scenario of its own, and `reopen()` is the
-    fixture surface for it.
+    "unique across every instrument the engine holds, for that engine's
+    lifetime, including across reloads of persisted state" -- the reload half
+    is the part no scenario names, and `reopen()` is the fixture surface for
+    it. The cross-instrument half is covered by the scenarios below.
     """
     first = engine.limit("bid", 5, 100, tid=100)
     issued = first.idNum
@@ -127,6 +174,36 @@ def test_identifiers_stay_unique_across_a_reload(engine):
     assert [entry.idNum for entry in engine.snapshot("bid")] == [issued, later.idNum]
 
 
+def test_identifiers_do_not_restart_per_instrument(engine_factory):
+    """Order identifiers are unique and stable / Identifiers do not restart per instrument.
+
+    "no two of them carry the same identifier, and no identifier issued on one
+    instrument is issued again on the other."
+
+    Distinctness is the whole assertion. The requirement promises identifiers
+    "unique across every instrument the engine holds" and says nothing about
+    how they are allocated, so an engine handing them out sparsely, or from a
+    pool, keeps this contract and would fail an assertion written about the
+    sequence.
+    """
+    engine = engine_factory(instruments=((OTHER, "USD"),))
+
+    issued = []
+    for step in range(3):
+        issued.append(engine.limit("bid", 5, 99 - step, tid=100).idNum)
+        issued.append(
+            engine.limit("bid", 5, 99 - step, tid=101, instrument=OTHER).idNum
+        )
+
+    assert len(set(issued)) == len(issued)
+
+    # ... and the six really are two books' worth of orders, alternating, so
+    # the distinctness above is across the instruments and not six submissions
+    # into one of them.
+    assert [entry.idNum for entry in engine.snapshot("bid")] == issued[0::2]
+    assert [entry.idNum for entry in engine.snapshot("bid", OTHER)] == issued[1::2]
+
+
 def test_externally_supplied_duplicate_identifier_is_rejected(engine):
     """Order identifiers are unique and stable / Externally supplied duplicate is rejected."""
     engine.limit("bid", 5, 100, tid=100, idNum=7, timestamp=1)
@@ -135,6 +212,73 @@ def test_externally_supplied_duplicate_identifier_is_rejected(engine):
         engine.limit("bid", 3, 99, tid=101, idNum=7, timestamp=2)
 
     assert [(entry.idNum, entry.qty) for entry in engine.snapshot("bid")] == [(7, 5)]
+
+
+def test_a_duplicate_from_another_instrument_is_rejected(engine_factory):
+    """Order identifiers are unique and stable / A duplicate from another instrument is rejected.
+
+    "the submission is rejected with a library exception and neither
+    instrument's book changes."
+
+    The replayed bid would rest if it were accepted -- it is nowhere near the
+    ask quoted above it -- so the second instrument's book is where an engine
+    holding one identifier space per instrument would show the difference.
+    """
+    engine = engine_factory(instruments=((OTHER, "USD"),))
+    engine.limit("bid", 5, 100, tid=100, idNum=7, timestamp=1)
+    engine.limit("ask", 4, 101, tid=101, idNum=8, timestamp=2, instrument=OTHER)
+    untouched = engine.snapshot("bid")
+    other_untouched = engine.snapshot("ask", OTHER)
+
+    with pytest.raises(Exception):
+        engine.limit("bid", 3, 99, tid=102, idNum=7, timestamp=3, instrument=OTHER)
+
+    assert engine.snapshot("bid") == untouched
+    assert engine.snapshot("ask", OTHER) == other_untouched
+    assert engine.snapshot("bid", OTHER) == ()
+    assert engine.snapshot("ask") == ()
+
+
+def test_a_cancelled_orders_identifier_is_not_reissued(engine):
+    """Order identifiers are unique and stable / A finished order's identifier is not reissued.
+
+    "an identifier SHALL NOT be reissued after its order is cancelled or fully
+    filled."
+
+    The scope is the engine's lifetime and not what is currently resting: an
+    engine that freed the identifier when the order left the book would accept
+    the replay below, and every later operation naming 11 would mean the new
+    order rather than the cancelled one.
+    """
+    doomed = engine.limit("bid", 5, 100, tid=100, idNum=11, timestamp=1)
+    engine.cancel(doomed)
+    assert doomed.cancelled and not doomed.resting
+
+    with pytest.raises(Exception):
+        engine.limit("bid", 3, 99, tid=101, idNum=11, timestamp=2)
+
+    assert engine.snapshot("bid") == ()
+    # 11 still names the order it was issued for, which is the "stable" half of
+    # the requirement's own title.
+    assert engine.order_state(11).cancelled
+
+
+def test_a_filled_orders_identifier_is_not_reissued(engine):
+    """Order identifiers are unique and stable / A finished order's identifier is not reissued.
+
+    The other half of the scenario's "cancelled or fully filled": an order that
+    left the book by trading out is as finished as one that was cancelled, and
+    its identifier is no more available for reuse.
+    """
+    maker = engine.limit("bid", 5, 100, tid=100, idNum=11, timestamp=1)
+    engine.limit("ask", 5, 100, tid=101, idNum=12, timestamp=2)
+    assert maker.fulfilled == 5 and not maker.resting
+
+    with pytest.raises(Exception):
+        engine.limit("bid", 3, 99, tid=102, idNum=11, timestamp=3)
+
+    assert engine.snapshot("bid") == ()
+    assert engine.order_state(11).fulfilled == 5
 
 
 # --------------------------------------------------------------------------
