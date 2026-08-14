@@ -136,6 +136,14 @@ file are genuinely good -- every one of them was committed. What is unknown
 is only how many more there were meant to be, which is why nothing here
 claims a count for what the buffer took with it.
 
+How much the tail is depends on `buffer_size`, and short episodes are the
+case to know about: at the default 512, a session killed after a couple of
+hundred events leaves a file with **no rows in it at all**. That is the
+ordinary outcome and not a symptom of anything -- but somebody running many
+small episodes, meaning to inspect whichever one goes wrong, wants a smaller
+`buffer_size` or a `flush` of their own, decided before the run rather than
+after it.
+
 `session_end` also carries the log's size at the moment it was written, so
 rows deleted from the *end* of a finished log -- the one edit no gap and no
 marker could ever reveal -- come out as a mismatch between what the sink
@@ -159,18 +167,35 @@ and readable as `journal_mode`, because a durability story nobody verified is
 not one.
 
 **A recording in WAL mode is up to three files, and the `.db` alone is not
-it.** Commits land in `session.db-wal` and move into `session.db` only at a
+it.** Commits land in `session.db-wal` and reach `session.db` only at a
 checkpoint. `close` closes the connection, which checkpoints, so a session
-that ended properly is the single file it looks like. A session that was
-*killed* checkpointed nothing: its `.db` can be a 4 KB shell while every
-recorded event sits in the `-wal` beside it. So copy a killed run's
-`session.db`, `session.db-wal` and `session.db-shm` together, or checkpoint
-before copying -- `sqlite3 session.db 'PRAGMA wal_checkpoint(TRUNCATE)'`, or
-just open and close the file with any SQLite client, after which the `.db`
-travels alone. Copying the `.db` by itself does not corrupt anything and
-loses nothing that is still on the original disk; it produces a file with no
-tables in it, which `check_log` reports as exactly that, and the events are
-where they always were.
+that ended properly is the single file it looks like, and copying it is
+copying it. A session that was *killed* checkpointed only whatever SQLite
+auto-checkpointed along the way, and copying its `.db` without the sidecars
+fails in one of two ways depending on whether that had happened yet:
+
+*Loudly*, if it had not. The `.db` is a 4 KB shell holding no tables at all,
+and `check_log` says so and names the `-wal` (measured: 56 of 56 events left
+behind).
+
+*Silently*, if it had. The copy is a valid, contiguous, shorter log --
+measured at 2168 of 2400 events -- with no `event_loss` row and no
+`session_end` row, which is exactly what a genuine killed run that stopped at
+2168 looks like. Nothing in the file reveals the missing 232, and no marker
+this sink could write would: the `session_end` row that counts the log
+travels through the same WAL, and a checkpoint copies a *prefix* of that WAL,
+so a truncated copy can never carry a count for its own contents to
+contradict. Verified directly -- a copy taken after `session_end` was
+committed still had neither the row nor the events it counted. This is the
+one way to lose recorded data that the file cannot be made to report, and it
+is caused entirely outside this module, by the copy.
+
+So copy a killed run's `session.db`, `session.db-wal` and `session.db-shm`
+together, or checkpoint before copying -- `sqlite3 session.db 'PRAGMA
+wal_checkpoint(TRUNCATE)'`, or just open and close the file with any SQLite
+client, after which the `.db` travels alone. Copying the `.db` by itself
+corrupts nothing and loses nothing that is still on the original disk: the
+events stay where they were, in the sidecar that was left behind.
 
 That is the loud outcome, and it is the likely one for a short run. A long
 one may have auto-checkpointed part way, and then the lone `.db` holds the
@@ -1139,6 +1164,12 @@ class IncompleteLogError(EventLogError):
             pass                       # a killed run; the prefix is good
         events = read_events(path, strict=False)
 
+    The one thing this state cannot tell you is *where* the cut is, and that
+    matters beyond the lost tail: a killed run's `.db` copied without its
+    `-wal` is a shorter prefix again, contiguous, unmarked, and identical in
+    every readable respect to a run that stopped there (see Durability). If
+    the file is a copy, the sidecars are part of it.
+
     Subclasses `EventLogError`, so a caller who only wants whole sessions
     needs to know none of this.
     """
@@ -1191,7 +1222,15 @@ def check_log(source: str | os.PathLike[str] | sqlite3.Connection) -> None:
 
     **The session never closed** -- `IncompleteLogError`, and the one that is
     not corruption. See that class: the file is a good prefix of a run whose
-    process was killed, and reading it is a choice rather than a mistake.
+    process was killed, and reading it is a choice rather than a mistake. It
+    is also the one verdict here with a blind spot, and the blind spot is
+    stated in the message rather than hidden: the checks above all compare the
+    file against something the file itself carries, and an unclosed log
+    carries no count to compare against. A prefix truncated further -- by
+    copying the `.db` away from its `-wal`, the way it happens in practice --
+    is arithmetically indistinguishable from the prefix the run left. The
+    extent check below is what would catch it, and it is unreachable here
+    precisely because `session_end` is what is missing.
 
     An empty log that was closed passes: nothing was recorded and nothing is
     missing. An empty log that was *not* closed is a session killed before it
@@ -1282,14 +1321,27 @@ def _check_log(conn: sqlite3.Connection) -> None:
     ended = conn.execute(
         "SELECT last_seq, event_count FROM session_end ORDER BY rowid"
     ).fetchall()
+    if not ended and count == 0:
+        raise IncompleteLogError(
+            f"the log has no session_end row and no events at all: the process "
+            f"that wrote it was killed before its first flush, so everything it "
+            f"had recorded went with the buffer. A session shorter than the "
+            f"sink's buffer (default {DEFAULT_BUFFER_SIZE} events) ends this way "
+            f"every time it is killed rather than closed; a smaller buffer_size, "
+            f"or a flush of your own, is what makes a short episode survive one"
+        )
     if not ended:
         raise IncompleteLogError(
             f"the log has no session_end row: the process that wrote it was "
             f"killed rather than closing it, so these {count} event(s) ending "
             f"at seq {highest} are a prefix of the session and not all of it. "
             f"Whatever was still buffered went with the process, and how much "
-            f"that was is not knowable from the file. The events that are here "
-            f"were all committed: pass strict=False to read them"
+            f"that was is not knowable from the file. If this file is a copy, "
+            f"check that it was copied with its -wal sidecar: a lone .db taken "
+            f"from a run still in progress is a shorter prefix again, equally "
+            f"contiguous, and reads exactly like this one (see Durability). The "
+            f"events that are here were all committed: pass strict=False to "
+            f"read them"
         )
     last_seq, event_count = ended[-1]
     if (event_count, last_seq) != (count, highest):

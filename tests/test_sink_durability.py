@@ -742,6 +742,76 @@ def test_a_killed_db_copied_without_its_wal_names_the_wal(tmp_path):
     assert sink.buffered > 0, "the live sink was never closed behind our backs"
 
 
+def test_a_checkpointed_db_copied_alone_is_silently_shorter(tmp_path):
+    """The same bad copy once SQLite has checkpointed, and it is worse.
+
+    Face one of this trap is loud: no checkpoint has happened, the lone `.db`
+    has no tables, and the message above names the `-wal`. Once SQLite has
+    auto-checkpointed -- which it does on its own, around 1000 pages, so any
+    session worth recording gets there -- the lone copy is instead a *valid*
+    log: schema intact, `seq` contiguous from 0, no `event_loss` row, no
+    `session_end` row. It is a killed run that stopped early, and there is no
+    way to tell it from a killed run that really did stop there. Reproduced
+    against a real auto-checkpoint at 2168 of 2400 events; the checkpoint here
+    is triggered by hand so the test is deterministic and fast.
+
+    So this test asserts a limitation, not a defence. It exists to keep the
+    limitation *stated*: `check_log` reaches its extent comparison only when a
+    `session_end` row is there to compare against, and that row is exactly
+    what a truncated copy has lost -- the marker rides the same WAL as the
+    events, and a checkpoint copies a prefix of it. Nothing the sink writes
+    can survive a cut that also takes the writing. The message is the only
+    place the warning can live, so the message has to carry it.
+    """
+    live = tmp_path / "live"
+    live.mkdir()
+    path = live / "killed.db"
+    book, sink = build(path, buffer_size=4)
+    for index in range(20):
+        book.submit(
+            tid=1,
+            instrument=INSTRUMENT,
+            side="bid",
+            order_type="limit",
+            qty=1,
+            price=round(100.0 - index * 0.01, 2),
+        )
+    sink.flush()
+    # What SQLite's auto-checkpoint does on its own once the WAL is big
+    # enough: move the committed prefix into the `.db` and leave the rest.
+    sink._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+    for index in range(20, 40):
+        book.submit(
+            tid=1,
+            instrument=INSTRUMENT,
+            side="bid",
+            order_type="limit",
+            qty=1,
+            price=round(90.0 - index * 0.01, 2),
+        )
+    sink.flush()
+
+    copied = tmp_path / "copied.db"
+    shutil.copyfile(path, copied)
+
+    truncated, whole = seqs(copied), seqs(path)
+    assert 0 < len(truncated) < len(whole), "the copy silently lost the tail"
+    assert truncated == list(range(len(truncated))), "and is contiguous from 0"
+    assert losses(copied) == [], "nothing failed, so nothing recorded a failure"
+    assert ended(copied) == [], "and the run was never closed"
+
+    # Every readable fact about the copy is a fact about a shorter killed run,
+    # so this is the verdict -- the same one the whole file would earn.
+    with pytest.raises(IncompleteLogError) as refusal:
+        check_log(copied)
+    with pytest.raises(IncompleteLogError):
+        check_log(path)
+    assert "-wal" in str(refusal.value), (
+        "the message is the only thing that can warn about this, since the file cannot"
+    )
+    assert sink.buffered == 0
+
+
 def test_a_cleanly_closed_log_is_not_flagged(tmp_path):
     """The same run, closed. Nothing about it is suspect."""
     path = tmp_path / "closed.db"
@@ -832,11 +902,20 @@ def test_the_end_row_is_written_even_when_events_were_lost(tmp_path):
 
 
 def test_an_unclosed_empty_log_is_incomplete(tmp_path):
-    """Killed before writing anything is still killed, not an empty session."""
+    """Killed before writing anything is still killed, not an empty session.
+
+    The ordinary outcome for short episodes at the default buffer, so the
+    message has to name the buffer rather than report zero events and stop:
+    the reader's next question is why the file is empty, and the answer is a
+    setting they can change.
+    """
     path = tmp_path / "stillborn.db"
     SQLiteSink(path, buffer_size=100).consume(session())
-    with pytest.raises(IncompleteLogError):
+    with pytest.raises(IncompleteLogError) as refusal:
         check_log(path)
+    assert "buffer_size" in str(refusal.value)
+    assert str(DEFAULT_BUFFER_SIZE) in str(refusal.value)
+    assert "seq None" not in str(refusal.value), "there is no last seq to name"
 
 
 def test_rows_deleted_from_the_end_of_a_closed_log_are_caught(tmp_path):
