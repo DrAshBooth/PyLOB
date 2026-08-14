@@ -39,7 +39,9 @@ occupied level                which is the case that tells the two
                               priority rules apart
 `lob-a17` supplied            the data-replay path, identifiers and
 identifiers                   timestamps supplied by the caller, several
-                              orders sharing one timestamp
+                              orders sharing one timestamp, and half of them
+                              drawn from *below* the high-water mark the way a
+                              real replay interleaves them
 `lob-7e7`/`lob-bis` reloads   the engine reloads mid-workload and must come
                               back agreeing with a model that never went
                               away
@@ -173,6 +175,8 @@ from harness import (
     BookEntry,
     Commissions,
     NO_COMMISSION,
+    Trade,
+    as_commissions,
     build_inmemory,
 )
 from PyLOB.bench import workloads as bench_workloads
@@ -190,18 +194,39 @@ TRADERS = (1, 2, 3, 4, 5)
 #: is then a property of the workload rather than a scenario off to one side.
 REPLAY_TIMESTAMP = 7.0
 
-#: Supplied identifiers start well above anything the engines assign, so that
-#: "supplied" and "assigned" cannot collide by accident. Both sides push their
-#: counter past a supplied identifier, and the harness compares the next
-#: assignment, so the rule is checked rather than assumed.
+#: Half the supplied identifiers climb from here, above everything either
+#: implementation has assigned. `order-lifecycle` makes such an identifier push
+#: the counter past itself, and the harness compares the next assignment, so
+#: the rule is checked rather than assumed.
 FIRST_SUPPLIED_ID = 1_000_000
 
-#: ...and each supplied identifier clears the last by more than a workload's
-#: worth of operations. `order-lifecycle` makes a supplied identifier push the
-#: counter past itself, so the identifiers assigned *after* one climb out of
-#: the range the next supplied one would otherwise sit in. A stride wider than
-#: `Profile.ops` is what keeps "supplied" and "assigned" from meeting.
+#: ...and each climbing identifier clears the last by more than a workload's
+#: worth of operations, so the identifiers assigned *after* one stay out of the
+#: range the next would otherwise sit in. A stride wider than `Profile.ops` is
+#: what keeps two of them from meeting an assignment in between.
 SUPPLIED_STRIDE = 1000
+
+#: The other half comes from *below* the high-water mark, counting down from
+#: `FIRST_SUPPLIED_ID`, and this is the half that matters most.
+#:
+#: A real data replay interleaves its identifiers with the ones a book assigns
+#: for itself; a harness that only ever supplies identifiers above the counter
+#: never asks either implementation what happens below it. It leaves
+#: `if idNum >= self._next_idNum` (engine.py) and its twin in the reference
+#: matcher taken in one direction only -- so a counter that walked *backwards*
+#: on a supplied identifier, onto identifiers that live orders already hold,
+#: would be invisible. It was: the mutation survived the whole suite until this
+#: band existed (lob-e9a).
+#:
+#: The band is free by construction and the margin is not subtle. The first
+#: supplied identifier of a run is always a climbing one, so by the time one is
+#: drawn from here the counters are past `FIRST_SUPPLIED_ID`; every later
+#: assignment is therefore above the band, every earlier one is below
+#: `Profile.ops`, and a run draws a few dozen from a band a hundred thousand
+#: wide. Nothing rests on that arithmetic being right, though -- a collision is
+#: a `DuplicateOrderID` out of both implementations, which fails the run where
+#: it happens rather than quietly narrowing it.
+FIRST_INTERLEAVED_ID = FIRST_SUPPLIED_ID - 1
 
 
 #: Every constraint the workload generator carries, and why. Two entries, both
@@ -219,7 +244,15 @@ CONSTRAINTS = {
         "does not exclude a *hostile* input, only an invalid one. Half-tick "
         "prices, market orders that outrun the book, reprices onto a busy "
         "level and identifiers chosen by the caller are all legal, and all "
-        "generated."
+        "generated. What it does still exclude is a duplicate identifier, "
+        "which is illegal input and therefore this same rule rather than a "
+        "second one -- but the constants that implement it "
+        "(`FIRST_SUPPLIED_ID`, `SUPPLIED_STRIDE`, `FIRST_INTERLEAVED_ID`) are "
+        "named here on purpose. A constant that narrows the workload is "
+        "exactly what this list exists to make visible, and for a while one of "
+        "them narrowed it further than legality asked: every supplied "
+        "identifier sat above the counter, so no run ever asked what either "
+        "implementation does with one below it (lob-e9a)."
     ),
     "cancel and modify address a live resting order": (
         "The same rule as above, for the two operations that name an order "
@@ -383,14 +416,34 @@ PROFILES = (
     # sharing a currency: the ledgers, the self-matching gate and a currency
     # balance that nets across two books, all at once. The 0.05 tick is where
     # a quantizer that reads the tick as a double gets it wrong.
+    #
+    # The schedule is the one place here that reaches all three terms of
+    # `min(max_pct * V / 100, max(min_commission, per_unit * Q))`. Around this
+    # profile's price of ~100 the cap is ~`Q` and the per-unit term is `0.5Q`,
+    # so a fill of 1 or 2 is capped, 3 to 5 meets the 2.5 floor, and 6 or more
+    # is charged per unit -- and the generator draws quantities across all of
+    # that. `per_unit` was 0.01 until lob-e9a, which put the per-unit term
+    # above the floor only past a fill of 250 and so out of every workload's
+    # reach; raising it moves the crossover under the quantities instead of
+    # raising the quantities over the crossover, which no profile here could
+    # do without becoming a different profile. The cap could not be reached
+    # that way at all: `V` grows with `Q`, so cap-against-per-unit is a
+    # comparison the quantity cancels out of.
     Profile(
         name="ledgers",
         tick_size=0.05,
         grid=_halves(3990, 4012, 1),
         instruments=(("FAKE", "USD"), ("BAR", "USD")),
-        commissions=Commissions(min=2.5, max_pct=1.0, per_unit=0.01),
+        commissions=Commissions(min=2.5, max_pct=1.0, per_unit=0.5),
         self_matching=(1, 3),
-        expects=frozenset({"market remainder", "off-grid price", "two instruments"}),
+        expects=frozenset(
+            {
+                "market remainder",
+                "off-grid price",
+                "two instruments",
+                "per-unit commission binds",
+            }
+        ),
     ),
     # A narrow book: every level many orders deep, which is where FIFO order,
     # partial fills and the modify rules actually collide -- and where a
@@ -427,7 +480,13 @@ PROFILES = (
         p_supplied=0.35,
         max_reloads=2,
         expects=frozenset(
-            {"supplied identifier", "reload", "off-grid price", "two instruments"}
+            {
+                "supplied identifier",
+                "supplied identifier below the high-water mark",
+                "reload",
+                "off-grid price",
+                "two instruments",
+            }
         ),
     ),
     # The benchmark's own traffic, replayed. Not a fifth market shape chosen
@@ -495,7 +554,9 @@ class Generator:
     def __init__(self, profile, seed):
         self.profile = profile
         self.rng = random.Random(seed)
-        self.next_supplied = FIRST_SUPPLIED_ID
+        self.next_above = FIRST_SUPPLIED_ID
+        self.next_below = FIRST_INTERLEAVED_ID
+        self.supplied = 0
         self.reloads = 0
 
     @property
@@ -560,8 +621,7 @@ class Generator:
 
         idNum = timestamp = None
         if rng.random() < profile.p_supplied:
-            idNum = self.next_supplied
-            self.next_supplied += SUPPLIED_STRIDE
+            idNum = self._supplied_id()
             timestamp = REPLAY_TIMESTAMP
             tags.append("supplied identifier")
 
@@ -576,6 +636,29 @@ class Generator:
             timestamp=timestamp,
             tags=tuple(tags),
         )
+
+    def _supplied_id(self):
+        """The next caller-supplied identifier, alternating above and below.
+
+        Above the high-water mark and below it, one after the other, because
+        the two sides of `if idNum >= self._next_idNum` are different rules and
+        a workload that only ever climbs asks about one of them. Climbing first,
+        always: the descending band is only *below* anything once a climbing
+        identifier has taken the counters up to it, and the alternation is
+        deterministic rather than a coin flip so that the first draw of every
+        run is the one that establishes that.
+
+        The count is the generator's own, not the random stream's, so adding a
+        draw here cannot shift the prices and quantities a seed produces.
+        """
+        self.supplied += 1
+        if self.supplied % 2:
+            idNum = self.next_above
+            self.next_above += SUPPLIED_STRIDE
+            return idNum
+        idNum = self.next_below
+        self.next_below -= 1
+        return idNum
 
     def _modify(self, oracle, target):
         """A quantity change, a price change, both, or neither stated.
@@ -977,6 +1060,10 @@ class Run:
     generator: Generator
     history: list = field(default_factory=list)
     known_ids: list = field(default_factory=list)
+    #: The largest identifier either implementation has seen, which is where
+    #: both counters stand. A supplied identifier below this is one the
+    #: counters have already passed -- see `FIRST_INTERLEAVED_ID`.
+    high_water: int = 0
     #: What this run has actually exercised, checked against `profile.expects`.
     tags: set = field(default_factory=set)
 
@@ -1034,6 +1121,50 @@ class Run:
                     entry.price for entry in self.reference.snapshot(side, symbol)
                 )
         return found
+
+    def _note_per_unit_commission(self, taker, trades):
+        """Tag the run if this operation charged the schedule's *middle* term.
+
+        `commissions`: the commission is
+        `min(max_pct * V / 100, max(min_commission, per_unit * Q))`. Three
+        terms, and until lob-e9a no workload here reached the middle one: every
+        schedule's floor stood above `per_unit * Q` for every quantity the
+        generator drew, so `commission_for` with the per-unit term deleted
+        outright passed the whole differential suite. The floor and the cap
+        were never the problem -- both bind in `ledgers` at small fills -- and
+        the fix was to move the floor under the quantities rather than the
+        quantities over the floor, because `V` grows with `Q` and so which of
+        the *cap* and the per-unit term binds is a property of the schedule
+        alone. See that profile's comment.
+
+        Every order this operation charged, which is the taker and both sides
+        of each execution: a maker's commission moves when it is filled, not
+        when it is submitted.
+
+        Read off the model's own numbers rather than recomputed from the
+        formula. If the commission charged *is* `per_unit * Q` and that product
+        cleared the floor, then the middle term is what the `max` chose and the
+        cap did not undercut it. Exact equality is right here and the money
+        tolerance is not: it is the same multiplication on both sides of the
+        comparison, so a difference of one bit would mean the model is not
+        doing what this reads it as doing.
+        """
+        schedule = as_commissions(self.profile.commissions)
+        if not schedule.per_unit:
+            return
+        charged = {taker}
+        charged.update(trade.bid for trade in trades)
+        charged.update(trade.ask for trade in trades)
+        for idNum in charged:
+            if idNum is None:
+                continue
+            state = self.reference.order_state(idNum)
+            if state is None:
+                continue
+            per_unit = schedule.per_unit * state.fulfilled
+            if per_unit > schedule.min and state.commission == per_unit:
+                self.tags.add("per-unit commission binds")
+                return
 
     def report(self, index, op, found):
         """The failure message. This is the whole point of the harness."""
@@ -1109,8 +1240,17 @@ class Run:
             and self._two_instruments_resting()
         ):
             self.tags.add("two instruments")
+        if "per-unit commission binds" not in self.tags:
+            self._note_per_unit_commission(reference_id, reference_trades)
         if op.kind in ("limit", "market"):
+            if op.idNum is not None and op.idNum < self.high_water:
+                # Read off the run rather than off the generator's intent, the
+                # way the tag above is: what makes an interleaved identifier
+                # interleaved is where the counters had got to when it arrived,
+                # and only the run knows that.
+                self.tags.add("supplied identifier below the high-water mark")
             self.known_ids.append(reference_id)
+            self.high_water = max(self.high_water, reference_id)
             state = self.reference.order_state(reference_id)
             if op.kind == "market" and state.fulfilled < state.qty:
                 self.tags.add("market remainder")
@@ -1135,18 +1275,11 @@ def build_pair(tmp_path, profile, name="run"):
         self_matching=profile.self_matching,
         instrument=first,
         currency=first_currency,
+        instruments=profile.instruments[1:],
         tick_size=profile.tick_size,
     )
     reference = build_reference(tmp_path / ("%s-reference" % name), **options)
     engine = build_inmemory(tmp_path / ("%s-engine.db" % name), **options)
-    for adapter in (reference, engine):
-        # The acceptance builders configure one instrument; a differential
-        # workload wants several. `configure_instrument` is the public call
-        # that declares one, and on the engine it is also what puts an
-        # `InstrumentConfigured` in the stream, so a reload rebuilds the same
-        # set of books.
-        for symbol, currency in profile.instruments[1:]:
-            adapter.book.configure_instrument(symbol, currency)
     return reference, engine
 
 
@@ -1562,6 +1695,13 @@ def test_every_input_class_the_table_names_is_still_expected():
     the list below plus that check is the whole guarantee, and the guarantee is
     only as good as the list being asserted somewhere.
 
+    Two entries below are not in that table, and are here for the same reason
+    the table's are: an input class this harness once failed to reach at all.
+    A supplied identifier *below* the high-water mark and a commission that
+    charges the schedule's per-unit term were both unreachable until lob-e9a,
+    each because of one constant, and a list of what must be reached is the
+    only thing that would have said so.
+
     It is asserted here because the pressure is real and one-directional: the
     benchmark's workload is narrower than this harness's by design (one
     instrument, on-grid prices, submissions only), and "share the generator"
@@ -1575,9 +1715,11 @@ def test_every_input_class_the_table_names_is_still_expected():
         "off-grid price",
         "reprice onto an occupied level",
         "supplied identifier",
+        "supplied identifier below the high-water mark",
         "reload",
         "price=None modify",
         "two instruments",
+        "per-unit commission binds",
     } - expected
     assert not missing, (
         "no profile expects %s any more, so nothing fails when the workload "
@@ -1721,6 +1863,126 @@ def test_both_refuse_what_the_specs_refuse(tmp_path):
     finally:
         reference.close()
         engine.close()
+
+
+def test_a_reprice_crosses_at_its_own_limit_and_never_sweeps_the_book(tmp_path):
+    """A modify re-enters as a taker, and a taker with a price is not a market order.
+
+    `modifyOrder` lifts the repriced order out of the book and crosses it like
+    any arriving order (`trades = self.match(order)`), and what "like any
+    arriving order" has to mean is *at its own limit*. The order named a price;
+    a reprice names a different one, never no price at all. The legacy engine
+    read `price=None` on a modify as "become a market order" and swept an ask
+    at 105 with an order stored at 99 (`lob-crf`) -- and nothing named ever
+    pinned the other half of that: that a reprice which does name a price stops
+    where the price says. Replacing the call with a market-order match was
+    caught only by the randomized comparator, which is not the same as a test
+    that says what the rule is (lob-e9a).
+
+    Two halves, because a modify re-enters as a taker on two different
+    triggers. A reprice that crosses must take the levels it is entitled to and
+    leave the next one alone; a quantity increase, which re-enters for the same
+    reason at a price that crosses nothing, must trade nothing at all. The
+    untouched level is the whole difference between crossing and sweeping, so
+    it is asserted directly rather than through the two implementations
+    agreeing.
+    """
+    profile = PROFILES[0]
+    reference, engine = build_pair(tmp_path, profile, name="reprice")
+    try:
+        for book in (reference, engine):
+            # Order 1 is the bid; 2, 3 and 4 are asks a tick apart, on a
+            # trader of their own because this profile gates self-matching.
+            book.limit("bid", 12, 99.90, 1)
+            book.limit("ask", 5, 100.02, 2)
+            book.limit("ask", 5, 100.03, 2)
+            book.limit("ask", 5, 100.04, 2)
+
+            # Repriced to 100.03: entitled to the two levels at or below it,
+            # and to nothing above. A market order would take 100.04 as well
+            # and finish with 12 fulfilled and nothing resting.
+            assert book.modify(1, price=100.03) == (
+                Trade(bid=1, ask=2, price=100.02, qty=5),
+                Trade(bid=1, ask=3, price=100.03, qty=5),
+            )
+            assert book.snapshot("ask") == (
+                BookEntry(idNum=4, price=100.04, available=5, qty=5, fulfilled=0),
+            )
+            assert book.snapshot("bid") == (
+                BookEntry(idNum=1, price=100.03, available=2, qty=12, fulfilled=10),
+            )
+
+            # And the quantity-increase trigger: reprioritized, re-entered,
+            # crossing nothing, because 100.03 is still under the 100.04 ask.
+            assert book.modify(1, qty=20) == ()
+            assert book.snapshot("ask") == (
+                BookEntry(idNum=4, price=100.04, available=5, qty=5, fulfilled=0),
+            )
+            assert book.snapshot("bid") == (
+                BookEntry(idNum=1, price=100.03, available=10, qty=20, fulfilled=10),
+            )
+
+        assert not differences(
+            reference, engine, profile, known_ids=[1, 2, 3, 4], probes=(100.04,)
+        )
+    finally:
+        reference.close()
+        engine.close()
+
+
+def test_the_quantizer_memo_is_bounded_and_survives_being_emptied():
+    """`OrderBook.quantize` keeps its answers, and the memo has a ceiling.
+
+    Two claims that only this test makes. Every workload in this file works a
+    few hundred prices, and a differential comparison cannot see a dictionary
+    at all, so both of these survived the whole suite when they were broken
+    (lob-e9a):
+
+    * **the bound holds.** Deleting the two lines that empty a full memo leaves
+      a book growing one entry for every distinct price it is ever asked about
+      -- 672 KiB at the 8192-entry cap and unbounded past it -- for the life of
+      a session. Nothing failed.
+    * **the answers survive the emptying.** "Full means cleared, not evicted
+      one by one" is a policy with a moment in it: the prices asked before the
+      clear are gone and must be recomputed on the same grid when they come
+      back.
+
+    Checked against `reference.matcher.quantize` rather than against the
+    engine's own `_quantize`, for the reason the rest of this file exists --
+    the two are independent implementations of one clause. This is
+    `test_the_grid_is_half_on_the_grid_and_half_off_it`'s comparison, carried
+    across an eviction.
+
+    It reads a private attribute, which a test of a cache has no way around: a
+    memo that is doing its job is invisible from outside, and "invisible" is
+    exactly the state an unbounded one would also be in.
+    """
+    from PyLOB.engine import _GRID_MEMO_SIZE, OrderBook
+
+    tick = 0.01
+    book = OrderBook(tick_size=tick)
+    # Whole half-ticks again, so half of these sit exactly between two ticks:
+    # an eviction is worth checking where the grid is hardest. Enough of them
+    # to overfill the memo, and not many more -- the cost of this test is one
+    # `Fraction` quantization per price.
+    prices = [round(half * tick / 2, 12) for half in range(1, _GRID_MEMO_SIZE + 65)]
+    assert len(set(prices)) == len(prices)
+
+    for price in prices:
+        assert book.quantize(price) == reference_matcher.quantize(price, tick), price
+        assert len(book._grid) <= _GRID_MEMO_SIZE, (
+            "the memo holds %d prices against a cap of %d"
+            % (len(book._grid), _GRID_MEMO_SIZE)
+        )
+
+    # It filled and emptied rather than merely staying under the cap: what is
+    # left is what arrived after the clear, not everything that was asked.
+    assert len(book._grid) < len(prices)
+
+    # The prices the clear dropped, asked again. Recomputed, and on the grid
+    # they were on before.
+    for price in prices[:64]:
+        assert book.quantize(price) == reference_matcher.quantize(price, tick), price
 
 
 def test_the_grid_is_half_on_the_grid_and_half_off_it():

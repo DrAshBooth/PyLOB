@@ -209,6 +209,7 @@ def build_reference(
     self_matching=(),
     instrument=INSTRUMENT,
     currency=CURRENCY,
+    instruments=(),
     tick_size=DEFAULT_TICK,
 ):
     """Build the reference model, configured like any other engine under test.
@@ -217,12 +218,23 @@ def build_reference(
     way and hold them side by side. `db_path` is accepted and ignored: the
     model has no persistence, and taking the argument is what keeps the two
     builders interchangeable.
+
+    `instrument`/`currency` are the *default* instrument -- the one every
+    surface call means when it names none -- and `instruments` are further
+    `(symbol, currency)` pairs to declare beside it, each settling in its own
+    currency. The option is mirrored rather than merely tolerated: a caller
+    that has to reach past one of these builders into the book it wrapped
+    (`adapter.book.configure_instrument(...)`) is configuring two engines by
+    two different routes, which is precisely what a differential harness must
+    not do.
     """
     schedule = as_commissions(commissions)
     allowed = self_matching_set(self_matching, traders)
 
     book = ReferenceBook(tick_size=tick_size)
     book.configure_instrument(instrument, currency)
+    for symbol, settles_in in instruments:
+        book.configure_instrument(symbol, settles_in)
     for tid in traders:
         book.configure_trader(
             tid,
