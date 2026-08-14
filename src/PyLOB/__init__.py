@@ -8,6 +8,11 @@ into, and since ADR-0003 retired the SQL engine PR #7 built it is the only one -
 (`processOrder`, `cancelOrder`, `modifyOrder`, `getVolumeAtPrice`,
 `getBest*`/`getWorst*`, `print`); only the implementation behind it is gone.
 
+`replay` (`PyLOB.replay`) is the other half of a recorded session: it takes the
+events back, re-issues the commands among them into a fresh engine, and lets
+that engine derive every fill again. It takes an *iterable of events* rather
+than a database, so it costs no import.
+
 Also exported: the exceptions a caller catches (`PyLOBError` and its
 subclasses), the objects the public API hands back (`Order`, `Trade`,
 `Trader`), the two vocabularies it accepts (`Side`, `OrderType` -- plain
@@ -19,9 +24,16 @@ its results.
 hot path (ADR-0001, ADR-0002), and importing it eagerly would make every
 `import PyLOB` import `sqlite3` for a feature most callers never attach::
 
-    from PyLOB.sinks.sqlite import SQLiteSink
+    from PyLOB import OrderBook, replay
+    from PyLOB.sinks.sqlite import SQLiteSink, read_events
 
     book = OrderBook(tick_size=0.01, sink=SQLiteSink("session.db"))
+    ...
+    book.close()
+    rebuilt, trades = replay(read_events("session.db"))
+
+That this module imports no `sqlite3` is a promise, and
+`tests/test_replay.py` holds it: a subprocess imports `PyLOB` and looks.
 """
 
 from typing import Final
@@ -38,6 +50,7 @@ from .engine import (
     UnknownOrder,
 )
 from .events import EventSink, OrderType, Side
+from .replay import ReplayError, replay
 
 #: This library's version, as a literal rather than a lookup: the package is
 #: installable from a git URL at a commit that `importlib.metadata` would
@@ -57,10 +70,12 @@ __version__: Final = "0.1.0"
 __all__ = [
     "__version__",
     "OrderBook",
+    "replay",
     "PyLOBError",
     "InvalidOrder",
     "DuplicateOrderID",
     "UnknownOrder",
+    "ReplayError",
     "Order",
     "Trade",
     "Trader",

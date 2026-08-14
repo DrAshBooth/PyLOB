@@ -95,6 +95,8 @@ from PyLOB.sinks.sqlite import SQLiteSink, read_events
 # pytest puts it on `sys.path`), and `tests/test_sink_equality.py` already
 # borrows from it. The round-trip test below reuses its capture and its
 # comparison rather than growing a second `EndState` to keep correct.
+# `replayed_from` is its two-line composition of `read_events` with the shipped
+# `PyLOB.replay`; the replaying itself is not this suite's, nor that suite's.
 import test_replay as replay_suite
 
 TICK = 0.01
@@ -269,7 +271,7 @@ def test_the_last_price_a_replay_reports_is_the_one_the_engine_reports(tmp_path)
         book.setLastPrice(INSTRUMENT, 999.0)
     book.close()
 
-    replayed, _ = replay_suite.replay(path)
+    replayed, _ = replay_suite.replayed_from(path)
     assert replayed.getLastPrice(INSTRUMENT) == book.getLastPrice(INSTRUMENT) == 100.0
 
 
@@ -332,7 +334,7 @@ def test_a_create_order_only_session_replays_as_a_full_submission(tmp_path):
     assert original.getLastPrice(INSTRUMENT) is None, "the original never traded"
     assert [order.idNum for order in original.snapshot(INSTRUMENT, "ask")] == [1]
 
-    replayed, trades = replay_suite.replay(path)
+    replayed, trades = replay_suite.replayed_from(path)
 
     assert len(trades) == 1, "the replay was expected to invent exactly one trade"
     assert replayed.getLastPrice(INSTRUMENT) == 100.0
@@ -352,7 +354,7 @@ def test_a_create_order_only_session_round_trips(tmp_path):
     """The property that ought to hold for every public path, and does not."""
     path = tmp_path / "createonly.db"
     original = create_order_only_session(path)
-    replayed, _ = replay_suite.replay(path)
+    replayed, _ = replay_suite.replayed_from(path)
 
     assert [order.idNum for order in replayed.snapshot(INSTRUMENT, "ask")] == [
         order.idNum for order in original.snapshot(INSTRUMENT, "ask")
@@ -935,7 +937,7 @@ def test_the_previously_unrecorded_paths_round_trip(tmp_path):
     seqs = [event.seq for event in read_events(path)]
     assert seqs == list(range(len(seqs)))
 
-    replayed, trades = replay_suite.replay(path)
+    replayed, trades = replay_suite.replayed_from(path)
 
     replay_suite.assert_same_end_state(original, replay_suite.capture(replayed))
     assert trades, "a round trip over an empty session proves nothing"

@@ -1,5 +1,9 @@
 """Replay: a persisted event stream fed into a fresh engine reaches the same state.
 
+This suite pins the `recording-sink` scenario "State reconstructs from the
+log", and it pins it on the shipped `PyLOB.replay` -- the function a researcher
+calls -- rather than on a copy of it kept here.
+
 `PyLOB.events` (the "Replay" section) says the stream, not a live database, is
 what a session persists: re-issuing the *replayable* events in `seq` order into
 a fresh `PyLOB.engine.OrderBook` must reproduce the session. `Filled` and the
@@ -31,21 +35,27 @@ has to have rebuilt correctly from every earlier command rather than read from
 a projection.
 
 `harness.inmemory`'s `InMemoryAdapter.reopen` performs the same reload behind
-the engine-neutral acceptance surface. `replay` below is the engine-level
-equivalent: it is not reused from there because that surface hides exactly
-what this suite exists to compare -- per-order accounting, priority stamps,
-the whole ledger, more than one instrument.
+the engine-neutral acceptance surface, and calls the same shipped function.
+This suite works at the engine level instead, because that surface hides
+exactly what it exists to compare -- per-order accounting, priority stamps, the
+whole ledger, more than one instrument.
 """
 
 from __future__ import annotations
 
 import random
+import subprocess
+import sys
 from collections import Counter
+from dataclasses import replace as replace_field
 from typing import NamedTuple
 
 import pytest
 from harness import MONEY_ABS, MONEY_REL
+from PyLOB import ReplayError, replay
 from PyLOB.engine import OrderBook as InMemoryOrderBook
+from PyLOB.events import Filled, is_replayable
+from PyLOB.sinks import ListSink
 from PyLOB.sinks.sqlite import SQLiteSink, read_events
 
 # --------------------------------------------------------------------------
@@ -105,14 +115,13 @@ N_OPS = 2000
 MID = 100.0
 
 
-def build_recorded(db_path):
-    """A fresh engine recording to `db_path`, configured and empty.
+def configure(book):
+    """Declare both instruments and all five commission schedules; return `book`.
 
     Configuration goes through the engine's own calls so that the tick size,
     both currencies and all five commission schedules reach the stream as
     events -- a replay cannot charge the same commissions otherwise.
     """
-    book = InMemoryOrderBook(tick_size=TICK, sink=SQLiteSink(db_path))
     for symbol, currency in INSTRUMENTS:
         book.configure_instrument(symbol, currency)
     for tid, self_matching, minimum, max_percnt, per_unit in TRADERS:
@@ -125,6 +134,21 @@ def build_recorded(db_path):
             commission_per_unit=per_unit,
         )
     return book
+
+
+def build_recorded(db_path):
+    """A fresh engine recording to `db_path`, configured and empty."""
+    return configure(InMemoryOrderBook(tick_size=TICK, sink=SQLiteSink(db_path)))
+
+
+def build_listed():
+    """A fresh engine recording to a `ListSink`; returns `(book, sink)`.
+
+    No file and no `sqlite3`: the same session, kept in memory, which is the
+    other shape of input `replay` accepts.
+    """
+    sink = ListSink()
+    return configure(InMemoryOrderBook(tick_size=TICK, sink=sink)), sink
 
 
 def _price(rng, side, aggressive):
@@ -225,63 +249,25 @@ def run_workload(book, rng, n_ops=N_OPS):
 # replaying a recorded stream
 # --------------------------------------------------------------------------
 
+# There is no replay implementation here. `PyLOB.replay` is the one in the
+# repository, and every test below drives it, so what these assertions hold is
+# what a researcher gets.
+#
+# A recorded session is replayed by composing two shipped functions:
+# `read_events` decodes the log into events, `replay` re-issues the commands
+# among them. Composition rather than a `replay(path)` convenience is what
+# keeps `sqlite3` off `import PyLOB` -- and it is what lets the same function
+# replay a `ListSink`'s list, which no path would name.
+#
+# The filter is applied by `replay` itself, by calling `events.is_replayable`.
+# Passing the *unfiltered* stream below is therefore deliberate: it exercises
+# that filter rather than the sink's materialised `replayable` column, which
+# `test_the_replayable_column_and_the_filter_agree` compares it against.
 
-def replay(db_path, sink=None):
-    """Re-issue the replayable events at `db_path` into a fresh engine.
 
-    `read_events(..., replayable_only=True)` is the whole filter: it yields
-    decoded events in `seq` order and applies the `replayable` column, which
-    the sink wrote by calling `events.is_replayable`. There is no second
-    decoder and no second copy of the replayability rule here -- in particular
-    nothing skips `Filled` explicitly, because nothing ever sees one.
-
-    Returns `(book, trades)`: the rebuilt engine and the executions *it*
-    derived, which is the sequence a caller of the original session saw.
-    """
-    book = None
-    trades = []
-    for event in read_events(db_path, replayable_only=True):
-        # `KIND` is the wire name and is stable across renames of the event
-        # class, so dispatching on it needs no imports.
-        if event.KIND == "session_started":
-            assert book is None, "a stream has exactly one SessionStarted"
-            book = InMemoryOrderBook(tick_size=event.tick_size, sink=sink)
-        elif event.KIND == "instrument_configured":
-            book.configure_instrument(event.symbol, event.currency)
-        elif event.KIND == "trader_configured":
-            book.configure_trader(
-                event.tid,
-                name=event.name,
-                allow_self_matching=event.allow_self_matching,
-                commission_min=event.commission_min,
-                commission_max_percnt=event.commission_max_percnt,
-                commission_per_unit=event.commission_per_unit,
-            )
-        elif event.KIND == "accepted":
-            _, made = book.submit(
-                tid=event.tid,
-                instrument=event.instrument,
-                side=event.side,
-                order_type=event.order_type,
-                qty=event.qty,
-                price=event.price,
-                idNum=event.idNum,
-                timestamp=event.timestamp,
-            )
-            trades.extend(made)
-        elif event.KIND == "modified":
-            made, _ = book.modifyOrder(
-                event.idNum,
-                dict(side=event.side, qty=event.qty, price=event.price),
-                time=event.timestamp,
-            )
-            trades.extend(made)
-        elif event.KIND == "cancelled":
-            book.cancelOrder(event.side, event.idNum, time=event.timestamp)
-        else:  # pragma: no cover - a new replayable kind, unhandled
-            raise AssertionError("unhandled replayable event %r" % (event.KIND,))
-    assert book is not None, "the stream is empty"
-    return book, trades
+def replayed_from(db_path, sink=None):
+    """`replay` over the whole recorded log at `db_path`. Two calls, no logic."""
+    return replay(read_events(db_path), sink=sink)
 
 
 # --------------------------------------------------------------------------
@@ -485,7 +471,7 @@ def test_replay_reaches_the_same_end_state(tmp_path, seed):
     assert_workload_was_substantial(original, trades, counts)
     book.close()
 
-    replayed_book, replayed_trades = replay(db_path)
+    replayed_book, replayed_trades = replayed_from(db_path)
 
     assert_same_end_state(original, capture(replayed_book))
     # The replayed engine derived these itself: no `Filled` was ever fed back
@@ -511,7 +497,7 @@ def test_identifiers_after_replay_cannot_collide(tmp_path, seed):
     assert before
     book.close()
 
-    replayed_book, _ = replay(db_path)
+    replayed_book, _ = replayed_from(db_path)
     assert {order.idNum for order in replayed_book.orders()} == before
 
     for expected in range(max(before) + 1, max(before) + 21):
@@ -542,7 +528,7 @@ def test_replay_re_emits_an_identical_stream(tmp_path):
     book.close()
 
     replay_path = tmp_path / "replay.db"
-    replayed_book, _ = replay(original_path, sink=SQLiteSink(replay_path))
+    replayed_book, _ = replayed_from(original_path, sink=SQLiteSink(replay_path))
     replayed_book.close()
 
     original_stream = list(read_events(original_path))
@@ -550,3 +536,130 @@ def test_replay_re_emits_an_identical_stream(tmp_path):
     assert len(replayed_stream) == len(original_stream)
     for replayed_event, original_event in zip(replayed_stream, original_stream):
         assert replayed_event == original_event
+
+
+# --------------------------------------------------------------------------
+# what taking events rather than a path buys
+# --------------------------------------------------------------------------
+
+
+def test_replay_reconstructs_from_a_list_of_events_with_no_database():
+    """The ratified scenario again, with no file and no `sqlite3` anywhere.
+
+    `replay` takes an iterable of events, so a session recorded to a `ListSink`
+    replays out of memory. The list still holds the fills -- nothing filtered
+    it -- which is what makes this the test of `replay`'s own call to
+    `events.is_replayable`: feed a `Filled` back in and the book double-books.
+    """
+    book, sink = build_listed()
+    trades, counts = run_workload(book, random.Random(3), n_ops=800)
+    original = capture(book)
+
+    assert any(isinstance(event, Filled) for event in sink.events), (
+        "the list holds engine output too, or this proves nothing about the filter"
+    )
+    assert counts["trades"] > 50 and counts["modify_trades"] > 10, counts
+
+    replayed_book, replayed_trades = replay(sink.events)
+
+    assert_same_end_state(original, capture(replayed_book))
+    assert trade_log(replayed_trades) == trade_log(trades)
+
+
+def test_the_replayable_column_and_the_filter_agree(tmp_path):
+    """The sink's materialised filter and `is_replayable` are the same rule.
+
+    `read_events(..., replayable_only=True)` applies the column the sink wrote
+    at record time; `replay` applies `events.is_replayable` to whatever it is
+    handed. Both come from the one function, so replaying the filtered read and
+    the whole log must land in the same place -- and if they ever did not, one
+    of the two would be a second copy of the rule.
+    """
+    db_path = tmp_path / "session.db"
+    book = build_recorded(db_path)
+    run_workload(book, random.Random(11), n_ops=600)
+    book.close()
+
+    whole = list(read_events(db_path))
+    filtered = list(read_events(db_path, replayable_only=True))
+    assert len(filtered) < len(whole), "the filter dropped nothing; nothing traded"
+    assert filtered == [event for event in whole if is_replayable(event)]
+
+    from_whole, trades_from_whole = replay(whole)
+    from_filtered, trades_from_filtered = replay(filtered)
+
+    assert_same_end_state(capture(from_whole), capture(from_filtered))
+    assert trade_log(trades_from_filtered) == trade_log(trades_from_whole)
+
+
+# --------------------------------------------------------------------------
+# what replay refuses
+# --------------------------------------------------------------------------
+
+
+def recorded_events(n_ops=40, seed=17):
+    """A short recorded session as a list of events. No file involved."""
+    book, sink = build_listed()
+    run_workload(book, random.Random(seed), n_ops=n_ops)
+    return sink.events
+
+
+def test_replay_refuses_a_stream_that_does_not_open_with_a_session():
+    """Without `SessionStarted` there is no tick size to build an engine with.
+
+    Dropping it is what slicing a log wrong looks like, and the failure it
+    would otherwise cause is a book quantized to the default tick -- orders at
+    plausible but different prices, and no exception anywhere.
+    """
+    events = recorded_events()
+    with pytest.raises(ReplayError, match="not SessionStarted"):
+        replay(events[1:])
+
+    with pytest.raises(ReplayError, match="empty"):
+        replay([])
+
+
+def test_replay_refuses_two_sessions_concatenated():
+    """Two logs appended together are two books, not a longer one."""
+    with pytest.raises(ReplayError, match="second SessionStarted"):
+        replay(recorded_events() + recorded_events(seed=18))
+
+
+def test_replay_refuses_a_stream_version_it_does_not_implement():
+    """`SessionStarted.stream_version`: refuse what this release cannot read.
+
+    `read_events` refuses it too, from the recorded `session` row -- but a
+    caller replaying a list of events never goes near that check, so the
+    replayer keeps its own, as `events.SessionStarted` says it must.
+    """
+    events = recorded_events()
+    with pytest.raises(ReplayError, match="stream_version"):
+        replay([replace_field(events[0], stream_version=99)] + events[1:])
+
+
+# --------------------------------------------------------------------------
+# the import that must not happen
+# --------------------------------------------------------------------------
+
+
+def test_importing_PyLOB_does_not_import_sqlite3():
+    """`PyLOB.__init__`, README: persistence is optional, so is its import.
+
+    Checked in a subprocess because the claim is about a fresh interpreter:
+    this one imported `sqlite3` at the top of three sink suites long before
+    getting here. `replay` shipping inside the package is what makes the check
+    worth having -- it is the first module in `PyLOB` whose whole purpose is
+    reading a recorded session, and the composition with `read_events` rather
+    than a `replay(path)` convenience is what keeps the promise true.
+    """
+    probe = (
+        "import sys; import PyLOB; "
+        "print(sorted(m for m in sys.modules if 'sqlite' in m))"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", probe], capture_output=True, text=True, timeout=60
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "[]", (
+        "`import PyLOB` pulled in %s" % result.stdout.strip()
+    )

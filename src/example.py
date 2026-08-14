@@ -4,13 +4,15 @@ Run it from a clone with `uv run python src/example.py`. It prints a running
 commentary and writes nothing outside a temporary directory it creates and
 removes.
 
-Two acts:
+Three acts:
 
 1. `walkthrough` -- one book, no sink. Limit orders that rest, a limit order
    that crosses, one that crosses only partially, a market order, a cancel, a
    modify, and one last submission through the legacy dict-quote API.
 2. `recorded` -- the same engine with a `SQLiteSink` attached, and the SQL
    that reads the session back afterwards.
+3. `replayed` -- that recording fed back into a fresh engine, which reaches
+   the same book by matching again rather than by restoring anything.
 
 `./verify` runs this file end to end, so it cannot drift from the library.
 
@@ -160,6 +162,30 @@ def recorded(db_path):
     print("recorded %d events at %s; trades: %r" % (events, db_path, trades))
 
 
+def replayed(db_path):
+    """The third act: the recording fed back into a fresh engine.
+
+    What a session persists is its event log, so `read_events` decodes the log
+    and `replay` re-issues the *commands* in it -- the configuration, the
+    submissions, the modifications, the cancellations someone asked for. The
+    fills are not fed back: this engine matches again and derives them itself,
+    which is why an identical book is evidence of determinism and not of a
+    restore.
+
+    `replay` takes events rather than a path, so a session kept in memory (a
+    `PyLOB.sinks.ListSink`) replays exactly the same way -- and `import PyLOB`
+    still costs no `sqlite3`.
+    """
+    from PyLOB import replay
+    from PyLOB.sinks.sqlite import read_events
+
+    lob, trades = replay(read_events(db_path))
+    print(
+        "replayed: %d trade(s) re-derived, last price %s, best ask %s"
+        % (len(trades), lob.getLastPrice(INSTRUMENT), lob.getBestAsk(INSTRUMENT))
+    )
+
+
 def main():
     # One book is one session, and the two acts below are two of them: there
     # is no `reset()` because constructing a fresh `OrderBook` is the reset,
@@ -172,7 +198,9 @@ def main():
     # The database is temporary only because this is an example -- point the
     # sink anywhere you want the session kept.
     with tempfile.TemporaryDirectory() as tmp:
-        recorded(Path(tmp) / "session.db")
+        session = Path(tmp) / "session.db"
+        recorded(session)
+        replayed(session)
 
 
 if __name__ == "__main__":

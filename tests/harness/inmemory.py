@@ -8,6 +8,7 @@ engine wants its own module here, against `harness.surface`, and a params
 list back over the two.
 """
 
+from PyLOB import replay
 from PyLOB.engine import OrderBook
 from PyLOB.sinks.sqlite import SQLiteSink, read_events
 
@@ -82,13 +83,15 @@ class InMemoryAdapter:
     def reopen(self):
         """Rebuild the engine from persisted state; return self.
 
-        For this engine the persisted state is the event stream. The sink is
-        flushed and closed, the *replayable* events are read back -- the
-        configuration and the commands a caller made, never the fills, which
-        would double-book -- and re-issued into a fresh book that derives
-        every trade for itself. Nothing carries over in memory: the trade log
-        here is cleared and refilled by the replay, so what it holds
-        afterwards is what the new engine produced, not what the old one did.
+        For this engine the persisted state is the event stream, and
+        `PyLOB.replay` is what re-issues one -- the same shipped function
+        `tests/test_replay.py` compares end states with, so this surface
+        reloads the way a researcher does. The sink is flushed and closed, the
+        events are read back, and the commands among them are re-issued into a
+        fresh book that derives every trade for itself. Nothing carries over
+        in memory: the trade log here is replaced by the replay's, so what it
+        holds afterwards is what the new engine produced, not what the old one
+        did.
 
         The reloaded session records to a new file, since the log's `seq` is
         its primary key and a second session cannot append to the first.
@@ -100,55 +103,9 @@ class InMemoryAdapter:
         self.db_path = self.db_path.with_name(
             "%s.reload%d.db" % (self.db_path.stem, self._reloads)
         )
-        self._trades = []
 
-        book = None
-        for event in events:
-            # `KIND` is the wire name and is stable across renames of the
-            # event class, so dispatching on it needs no imports.
-            if event.KIND == "session_started":
-                book = OrderBook(
-                    tick_size=event.tick_size, sink=SQLiteSink(self.db_path)
-                )
-            elif event.KIND == "instrument_configured":
-                book.configure_instrument(event.symbol, event.currency)
-            elif event.KIND == "trader_configured":
-                book.configure_trader(
-                    event.tid,
-                    name=event.name,
-                    allow_self_matching=event.allow_self_matching,
-                    commission_min=event.commission_min,
-                    commission_max_percnt=event.commission_max_percnt,
-                    commission_per_unit=event.commission_per_unit,
-                )
-            elif event.KIND == "accepted":
-                _, trades = book.submit(
-                    tid=event.tid,
-                    instrument=event.instrument,
-                    side=event.side,
-                    order_type=event.order_type,
-                    qty=event.qty,
-                    price=event.price,
-                    idNum=event.idNum,
-                    timestamp=event.timestamp,
-                )
-                self._trades.extend(trades)
-            elif event.KIND == "modified":
-                trades, _ = book.modifyOrder(
-                    event.idNum,
-                    dict(
-                        side=event.side,
-                        qty=event.qty,
-                        price=event.price,
-                        tid=event.tid,
-                    ),
-                    time=event.timestamp,
-                )
-                self._trades.extend(trades)
-            elif event.KIND == "cancelled":
-                book.cancelOrder(event.side, event.idNum, time=event.timestamp)
-
-        self.book = book
+        self.book, trades = replay(events, sink=SQLiteSink(self.db_path))
+        self._trades = list(trades)
         return self
 
     def close(self):

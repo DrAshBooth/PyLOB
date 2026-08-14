@@ -70,9 +70,9 @@ leg of a trade, not the cash leg. `configure_trader` sets a trader's
 commission schedule and whether it may match its own resting orders.
 
 `src/example.py` is the full walkthrough — limit orders, crossing, partial
-fills, market orders, cancel, modify, the legacy dict-quote API, and the same
-run again with a recording sink attached. It is executed on every `./verify`,
-so it cannot rot silently.
+fills, market orders, cancel, modify, the legacy dict-quote API, the same run
+again with a recording sink attached, and that recording replayed back into a
+fresh engine. It is executed on every `./verify`, so it cannot rot silently.
 
 Sessions and episodes:
 ======================
@@ -151,6 +151,31 @@ and does not change, and how a killed run is told apart from a finished one.
 Do not read a recorded database without `check_log`/`read_events`, or at least
 without knowing what that header says about `session_end`: a session that was
 killed mid-run looks exactly like a shorter one.
+
+Replaying a session:
+====================
+The log, not the database file, is what a session persists. `replay` re-issues
+the recorded *commands* — the configuration, the submissions, the
+modifications, the cancellations someone asked for — into a fresh engine:
+
+```python
+from PyLOB import replay
+from PyLOB.sinks.sqlite import read_events
+
+book, trades = replay(read_events("session.db"))
+```
+
+The fills are not fed back in. The rebuilt engine matches again and derives
+every one of them for itself, so an identical book is evidence of determinism
+rather than of a restore — and `recording-sink` requires exactly that: the
+reconstructed book snapshot and last-trade price equal the original session's
+end state.
+
+`replay` takes an *iterable of events*, not a path. `read_events` is what turns
+a `.db` into one; a session kept in memory with `PyLOB.sinks.ListSink` replays
+from `sink.events` with no file and no `sqlite3` in sight. That is also why
+`import PyLOB` still does not import `sqlite3`, even though `replay` ships in
+the package.
 
 Usage and semantics:
 ====================
