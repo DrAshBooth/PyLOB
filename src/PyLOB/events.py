@@ -473,6 +473,12 @@ class EventSink(Protocol):
     being recorded rather than after it, so `consume` runs while the engine's
     structures are part-way through an update. All three are prohibitions with
     nothing enforcing them, and each costs something different.
+    `recording-sink`, "A sink observes the stream and does not act on the
+    engine", ratifies the first two and the absence of enforcement: a sink
+    "SHALL NOT call into the engine from `consume` -- neither a query nor a
+    mutation", and the engine "SHALL NOT detect, refuse, or compensate" for
+    one that does. Raising is this module's own prohibition; no requirement
+    describes what the engine is left holding afterwards.
 
     *Reading* returns an answer that is not merely stale but
     self-contradictory. A match walk lifts the level it is working off the

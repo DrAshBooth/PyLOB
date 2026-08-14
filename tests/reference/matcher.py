@@ -347,9 +347,12 @@ class ReferenceBook:
     #: instrument's currency"`).
     instruments: dict = field(default_factory=dict)
     traders: dict = field(default_factory=dict, repr=False)
-    #: Every order ever accepted, by identifier, kept for the book's lifetime.
-    #: `order-lifecycle: "Order identifiers are unique and stable"` makes an
-    #: identifier unique "within the book's lifetime", so nothing is pruned.
+    #: Every order ever accepted, by identifier, kept for this model's whole
+    #: lifetime. `order-lifecycle: "Order identifiers are unique and stable"`
+    #: makes an identifier unique "across every instrument the engine holds,
+    #: for that engine's lifetime", so nothing is pruned and this one dict
+    #: holds every instrument's orders: the identifier space is the model's,
+    #: not an instrument's.
     orders: dict = field(default_factory=dict, repr=False)
     #: The book itself.
     _resting: list = field(default_factory=list, repr=False)
@@ -795,8 +798,13 @@ class ReferenceBook:
         """Allocate or accept an identifier, keeping it unique for all time.
 
         `order-lifecycle: "Order identifiers are unique and stable"`: "unique
-        within the book's lifetime, including across reloads of persisted
-        state", and the scenario "Externally supplied duplicate is rejected".
+        across every instrument the engine holds, for that engine's lifetime,
+        including across reloads of persisted state", and the scenarios
+        "Externally supplied duplicate is rejected", "A duplicate from another
+        instrument is rejected" and "A finished order's identifier is not
+        reissued". One counter and one `orders` dict for the whole model, so
+        the refusal crosses instruments and outlives an order, as the
+        requirement does.
 
         A supplied identifier at or above the counter pushes the counter past
         itself, which is what makes uniqueness survive a reload that replays

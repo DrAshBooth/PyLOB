@@ -74,9 +74,18 @@ Identity
 
 `_orders` maps `idNum` -> `Order` and is never pruned: a filled or cancelled
 order is still addressable, because the acceptance surface asks a finished
-order for its `fulfilled` and `commission`. Retention is also what makes
-identifiers unique *within the book's lifetime* rather than merely among
-resting orders, which is what `order-lifecycle` requires.
+order for its `fulfilled` and `commission`. Retention is also what keeps an
+identifier unique *"across every instrument the engine holds, for that
+engine's lifetime"* rather than merely among resting orders, which is what
+`order-lifecycle` requires.
+
+One engine is one identifier space. `_orders` and `_next_idNum` belong to the
+engine and not to an instrument, so an identifier issued on one instrument is
+never issued again on another, and one that named a cancelled or filled order
+is never reissued at all. The scope has to be that wide for the API to work:
+`cancelOrder` and `modifyOrder` name an identifier and no instrument, and they
+reach the single order holding it. The scope is one engine and not the process
+-- two engines each issue 1, and an episode is a fresh `OrderBook` (ADR-0006).
 
 Two rules, both enforced in `create_order`, and both bugs on the legacy engine
 (lob-a17, lob-7e7):
@@ -1071,8 +1080,10 @@ class OrderBook:
     to and the taker rests against it -- a book left crossed between two
     traders, which no later operation unwinds. Neither is detected, and
     neither is a state any public call can reach. That a sink reads nothing
-    and calls nothing back is therefore a load-bearing contract, stated where
-    a sink author reads it (`events.EventSink`) and enforced by nothing.
+    and calls nothing back is therefore a load-bearing contract: it is
+    `recording-sink`, "A sink observes the stream and does not act on the
+    engine", which ratifies the prohibition and the non-enforcement together;
+    `events.EventSink` is where a sink author meets it.
 
     One book is one session and there is no `reset()`: an episode is a fresh
     `OrderBook`, which is the intended pattern and the measured-faster one
@@ -2321,7 +2332,10 @@ class OrderBook:
         operation does. What a sink may do from that position is
         `events.EventSink`'s contract, and nothing here checks it -- a sink
         that reads the engine is answered, one that calls back into it is
-        obeyed, and one that raises takes the operation down with it.
+        obeyed, and one that raises takes the operation down with it. The
+        unguardedness is the requirement, not an omission: `recording-sink`
+        has the engine "SHALL NOT detect, refuse, or compensate for a sink
+        that calls back into it".
 
         Not replay-coherent: it records, it does not act. An event pushed in
         from outside describes a transition the engine did not make, and the
