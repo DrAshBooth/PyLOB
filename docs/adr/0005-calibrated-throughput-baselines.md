@@ -58,8 +58,11 @@ Three parts:
    change's own decision (20% by default), applied to the normalised value.
 
 **439 orders/sec is recorded as a historical origin, not a live denominator.**
-The engine's speedup over the 2013 SQL implementation is a fact about the
+The engine's speedup over the legacy SQL implementation is a fact about the
 project's history, quotable as such, and no longer something a test can assert.
+For the record, since the two get conflated: the SQL engine was written in
+2022-10 and merged as PR #7 on 2023-01-01, and it is what 439 orders/sec
+measures. The tree implementation it replaced is the 2013 one.
 
 ## Consequences
 

@@ -42,10 +42,9 @@ Detecting which core class we got
 ---------------------------------
 
 There is no public API for "which core am I on". What there is, on Darwin, is
-`proc_pid_rusage(RUSAGE_INFO_V4)`, which reports the process's retired
-instructions and elapsed *cycles*. Cycles divided by CPU seconds is the
-effective clock, and on a heterogeneous CPU the P and E clusters are far
-enough apart to tell apart.
+`proc_pid_rusage(RUSAGE_INFO_V4)`, which reports the *cycles* elapsed against
+the process. Cycles divided by CPU seconds is the effective clock, and on a
+heterogeneous CPU the P and E clusters are far enough apart to tell apart.
 
 The threshold is not hardcoded, because hardcoding 2.06 GHz would be a fact
 about one chip. Instead `measure_core_class` takes a short reference sample
@@ -70,14 +69,15 @@ import platform
 import subprocess
 import sys
 import time
+from pathlib import Path
 from typing import Any, Final
 
 __all__ = [
     "CoreClock",
     "capture",
-    "effective_ghz",
     "interpreter",
     "measure_core_class",
+    "repo_root",
     "request_performance_core",
 ]
 
@@ -89,10 +89,9 @@ _QOS_DEFAULT: Final = 0x15
 _QOS_BACKGROUND: Final = 0x09
 
 #: `struct rusage_info_v4` is a 16-byte uuid followed by 35 uint64 fields.
-#: `ri_instructions` and `ri_cycles` are the 30th and 31st of them.
+#: `ri_cycles` is the 31st of them.
 _RUSAGE_INFO_V4: Final = 4
 _RI_FIELDS: Final = 35
-_RI_INSTRUCTIONS: Final = 29
 _RI_CYCLES: Final = 30
 
 
@@ -201,21 +200,23 @@ def _power_source() -> str:
 def _git(*args: str) -> str | None:
     try:
         out = subprocess.run(
-            ("git", *args), capture_output=True, text=True, timeout=10, cwd=_repo_root()
+            ("git", *args), capture_output=True, text=True, timeout=10, cwd=repo_root()
         )
     except (OSError, subprocess.SubprocessError):
         return None
     return out.stdout.strip() if out.returncode == 0 else None
 
 
-def _repo_root() -> str:
-    """The package's repository, so provenance is about the code being measured.
+def repo_root() -> Path:
+    """The checkout this package was imported from: four levels above this file.
 
-    `os.getcwd()` would report whatever directory the benchmark happened to be
+    `os.getcwd()` would name whatever directory the benchmark happened to be
     invoked from, which on a worktree-per-agent layout is routinely a different
-    checkout from the one that was imported.
+    checkout from the one that was imported. Every consumer of "where is the
+    repository" asks here -- provenance's `git` calls and `__main__`'s default
+    baselines path -- so the two cannot count directories differently.
     """
-    return os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
+    return Path(__file__).resolve().parent.parent.parent.parent
 
 
 def _commit() -> dict[str, Any]:
@@ -242,16 +243,7 @@ def request_performance_core() -> str | None:
     A request, not a guarantee, and a no-op off Darwin. ADR-0005 wants this
     done and reported rather than relied on.
     """
-    if _LIBC is None or not hasattr(_LIBC, "pthread_set_qos_class_self_np"):
-        return None
-    try:
-        _LIBC.pthread_set_qos_class_self_np.argtypes = [ctypes.c_uint, ctypes.c_int]
-        _LIBC.pthread_set_qos_class_self_np.restype = ctypes.c_int
-        if _LIBC.pthread_set_qos_class_self_np(_QOS_USER_INTERACTIVE, 0) != 0:
-            return None
-    except (AttributeError, OSError, ValueError):
-        return None
-    return "user-interactive"
+    return "user-interactive" if _set_qos(_QOS_USER_INTERACTIVE) else None
 
 
 def _set_qos(qos: int) -> bool:
@@ -293,8 +285,8 @@ def _get_qos() -> int | None:
     return qos.value if rc == 0 else None
 
 
-def _rusage() -> tuple[int, int] | None:
-    """`(instructions, cycles)` retired by this process, or None."""
+def _rusage() -> int | None:
+    """Cycles elapsed against this process so far, or None."""
     if _LIBC is None or not hasattr(_LIBC, "proc_pid_rusage"):
         return None
     try:
@@ -306,7 +298,7 @@ def _rusage() -> tuple[int, int] | None:
         return None
     if rc != 0:
         return None
-    return buffer.ri_fields[_RI_INSTRUCTIONS], buffer.ri_fields[_RI_CYCLES]
+    return int(buffer.ri_fields[_RI_CYCLES])
 
 
 class CoreClock:
@@ -319,13 +311,12 @@ class CoreClock:
         clock.ghz  # None if the counters were unavailable or implausible
     """
 
-    __slots__ = ("_start", "_cpu0", "cycles", "instructions", "cpu_seconds")
+    __slots__ = ("_start", "_cpu0", "cycles", "cpu_seconds")
 
     def __init__(self) -> None:
-        self._start: tuple[int, int] | None = None
+        self._start: int | None = None
         self._cpu0 = 0.0
         self.cycles: int | None = None
-        self.instructions: int | None = None
         self.cpu_seconds: float | None = None
 
     def __enter__(self) -> CoreClock:
@@ -338,8 +329,7 @@ class CoreClock:
         end = _rusage()
         if self._start is None or end is None:
             return
-        self.instructions = end[0] - self._start[0]
-        self.cycles = end[1] - self._start[1]
+        self.cycles = end - self._start
         self.cpu_seconds = cpu
 
     @property
@@ -355,19 +345,6 @@ class CoreClock:
             return None
         value = self.cycles / self.cpu_seconds / 1e9
         return value if 0.2 <= value <= 10.0 else None
-
-    @property
-    def ipc(self) -> float | None:
-        if not self.cycles or not self.instructions:
-            return None
-        return self.instructions / self.cycles
-
-
-def effective_ghz(work: Any) -> float | None:
-    """The effective clock while running `work()`."""
-    with CoreClock() as clock:
-        work()
-    return clock.ghz
 
 
 def _reference_efficiency_ghz() -> float | None:

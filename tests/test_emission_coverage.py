@@ -617,8 +617,8 @@ SURFACE = {
     "close": (QUERY, "flushes the sink; the engine's own state is untouched"),
     "recording": (QUERY, "is a sink attached"),
     # -- reads
-    "clipPrice": (QUERY, "the tick grid applied to a price"),
-    "quantize": (QUERY, "clipPrice under its other name"),
+    "quantize": (QUERY, "the tick grid applied to a price"),
+    "clipPrice": (QUERY, "quantize under its legacy name"),
     "order": (QUERY, "the store, by identifier"),
     "require_order": (QUERY, "the store, by identifier, raising when absent"),
     "orders": (QUERY, "every order accepted"),

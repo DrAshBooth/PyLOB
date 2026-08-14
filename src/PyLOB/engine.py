@@ -275,7 +275,7 @@ _NOTIONAL_GUARD: Final = 1e292
 
 _INF: Final = float("inf")
 
-#: How many quantized prices a book keeps (`OrderBook.clipPrice`). Big enough
+#: How many quantized prices a book keeps (`OrderBook.quantize`). Big enough
 #: to hold the grid of any book a research workload builds around a touch;
 #: small enough that a book that walks a wide grid forever cannot grow one
 #: entry per price it ever saw.
@@ -352,9 +352,18 @@ def _positive_real(value: Any, what: str) -> float:
     `Fraction` counts -- and converted once, so what the engine stores and
     quantizes is an ordinary float rather than whatever the caller's array
     library hands back from arithmetic.
+
+    The refusal names int and float rather than the wider set it accepts,
+    because the value that lands here is nearly always a `Decimal` -- which is
+    a real number by any ordinary reading and is not a `numbers.Real`, so
+    "must be a real number" reads as a contradiction of the thing in front of
+    you. What the caller needs is the conversion, so the message is that.
     """
     if isinstance(value, bool) or not isinstance(value, (int, float, Real)):
-        raise InvalidOrder("%s must be a real number, got %r" % (what, value))
+        raise InvalidOrder(
+            "%s must be an int or float (pass `float(%s)`), got %r"
+            % (what, what.replace(" ", "_"), value)
+        )
     try:
         number = float(value)
     except (OverflowError, ValueError) as exc:
@@ -390,7 +399,7 @@ def _quantize(price: float, tick: Decimal) -> float:
     """`price` snapped to the nearest multiple of an already-decimalized tick.
 
     Three `decimal` operations and two conversions, which makes it the most
-    expensive thing on the accept path; `OrderBook.clipPrice` keeps the
+    expensive thing on the accept path; `OrderBook.quantize` keeps the
     answers, and this is what a miss costs. A ratio too wide for `_CTX` raises
     `InvalidOrder` rather than leaking `decimal.InvalidOperation`, which is
     not an error a caller catching this library's own would catch.
@@ -469,6 +478,8 @@ class Order:
     #: Arrival stamp; matching sorts by (price, priority). Re-stamped by a
     #: non-passive modify. Never a timestamp, never an event `seq`.
     priority: int
+    #: Quantity filled so far -- a count, not the `filled` flag beside it.
+    #: `fulfilled` is how much has traded; `filled` is whether all of it has.
     fulfilled: int = 0
     #: Cumulative traded value (sum of qty * price over this order's fills).
     value: float = 0.0
@@ -561,6 +572,8 @@ class Trader:
     name: str = ""
     allow_self_matching: bool = False
     commission_min: float = 0.0
+    #: `percnt`, sic: frozen in the stream format (`TraderConfigured`), so
+    #: renaming it would invalidate every recorded session.
     commission_max_percnt: float = 0.0
     commission_per_unit: float = 0.0
 
@@ -715,7 +728,7 @@ class BookSide:
         return "BookSide(side=%r, levels=%d, volume=%d)" % (
             str(self.side),
             len(self._levels),
-            self.total_volume,
+            sum(level.volume for level in self._levels.values()),
         )
 
     # -- reading -----------------------------------------------------------
@@ -727,11 +740,6 @@ class BookSide:
     def worst_price(self) -> float | None:
         """Lowest bid / highest ask, or None when the side is empty."""
         return self._peek(self._worst, -self._best_sign)
-
-    def best_level(self) -> PriceLevel | None:
-        """The level matching would consume first, or None when empty."""
-        price = self.best_price()
-        return None if price is None else self._levels[price]
 
     def level_at(self, price: float) -> PriceLevel | None:
         """The level at exactly `price` -- which must already be quantized."""
@@ -795,11 +803,6 @@ class BookSide:
             for level_price in walked:
                 if level_price in self._levels:
                     heapq.heappush(self._best, level_price * self._best_sign)
-
-    @property
-    def total_volume(self) -> int:
-        """Unfulfilled quantity resting on this side, across all prices."""
-        return sum(level.volume for level in self._levels.values())
 
     def volume_at(self, price: float) -> int:
         """Unfulfilled quantity an opposite order priced at `price` could take.
@@ -984,7 +987,7 @@ class OrderBook:
     """The engine: instruments, traders, orders, matching, and the ledgers.
 
     configuration
-        `configure_instrument`, `configure_trader`, `clipPrice`
+        `configure_instrument`, `configure_trader`, `quantize`
     operations
         `submit`, `cancelOrder`, `modifyOrder`, and `processOrder` -- the
         legacy dict-quote shape, kept because the public API is a standing
@@ -1025,7 +1028,7 @@ class OrderBook:
         `tick_size` is the price grid: every submitted price is snapped to the
         nearest multiple of it, so an order at 100.03 rests at 100.03 on the
         default 0.0001 grid and at 100.05 on a 0.05 one. It is fixed for this
-        book's life -- every resting price and the `clipPrice` memo assume it
+        book's life -- every resting price and the `quantize` memo assume it
         -- so a different grid means a different `OrderBook`, not a setter.
 
         `sink` is optional and `None` by default. With no sink the engine
@@ -1049,7 +1052,7 @@ class OrderBook:
         """
         self._tick = _tick_decimal(tick_size)
         self.tick_size = tick_size
-        #: `clipPrice`'s memo: submitted price -> price on this book's grid.
+        #: `quantize`'s memo: submitted price -> price on this book's grid.
         self._grid: dict[float, float] = {}
         #: The engine clock. Advanced by one per non-replay operation; set
         #: from the caller's value on the data-replay path. Recorded data.
@@ -1089,8 +1092,8 @@ class OrderBook:
 
     # -- prices ------------------------------------------------------------
 
-    def clipPrice(self, price: float) -> float:
-        """This book's tick grid applied to `price` (legacy name, kept).
+    def quantize(self, price: float) -> float:
+        """This book's tick grid applied to `price`.
 
         Answers are kept, because `_quantize` is the most expensive thing on
         the accept path and a book asks it about the same handful of prices
@@ -1117,7 +1120,10 @@ class OrderBook:
             return value
         return _quantize(price, self._tick)
 
-    quantize = clipPrice
+    #: The 2013 engine's name for `quantize`, and the same function object, so
+    #: the two share one docstring. Kept because removing a public name needs
+    #: an ADR (`config.yaml`); `quantize` is the one to write in new code.
+    clipPrice = quantize
 
     # -- configuration -----------------------------------------------------
 
@@ -1153,11 +1159,36 @@ class OrderBook:
         is a change to the stream format and to every sink that folds it, and
         a library that converts nothing between currencies (`config.yaml`: no
         FX, no cross-instrument netting) has nothing to spend that on.
+
+        **An instrument may not be named after its own currency.** Balances
+        are keyed `(tid, symbol)` and a symbol is an instrument *or* a
+        currency, one namespace for both (`balance`), so an instrument called
+        `"USD"` settling in `"USD"` would post both legs of every trade to the
+        same key. A buy of 5 @ 100 would credit 5 and debit 500 and leave a
+        single number, -495, that is neither a position nor a cash balance and
+        cannot be split back into the two. Refused here, where the collision
+        becomes knowable, rather than netted in silence twelve balance
+        movements later: this is `config.yaml`'s "an instrument must not be
+        named the same as a currency it settles against", enforced.
+
+        The wider collision is still the caller's to avoid, because no single
+        call can see it: an instrument named `"USD"` settling in `"EUR"`
+        shares the namespace with any *other* instrument that settles in USD,
+        and their traders' cash and position net together the same way. Name
+        instruments and currencies out of disjoint sets and neither can
+        happen.
         """
         if not isinstance(currency, str) or not currency:
             raise InvalidOrder(
                 "instrument %r needs a non-empty currency, got %r: a currency "
                 "cannot be withdrawn, because no event says it was" % (symbol, currency)
+            )
+        if symbol == currency:
+            raise InvalidOrder(
+                "instrument %r cannot settle in itself: balances are keyed "
+                "(trader, symbol) over instruments and currencies alike, so "
+                "both legs of every trade would post to the same key and net "
+                "to a number that is neither a position nor cash" % (symbol,)
             )
         book = self.book(symbol)
         book.currency = currency
@@ -1289,15 +1320,8 @@ class OrderBook:
         if order_type is OrderType.LIMIT:
             if price is None:
                 raise InvalidOrder("a limit order needs a price")
-            working_price: float | None = self.clipPrice(_check_price(price))
-            if working_price <= 0:
-                raise InvalidOrder(
-                    "price %r quantizes to %r on a tick of %r: under half a "
-                    "tick is not a price this book can hold"
-                    % (price, working_price, self.tick_size)
-                )
-            if working_price > _NOTIONAL_GUARD:
-                _check_notional(qty, working_price)
+            working_price: float | None = self.quantize(_check_price(price))
+            _check_working_price(price, working_price, qty, self.tick_size)
         else:
             if price is not None:
                 # Silently ignoring it is how a caller ends up believing a
@@ -1439,10 +1463,12 @@ class OrderBook:
         carries no commission field: nothing moves.
         """
         order = self.require_order(idNum)
-        if side is not None and _as_side(side) is not order.side:
-            raise InvalidOrder(
-                "order %r is a %s, not a %s" % (idNum, order.side, _as_side(side))
-            )
+        if side is not None:
+            named = _as_side(side)
+            if named is not order.side:
+                raise InvalidOrder(
+                    "order %r is a %s, not a %s" % (idNum, order.side, named)
+                )
         if order.cancelled:
             raise InvalidOrder("order %r is already cancelled" % (idNum,))
         if order.filled:
@@ -1488,9 +1514,10 @@ class OrderBook:
         qty = _required(orderUpdate, "qty", idNum)
         price = _required(orderUpdate, "price", idNum)
 
-        if _as_side(side) is not order.side:
+        named = _as_side(side)
+        if named is not order.side:
             raise InvalidOrder(
-                "order %r is a %s, not a %s" % (idNum, order.side, _as_side(side))
+                "order %r is a %s, not a %s" % (idNum, order.side, named)
             )
         if order.cancelled:
             raise InvalidOrder("order %r is cancelled" % (idNum,))
@@ -1503,17 +1530,10 @@ class OrderBook:
         # A modification is a submission of the same order at new terms, so
         # it goes through the same gate: a NaN here would corrupt the book
         # exactly as one on the submission path would (lob-d6i).
-        new_price = prev_price if price is None else self.clipPrice(_check_price(price))
+        new_price = prev_price if price is None else self.quantize(_check_price(price))
         new_qty = max(prev_qty if qty is None else qty, order.fulfilled)
         if new_price is not None:
-            if new_price <= 0:
-                raise InvalidOrder(
-                    "price %r quantizes to %r on a tick of %r: under half a "
-                    "tick is not a price this book can hold"
-                    % (price, new_price, self.tick_size)
-                )
-            if new_price > _NOTIONAL_GUARD:
-                _check_notional(new_qty, new_price)
+            _check_working_price(price, new_price, new_qty, self.tick_size)
         reprioritized = new_price != prev_price or new_qty > prev_qty
 
         self._advance(time)
@@ -1596,10 +1616,14 @@ class OrderBook:
             )
         trades: list[Trade] = []
         book = self.book(taker.instrument)
-        makers = book.opposite(taker.side)
-        if taker.cancelled or taker.remaining <= 0 or not makers:
+        # Both are whole `BookSide`s, not collections of counterparties: the
+        # maker book is the side being walked, the taker book the side the
+        # taker would rest on -- and does rest on already when this is a
+        # repriced modify, which is why its fills go through it.
+        maker_book = book.opposite(taker.side)
+        if taker.cancelled or taker.remaining <= 0 or not maker_book:
             return trades
-        takers = book.side(taker.side)
+        taker_book = book.side(taker.side)
         gated = not self.trader(taker.tid).allow_self_matching
         # `try`/`finally` rather than `contextlib.closing`: the walk has to be
         # closed on every exit (that is what puts the popped prices back), and
@@ -1607,7 +1631,7 @@ class OrderBook:
         # `__exit__` per submission for the same guarantee. Nothing may come
         # between the two lines below: an exception there would leave the walk
         # holding prices it popped off the heap.
-        levels = makers.match_levels(taker.price)
+        levels = maker_book.match_levels(taker.price)
         try:
             for level in levels:
                 if gated and level.sole_tid == taker.tid:
@@ -1633,7 +1657,9 @@ class OrderBook:
                         skipped += 1
                         continue
                     trades.append(
-                        self._execute(book, taker, takers, maker, makers, level.price)
+                        self._execute(
+                            book, taker, taker_book, maker, maker_book, level.price
+                        )
                     )
                     # A fill that did not exhaust the taker exhausted its
                     # maker, which leaves the level's dict a member shorter
@@ -1649,9 +1675,9 @@ class OrderBook:
         self,
         book: InstrumentBook,
         taker: Order,
-        takers: BookSide,
+        taker_book: BookSide,
         maker: Order,
-        makers: BookSide,
+        maker_book: BookSide,
         price: float,
     ) -> Trade:
         """One execution: fill both orders, charge both, move four balances.
@@ -1666,8 +1692,8 @@ class OrderBook:
         qty = min(taker.remaining, maker.remaining)
         value = qty * price
 
-        makers.fill(maker, qty)
-        takers.fill(taker, qty)
+        maker_book.fill(maker, qty)
+        taker_book.fill(taker, qty)
 
         taker_delta = self._charge(taker, value)
         maker_delta = self._charge(maker, value)
@@ -1754,6 +1780,12 @@ class OrderBook:
 
         Zero before any movement, and freely negative afterwards: balances
         record what happened and gate nothing (`trader-balances`).
+
+        One namespace covers both kinds, so a symbol that is an instrument
+        *and* somebody's settlement currency answers for the two of them
+        added together, with no way back to either. `configure_instrument`
+        refuses the case it can see (an instrument settling in itself) and
+        names the case it cannot.
         """
         return self._balances.get((tid, symbol), 0.0)
 
@@ -1809,14 +1841,45 @@ class OrderBook:
     # -- the book ----------------------------------------------------------
 
     def book(self, instrument: str) -> InstrumentBook:
-        """The book for `instrument`, created empty on first mention."""
+        """The book for `instrument`, created empty on first mention.
+
+        **A read creates too, and there is no undeclared symbol.** Every query
+        that names an instrument -- `getBestBid`, `getWorstAsk`,
+        `getVolumeAtPrice`, `getLastPrice`, `snapshot`, `print` -- reaches the
+        store through here, so `getBestBid("TYPO")` answers `None` *and* leaves
+        `TYPO` in `instruments()` for the rest of the session. Nothing warns,
+        because nothing here can tell a typo from an instrument about to be
+        traded: an empty book is what an instrument's first mention looks like
+        either way.
+
+        Two consequences worth knowing before they surprise you. A survey that
+        walks `instruments()` after polling a list of candidate symbols
+        surveys the candidates, not the traded set -- take the symbols from
+        your own configuration instead. And a process that queries an
+        unbounded stream of distinct symbols grows one `InstrumentBook` per
+        symbol it has ever seen, since nothing prunes them; a fixed symbol set,
+        which is every simulation this library was written for, costs one
+        empty book per typo and nothing more.
+
+        Creation on first mention is the standing scope constraint
+        (`openspec/config.yaml`: "a book springs into being on first mention"),
+        so making the read queries non-creating is a contract change and an
+        OpenSpec proposal, not a tidy-up. It is recorded here rather than done.
+        """
         book = self._books.get(instrument)
         if book is None:
             book = self._books[instrument] = InstrumentBook(symbol=instrument)
         return book
 
     def instruments(self) -> Iterator[str]:
-        """Every instrument this engine has a book for."""
+        """Every instrument this engine has a book for.
+
+        Every symbol *mentioned*, that is, which is not the same as every
+        symbol traded or configured: a book springs into being on first
+        mention and a read query mentions one (`book`). An empty entry here is
+        as likely to be a mistyped query as an instrument awaiting its first
+        order.
+        """
         return iter(self._books)
 
     def rest(self, order: Order) -> None:
@@ -1856,6 +1919,11 @@ class OrderBook:
         return tuple(self.book(instrument).side(side))
 
     # -- the read side (`book-queries`) ------------------------------------
+    #
+    # Every one of these names an instrument, and naming one creates its book
+    # if it does not have one: an unknown symbol reads as an empty book and
+    # stays in `instruments()` afterwards. See `book`, which says what that
+    # costs and why it is not fixed here.
 
     def getBestBid(self, instrument: str) -> float | None:
         """The highest resting bid price, or None if no bid rests."""
@@ -1880,7 +1948,7 @@ class OrderBook:
         price this book can hold, so asking about it means asking about the
         grid point it names.
         """
-        return self.book(instrument).side(side).volume_at(self.clipPrice(price))
+        return self.book(instrument).side(side).volume_at(self.quantize(price))
 
     def getLastPrice(self, instrument: str) -> float | None:
         """The most recent trade price, or None before the first trade."""
@@ -1960,7 +2028,9 @@ class OrderBook:
     # the list in `tests/test_emission_coverage.py` records them as.
 
     def next_priority(self) -> int:
-        """The next arrival stamp. Advances whether or not a sink is attached.
+        """Allocate the next arrival stamp (consumes it).
+
+        Advances whether or not a sink is attached.
 
         Not replay-coherent: a stamp taken outside `create_order` or a
         repricing `modifyOrder` belongs to no order and is recorded nowhere,
@@ -1973,7 +2043,7 @@ class OrderBook:
         return priority
 
     def next_trade_id(self) -> int:
-        """The next trade identifier.
+        """Allocate the next trade identifier (consumes it).
 
         Not replay-coherent: as with `next_priority`, an identifier taken
         outside `_execute` names no trade, and every later trade is numbered
@@ -1984,7 +2054,9 @@ class OrderBook:
         return trade_id
 
     def next_seq(self) -> int:
-        """The next position in the event stream. Matching must never read it.
+        """Allocate the next position in the event stream (consumes it).
+
+        Matching must never read it.
 
         Not replay-coherent: a `seq` taken without an event to carry it
         leaves a hole in the stream, and a sink reading the log is entitled to
@@ -2127,6 +2199,29 @@ def _check_notional(qty: int, price: float) -> None:
             "quantity %r at price %r overflows: qty * price must be finite"
             % (qty, price)
         )
+
+
+def _check_working_price(
+    submitted: Any, working: float, qty: int, tick_size: float
+) -> None:
+    """What a price still has to survive *after* the grid has been applied.
+
+    Both places a price enters the book run this: `create_order` on a
+    submission and `modifyOrder` on a reprice, which is the same gate because a
+    modification is a submission of the same order at new terms. It was written
+    out twice and the copies were verbatim, so the only thing keeping them
+    equal was that nobody had edited one.
+
+    `submitted` is the price as the caller wrote it, quoted back at them
+    because `working` is a number they never typed.
+    """
+    if working <= 0:
+        raise InvalidOrder(
+            "price %r quantizes to %r on a tick of %r: under half a tick is "
+            "not a price this book can hold" % (submitted, working, tick_size)
+        )
+    if working > _NOTIONAL_GUARD:
+        _check_notional(qty, working)
 
 
 def _required(update: dict[str, Any], field_name: str, idNum: int) -> Any:

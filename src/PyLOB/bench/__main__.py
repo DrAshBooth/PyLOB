@@ -38,16 +38,14 @@ from typing import Any, Final, Sequence
 
 from . import baselines as baselines_module
 from . import calibration as calibration_module
+from . import provenance as provenance_module
 from . import runner as runner_module
 from . import workloads as workloads_module
 
-#: Relative to the repository root, which is four directories above this file
-#: (`src/PyLOB/bench/__main__.py`).
-_DEFAULT_BASELINES = (
-    Path(__file__).resolve().parent.parent.parent.parent
-    / "benchmarks"
-    / "baselines.json"
-)
+#: Relative to the checkout this package was imported from, which
+#: `provenance.repo_root` locates -- the same answer its `git` calls use, so a
+#: run's baselines and its recorded commit cannot come from two checkouts.
+_DEFAULT_BASELINES = provenance_module.repo_root() / "benchmarks" / "baselines.json"
 
 
 def _parser() -> argparse.ArgumentParser:

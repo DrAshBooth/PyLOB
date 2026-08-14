@@ -76,6 +76,28 @@ timeout = 30
 # nothing in the package reads a file off disk any more. Listed explicitly
 # rather than left to the backend's default file selection, so a stray .sql or
 # .db appearing under src/PyLOB cannot be picked up and shipped.
+# The sdist carries what someone needs to build, test and understand the
+# package: the source, the suite that guards it, the gate that runs it, and the
+# decision records its docstrings cite. Without this stanza hatchling ships
+# everything git tracks -- which here means the agent tooling under `.claude/`
+# and `.agents/`, the issue database and its telemetry under `.beads/`, every
+# archived planning change under `openspec/`, and the wiki's images. None of
+# that belongs in a tarball someone downloads to install a library.
+[tool.hatch.build.targets.sdist]
+include = [
+    "src",
+    "tests",
+    "docs",
+    "verify",
+    "pyproject.toml",
+    "uv.lock",
+    "README.md",
+    "LICENSE.md",
+]
+# hatchling picks up README.md wherever it finds one; these two belong to
+# directories the include above deliberately leaves out.
+exclude = [".beads", "wikipics"]
+
 [tool.hatch.build.targets.wheel]
 sources = ["src"]
 include = ["src/PyLOB/**/*.py"]

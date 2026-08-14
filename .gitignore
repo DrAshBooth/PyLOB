@@ -1,8 +1,12 @@
 __pycache__/
-.project
-.pydevproject
 *.egg-info
 .DS_Store
+
+# Eclipse/PyDev: the tracked .project/.pydevproject were 2013-era artifacts
+# declaring python 2.7 and were removed. Ignored so PyDev can regenerate them
+# locally without them coming back into the tree.
+.project
+.pydevproject
 
 # uv: the environment is a build artifact, uv.lock is not (it is committed)
 .venv/

@@ -37,6 +37,15 @@
 > - **3's last bullet** — "docs describe the deleted implementation" — is half
 >   closed: the README no longer credits the RBTree code PR #7 deleted, and no
 >   longer claims the wiki as current. The wiki itself still describes it.
+>
+> **Addendum, 2026-08-14.** The wiki was rewritten for the shipped engine and
+> pushed, so 3's last bullet is closed rather than half closed: the wiki's
+> `Implementation` page is now kept under its own banner as history, README
+> links the rewritten pages, and `pyproject.toml` points `Documentation` at the
+> wiki again. The `benchmark-harness` plan named under 4 has landed as
+> `src/PyLOB/bench/` and `benchmarks/baselines.json`; both it and `rewrite-docs`
+> are still unarchived change directories, which is a bookkeeping state, not
+> outstanding work.
 
 Read-only review of the SQL-backed implementation (post-PR-#7), covering
 `src/PyLOB/orderbook.py`, `src/create_lob.sql`, and all 13 query files.

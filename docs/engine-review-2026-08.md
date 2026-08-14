@@ -15,6 +15,14 @@
 > declares the engine single-instrument" is closed: the `context:` block now
 > states what the engine supports and tests. Nothing else here is edited —
 > the findings are the record of what was found, and they stand as written.
+>
+> **Addendum, 2026-08-14.** ADR-0002 was itself superseded later on 2026-08-13
+> by [ADR-0005](adr/0005-calibrated-throughput-baselines.md), so read the
+> surviving performance claim there rather than in ADR-0002: throughput is
+> still measured sinkless, but it is judged against calibration-normalised
+> baselines in `benchmarks/baselines.json` instead of a ratio to the deleted
+> engine, and 439 orders/sec is now recorded as a historical origin rather than
+> a live denominator.
 
 Requested by the maintainer before deciding whether to retire the legacy SQL
 engine. Five independent adversarial reviews: matching-core correctness,

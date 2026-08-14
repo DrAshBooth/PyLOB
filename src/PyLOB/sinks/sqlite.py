@@ -347,6 +347,9 @@ CREATE TABLE IF NOT EXISTS trader (
 );
 
 CREATE TABLE IF NOT EXISTS orders (
+    -- Plural, alone among these tables, because ORDER is an SQL keyword:
+    -- `SELECT * FROM order` is a syntax error, and quoting it in every query
+    -- forever is a worse tax than the inconsistent name.
     idNum         INTEGER PRIMARY KEY,
     tid           INTEGER NOT NULL REFERENCES trader (tid),
     instrument    TEXT    NOT NULL REFERENCES instrument (symbol),

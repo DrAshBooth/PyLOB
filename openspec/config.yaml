@@ -1,7 +1,9 @@
 schema: spec-driven
 
 # Standing project constraints. Every change proposal must respect these.
-# Fixed constraints and conventions only — aspirations live in brain/ and ADRs.
+# Fixed constraints and conventions only. Decisions and the reasoning behind
+# them live in docs/adr/ — start at docs/adr/README.md. brain/architecture.md is
+# the dated 2026-08-10 draft this block superseded; it is history, not a source.
 context: |
   PyLOB is a simulation-for-research limit order book: price-time priority,
   market/limit orders with add/cancel/update, single-threaded, zero-latency

@@ -253,6 +253,9 @@ class TraderConfigured:
     name: str
     allow_self_matching: bool
     commission_min: float
+    #: `percnt`, sic. It is a field name in the wire format, and a persisted
+    #: stream decodes by keyword (`EVENT_BY_KIND[kind](**payload)`), so
+    #: correcting the spelling would invalidate every recorded session.
     commission_max_percnt: float
     commission_per_unit: float
 
@@ -330,16 +333,6 @@ class Filled:
     ask_value: float
     ask_commission: float
     ask_commission_delta: float
-
-    @property
-    def taker_idNum(self) -> int:
-        """The aggressing order's identifier."""
-        return self.bid_idNum if self.taker_side == Side.BID else self.ask_idNum
-
-    @property
-    def maker_idNum(self) -> int:
-        """The resting order's identifier -- the one that set the price."""
-        return self.ask_idNum if self.taker_side == Side.BID else self.bid_idNum
 
 
 @dataclass(frozen=True, slots=True)
@@ -497,7 +490,15 @@ def close_sink(sink: EventSink) -> None:
 
     The one sanctioned way to end a sink's life, so "close is optional" is a
     written contract rather than a convention each caller reinvents.
+
+    The test is `isinstance` against `ClosableEventSink`, which is what makes
+    that protocol the definition of "closable" rather than a docstring
+    describing a `getattr` somewhere else. A `runtime_checkable` protocol
+    checks for the attribute and not its signature, so `callable` still runs:
+    a sink whose `close` is a bool satisfies the isinstance and is not a sink
+    that can be closed.
     """
-    close = getattr(sink, "close", None)
-    if callable(close):
-        close()
+    if isinstance(sink, ClosableEventSink):
+        close = getattr(sink, "close", None)
+        if callable(close):
+            close()

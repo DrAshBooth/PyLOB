@@ -11,8 +11,9 @@ into, and since ADR-0003 retired the 2013 SQL engine it is the only one --
 Also exported: the exceptions a caller catches (`PyLOBError` and its
 subclasses), the objects the public API hands back (`Order`, `Trade`,
 `Trader`), the two vocabularies it accepts (`Side`, `OrderType` -- plain
-strings work everywhere they do), and `EventSink`, the protocol a recorder
-implements.
+strings work everywhere they do), `EventSink`, the protocol a recorder
+implements, and `__version__`, which a recorded session should note alongside
+its results.
 
 `SQLiteSink` is deliberately *not* here. Persistence is optional and off the
 hot path (ADR-0001, ADR-0002), and importing it eagerly would make every
@@ -22,6 +23,8 @@ hot path (ADR-0001, ADR-0002), and importing it eagerly would make every
 
     book = OrderBook(tick_size=0.01, sink=SQLiteSink("session.db"))
 """
+
+from typing import Final
 
 from .engine import (
     DEFAULT_TICK_SIZE,
@@ -36,7 +39,18 @@ from .engine import (
 )
 from .events import EventSink, OrderType, Side
 
+#: This library's version, as a literal rather than a lookup: the package is
+#: installable from a git URL at a commit that `importlib.metadata` would
+#: report by whatever version string the wheel was built with, and the
+#: constraint that PyLOB "reads nothing off disk" (`config.yaml`) applies to
+#: its own metadata too. Kept equal to pyproject's `version` by hand; it is
+#: read by researchers recording which library produced a session, and by
+#: nothing in the library itself. `events.STREAM_VERSION` is the number that
+#: governs whether a recorded session can be replayed -- this one does not.
+__version__: Final = "0.1.0"
+
 __all__ = [
+    "__version__",
     "OrderBook",
     "PyLOBError",
     "InvalidOrder",
