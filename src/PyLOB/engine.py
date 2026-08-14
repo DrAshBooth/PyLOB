@@ -452,14 +452,38 @@ class Order:
     **Yours to read, not to write.** This object is the engine's live record,
     not a copy: `order.qty = 5` on an order the book is holding leaves its
     price level's cached `volume` describing the old quantity, and emits no
-    event, so the book, the queries and the log disagree from then on. Change
-    a resting order through `modifyOrder` or `cancelOrder`, which is the same
-    request routed through `BookSide` and recorded.
+    event, so the book, the queries and the log disagree from then on.
+
+    `price` and `priority` are worse than that, because they are not merely
+    stored on the order -- they are the book's index into itself, and assigning
+    to either desynchronizes it permanently (`BookSide`). An order whose
+    `price` no longer names the level it is filed under is looked up in the
+    wrong place by everything that follows. `BookSide.remove` finds nothing,
+    which makes `cancelOrder` set the flag and return while leaving the order
+    resting and its quantity counted -- a cancelled order contributing volume
+    for the rest of the session. `BookSide.fill` finds no level either, so the
+    order trades down to nothing without leaving the queue, and the next taker
+    to reach it asks for a fill of zero: `InvalidOrder` out of `_execute`,
+    after the taker's own `Accepted` and the fills before it are already in
+    the stream and already settled. Nothing rejects the assignment, and no
+    later operation repairs it.
+
+    Change a resting order through `modifyOrder` or `cancelOrder`, which is
+    the same request routed through `BookSide` and recorded -- and which is
+    `remove`, then the change, then `add`, the one sequence that leaves the
+    index and the order agreeing.
 
     Mutable and identity-addressed: the book, the level, and `_orders` all
     hold the same object, so a fill updates one place. It outlives its stay in
     the book -- a filled or cancelled order stays in the store and keeps
     answering for its `fulfilled` and `commission`.
+
+    Freezing it is therefore not a tidy-up. It is a public type, and every
+    write path in this module assigns to it (`BookSide.fill` advances
+    `fulfilled`, `_charge` accumulates `value` and `commission`, a reprice
+    assigns `price`, `qty` and `priority` together), so a frozen `Order` is a
+    change to the public surface and to the accept path ADR-0002 measures.
+    Recorded here rather than done, as `OrderBook.book` records its own.
 
     `price` is the *quantized working price*, never the price as submitted,
     and `None` exactly for market orders. `value` and `commission` are
@@ -500,12 +524,24 @@ class Order:
 
     @property
     def resting(self) -> bool:
-        """Is this order in the book right now?
+        """Is this order eligible to rest: limit, not cancelled, not filled?
 
         Derived rather than stored, and false for a market order by
         construction rather than by the matching loop remembering to cancel
         the remainder: `order-lifecycle` says a market order never rests, and
         a derived flag cannot be caught mid-processing saying otherwise.
+
+        Eligibility and membership coincide between operations, and only
+        between them. A limit order reads `resting` from the moment
+        `create_order` returns, and `submit` does not put it in a level until
+        it has finished crossing, so in between it is in no level and says it
+        rests. Every submission passes through that state, and the only
+        observer who can be there is a sink, which `emit` calls from inside
+        the operation (`OrderBook`) -- and which can leave the order there for
+        good: a sink that raises out of the walk aborts the submission with
+        its fills settled, its `Accepted` emitted, and the taker answering
+        `resting` while no level holds it. `snapshot` is the membership
+        question.
         """
         return (
             self.order_type is OrderType.LIMIT
@@ -780,7 +816,16 @@ class BookSide:
 
         Close the iterator -- a `try`/`finally` around the walk, or exhaust it
         -- or the prices it walked past stay out of the heap until it is
-        collected.
+        collected. An open walk is not a paused one: while it is held, the
+        levels it has handed out are live in `_levels` and absent from
+        `_best`, so `best_price` names the best level *behind* the walk, or
+        `None`, which is exactly what a corrupted heap looks like from the
+        outside. Nothing distinguishes the two, and only the `finally` above
+        repairs it.
+
+        Public by name and internal by contract: `OrderBook.match` is the only
+        caller, and it is written around this requirement (its `try`/`finally`
+        is the reason it takes no `contextlib.closing`).
         """
         walked: set[float] = set()
         try:
@@ -1005,7 +1050,23 @@ class OrderBook:
 
     Single-threaded and synchronous throughout. An operation is finished --
     matched, rested or cancelled, balances moved, events emitted -- before it
-    returns, so there is no in-flight state for a caller to observe.
+    returns, so a caller holding a return value is holding settled state.
+
+    **A sink is not that caller.** `emit` hands each event to `consume`
+    synchronously, from inside the operation that caused it, so a sink is the
+    one observer positioned to see the engine mid-update -- and mid-update the
+    book contradicts itself. A match walk lifts the level it is working off
+    the best-price heap and leaves it in the level dict, so `getBestAsk`
+    answers `None` for a side that `getWorstAsk`, `snapshot` and
+    `getVolumeAtPrice` all report as occupied: the disagreement `book-queries`
+    requires never to happen. A sink that *writes* is worse. Cancelling a
+    maker the walk has stepped over shortens the prefix the skip cursor is
+    walked back over, so the walk resumes past a maker the taker was entitled
+    to and the taker rests against it -- a book left crossed between two
+    traders, which no later operation unwinds. Neither is detected, and
+    neither is a state any public call can reach. That a sink reads nothing
+    and calls nothing back is therefore a load-bearing contract, stated where
+    a sink author reads it (`events.EventSink`) and enforced by nothing.
 
     One book is one session and there is no `reset()`: an episode is a fresh
     `OrderBook`, which is the intended pattern and the measured-faster one
@@ -1430,9 +1491,16 @@ class OrderBook:
         runs before the clock does.
 
         `fromData` is the replay path: the quote's own `idNum` and `timestamp`
-        are used as given instead of being assigned. Either one absent is
-        assigned rather than refused, so a quote that carries neither replays
-        as an ordinary submission.
+        are used as given instead of being assigned, and the quote has to
+        carry both. Either one missing -- absent, or present as `None` -- is
+        an `InvalidOrder` naming it (`_replay_field`): a replay path that
+        invents the identity it was handed the flag to reproduce yields a run
+        that no longer traces back to its data, and yields it in silence. The
+        legacy engine required both here (lob-0mv).
+
+        `fromData=False` is how a quote gets an engine-assigned identifier and
+        stamp, and the flag is per call, so a feed of rows that carry their own
+        identity and rows that do not is two calls rather than one.
 
         The differences a caller porting from the retired SQL engine meets --
         this return shape, the keys that are no longer written back, and the
@@ -1446,8 +1514,8 @@ class OrderBook:
             order_type=_quote_field(quote, "type"),
             qty=_quote_field(quote, "qty"),
             price=quote.get("price"),
-            idNum=quote.get("idNum") if fromData else None,
-            timestamp=quote.get("timestamp") if fromData else None,
+            idNum=_replay_field(quote, "idNum") if fromData else None,
+            timestamp=_replay_field(quote, "timestamp") if fromData else None,
         )
         quote["idNum"] = order.idNum
         quote["timestamp"] = order.timestamp
@@ -2112,6 +2180,13 @@ class OrderBook:
     def emit(self, event: Event) -> None:
         """Hand one event to the sink, or drop it when there is none.
 
+        The call is synchronous and unguarded: `consume` runs on this thread,
+        inside the operation that built the event, and returns before the
+        operation does. What a sink may do from that position is
+        `events.EventSink`'s contract, and nothing here checks it -- a sink
+        that reads the engine is answered, one that calls back into it is
+        obeyed, and one that raises takes the operation down with it.
+
         Not replay-coherent: it records, it does not act. An event pushed in
         from outside describes a transition the engine did not make, and the
         replay of that stream makes it -- the one direction of divergence the
@@ -2292,6 +2367,33 @@ def _quote_field(quote: dict[str, Any], field_name: str) -> Any:
             "a quote needs a %r: processOrder reads tid, instrument, side, "
             "type and qty off it, and price for a limit order" % (field_name,)
         ) from None
+
+
+def _replay_field(quote: dict[str, Any], field_name: str) -> Any:
+    """One field `fromData` promised to replay, or an `InvalidOrder` naming it.
+
+    `_quote_field`'s rule applied to the two fields the flag itself makes
+    required. `processOrder(quote, fromData=True)` says the quote's identity
+    comes from the data; a quote that does not carry it has not got one, and
+    assigning it here would hand back a run whose orders are numbered and
+    stamped by the engine rather than by the source it claims to replay -- the
+    failure that shows up as a session nobody can reproduce rather than as an
+    error (lob-crf, lob-49r, lob-0mv). The legacy engine required both.
+
+    `None` is refused alongside absence, and not read as "leave it to the
+    engine" the way `_required` reads it as "leave it alone": `None` is exactly
+    what `submit` takes as "assign one", so admitting it here would be the
+    silent assignment under another spelling.
+    """
+    value = quote.get(field_name)
+    if value is None:
+        raise InvalidOrder(
+            "a fromData quote needs its own %r: fromData replays the identity "
+            "the data carries, and assigning one here records a session that "
+            "cannot be traced back to it. Pass fromData=False for a quote the "
+            "engine should stamp" % (field_name,)
+        )
+    return value
 
 
 def _book_line(order: Order) -> str:

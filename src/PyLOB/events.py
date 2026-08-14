@@ -10,6 +10,10 @@ Three rules shape every decision below.
 **No SQL in the matching path.** An event therefore carries everything a sink
 needs to record it. A sink never calls back into the engine to ask a question,
 so no event may be a bare notification ("order 7 filled -- go look it up").
+That is a rule about the events, and it rests on a rule about sinks: `consume`
+runs *inside* the operation it describes, so a sink with a question asks it
+mid-update and is answered accordingly. `EventSink` states the contract and
+what breaking it costs.
 
 **Sinks are optional and may not change outcomes.** Matching reads nothing
 from this module: `seq` is a position in the emitted stream, never a sort key.
@@ -462,8 +466,41 @@ class EventSink(Protocol):
     implementation that does real I/O per event should buffer: "off the hot
     path" is the sink's job, not the engine's (design.md decision 4).
 
-    `consume` must not raise on the engine's account and must not call back
-    into the engine. It gets every event exactly once.
+    It gets every event exactly once.
+
+    **A sink records what it is handed. It does not read the engine, call back
+    into it, or raise.** *Synchronously* above means from inside the operation
+    being recorded rather than after it, so `consume` runs while the engine's
+    structures are part-way through an update. All three are prohibitions with
+    nothing enforcing them, and each costs something different.
+
+    *Reading* returns an answer that is not merely stale but
+    self-contradictory. A match walk lifts the level it is working off the
+    best-price heap and leaves it in the book, so a sink that asks during a
+    `Filled` sees `getBestAsk` return `None` for a side whose `getWorstAsk`,
+    `snapshot` and `getVolumeAtPrice` all report a resting order at that price
+    -- the disagreement `book-queries` requires never to happen. The engine
+    keeps that promise everywhere a caller of its own methods can stand, and a
+    sink is standing somewhere else.
+
+    *Calling back* corrupts the walk in progress. Cancelling a maker the walk
+    has stepped over -- one of the taker's own, held in place by the
+    self-matching gate -- shortens the prefix the walk's cursor is rebuilt
+    over, so it resumes past a maker the taker was entitled to trade with. The
+    taker then rests against the liquidity it should have taken: a book
+    crossed between two traders, permanently, with every event describing a
+    session in which nothing went wrong.
+
+    *Raising* aborts the operation from the middle. The fills already executed
+    stay executed and settled and their `Filled` events stay in the stream,
+    and the taker is left answering `resting` while no level holds it
+    (`engine.Order.resting`). The book's own structures survive it; the
+    submission does not.
+
+    A sink that needs engine state folds it out of the stream instead, which
+    is what the stream is for ("Replay", above): every event carries what a
+    consumer needs to maintain its own view, exactly so that no sink has to
+    ask.
     """
 
     def consume(self, event: Event, /) -> None:
@@ -478,6 +515,11 @@ class ClosableEventSink(EventSink, Protocol):
     `close` is deliberately not part of `EventSink`: requiring it would make
     the trivial sinks (append to a list) carry a no-op method. Use
     `close_sink` rather than testing for the method by hand.
+
+    Unlike `consume`, `close` runs *between* operations -- `OrderBook.close`
+    is a call in its own right -- so a sink that wants to read the engine at
+    end of session may do it here, where the book is settled and the reads
+    `EventSink` warns about return what every other caller sees.
     """
 
     def close(self) -> None:

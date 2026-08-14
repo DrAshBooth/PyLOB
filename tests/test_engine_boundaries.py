@@ -1,9 +1,10 @@
 """The in-memory engine at its boundaries: bad input, gated walks, heap hygiene.
 
-Five findings from the pre-retirement review (`docs/engine-review-2026-08.md`),
-one section each. They are together in one module because they are one kind of
-test -- none of them would be caught by asking the engine to trade correctly.
-They are the cases where an engine that trades correctly still ends up wrong.
+Seven findings, one section each -- six from the pre-retirement review
+(`docs/engine-review-2026-08.md`) and one found while fixing another of them.
+They are together in one module because they are one kind of test -- none of
+them would be caught by asking the engine to trade correctly. They are the
+cases where an engine that trades correctly still ends up wrong.
 
 The first three are P1 and none of them is a scenario from a frozen spec. The
 fourth, `lob-8r6`, is: a spec change ratified the refusal, so the requirement's
@@ -13,6 +14,33 @@ cannot see -- the exact refusal, and that nothing at all moved. The fifth,
 `lob-49r`, is the first section's rule applied to a surface the acceptance
 suites never drive: they speak to the engine through an adapter, and the
 dict-quote shim is what legacy callers hold.
+
+The last two are different in kind from the first five and from each other.
+`lob-k3h` asserts states the engine can be *caught in* and does not defend
+against -- it is the only section here that pins behaviour nobody is claiming
+is correct, and it exists so that the docstrings now describing those states
+cannot quietly stop being true. `lob-0mv` pins a refusal added where the
+alternative was silence.
+
+`lob-k3h` -- what a sink can see, and what a caller can break
+    `EventSink.consume` runs inside the operation being recorded, so a sink is
+    the one observer that can catch the engine mid-update. Reading the book
+    from there returns the disagreement `book-queries` forbids; writing to it
+    corrupts the walk in progress. Separately, `Order` is a mutable public
+    dataclass, and assigning to a resting order's `price` desynchronizes the
+    level index permanently. Neither is detected, and both are prohibitions
+    carried only by docstrings (`events.EventSink`, `engine.Order`,
+    `engine.OrderBook`). The tests below record what the prohibitions cost,
+    not a contract the engine offers: enforcing either is a behaviour change
+    no spec names, and if one is ever ratified these are the tests that should
+    fail first and be rewritten deliberately.
+
+`lob-0mv` -- the identity `fromData` promised to replay
+    `processOrder(quote, fromData=True)` says the quote carries its own
+    identifier and timestamp. A quote that carried neither used to be assigned
+    both, silently, which is the `lob-crf` failure shape on the replay path:
+    the run cannot be traced back to the data it claims to replay, and nothing
+    says so. The legacy engine required both.
 
 `lob-d6i` -- the input gate
     A limit price of `float("nan")` was accepted. Every comparison against NaN
@@ -76,6 +104,7 @@ from PyLOB.engine import (
     PriceLevel,
     PyLOBError,
 )
+from PyLOB.events import Accepted, Filled
 
 INSTRUMENT = "FAKE"
 CURRENCY = "USD"
@@ -977,3 +1006,351 @@ def test_a_quote_with_every_field_present_is_untouched_by_the_gate():
     assert [(trade.price, trade.qty) for trade in trades] == [(100.0, 4)]
     assert quote["idNum"] in {order.idNum for order in book.orders()}
     assert quote["timestamp"] == book.time and quote["price"] is None
+
+
+# --------------------------------------------------------------------------
+# lob-k3h: what a sink can see, and what a caller can break
+# --------------------------------------------------------------------------
+
+
+class ProbingSink:
+    """Reads the book back on every `Filled`, from inside the match walk.
+
+    The engine is what a sink must not do, made into an observer. `engine` is
+    assigned after construction because the sink is passed to the constructor.
+    """
+
+    def __init__(self):
+        self.engine = None
+        self.observations = []
+
+    def consume(self, event):
+        if not isinstance(event, Filled):
+            return
+        book = self.engine
+        self.observations.append(
+            dict(
+                best_ask=book.getBestAsk(INSTRUMENT),
+                worst_ask=book.getWorstAsk(INSTRUMENT),
+                snapshot=[order.price for order in book.snapshot(INSTRUMENT, "ask")],
+                volume=book.getVolumeAtPrice(INSTRUMENT, "ask", 100.0),
+            )
+        )
+
+
+def test_a_sink_reading_the_book_mid_walk_is_told_two_different_things():
+    """`getBestAsk` is None for a side `snapshot` and `getWorstAsk` say is occupied.
+
+    `book-queries` requires a price to read `None` "only when that side of the
+    book is empty" and requires a snapshot to agree with the price and volume
+    queries taken at the same moment. Both hold for every caller who waits for
+    an operation to return. A sink does not wait: `match_levels` has lifted the
+    level off the best-price heap and left it in the book, so from inside
+    `consume` the same side answers `None` and 100.0 at once.
+
+    Nothing here is a contract the engine offers -- it is the cost of breaking
+    the one `events.EventSink` states, pinned so that the docstrings saying so
+    stay honest.
+    """
+    sink = ProbingSink()
+    book = make_book(sink=sink)
+    sink.engine = book
+    book.submit(2, INSTRUMENT, "ask", "limit", 5, 100.0)
+    book.submit(1, INSTRUMENT, "bid", "limit", 3, 100.0)
+
+    assert len(sink.observations) == 1
+    seen = sink.observations[0]
+    assert seen["best_ask"] is None, seen
+    assert seen["worst_ask"] == 100.0 and seen["snapshot"] == [100.0], seen
+    assert seen["volume"] == 2, seen
+
+    # Settled, the same four queries agree, which is the contract the sink was
+    # not in a position to observe.
+    assert book.getBestAsk(INSTRUMENT) == 100.0
+    assert book.getWorstAsk(INSTRUMENT) == 100.0
+    assert [order.price for order in book.snapshot(INSTRUMENT, "ask")] == [100.0]
+    assert book.getVolumeAtPrice(INSTRUMENT, "ask", 100.0) == 2
+
+
+class CancellingSink:
+    """Cancels one nominated order the first time it sees a `Filled`.
+
+    `target` is set after the book is built, so only the events of the walk
+    under test reach the cancel; clearing it first makes the sink re-entrant
+    against its own `Cancelled`.
+    """
+
+    def __init__(self):
+        self.engine = None
+        self.target = None
+
+    def consume(self, event):
+        if self.target is None or not isinstance(event, Filled):
+            return
+        target, self.target = self.target, None
+        self.engine.cancelOrder(None, target)
+
+
+def test_a_sink_cancelling_mid_walk_strands_liquidity_and_crosses_the_book():
+    """The skip cursor's prefix is only immovable while nobody moves it.
+
+    `match` steps over the taker's own resting orders and counts them, because
+    a fill invalidates the cursor over the level's dict and the replacement has
+    to be walked back over the orders already skipped. That walk-back is sound
+    exactly because a skipped order "stays put" -- which a sink cancelling one
+    from inside the walk makes false. The prefix shrinks by one, the
+    replacement cursor lands one order too far, and the maker behind it is
+    never offered to a taker with quantity left.
+
+    What comes out is the invariant `assert_not_crossed` exists for: the taker
+    resting at 100.0 against another trader's ask at 100.0, which no later
+    operation unwinds. Pinned as the cost of breaking `events.EventSink`'s
+    contract, not as behaviour the engine promises.
+    """
+    sink = CancellingSink()
+    book = make_book(sink=sink)
+    sink.engine = book
+    mine, _ = book.submit(1, INSTRUMENT, "ask", "limit", 5, 100.0)  # gated
+    first, _ = book.submit(2, INSTRUMENT, "ask", "limit", 2, 100.0)
+    behind, _ = book.submit(2, INSTRUMENT, "ask", "limit", 4, 100.0)
+    sink.target = mine.idNum
+
+    taker, trades = book.submit(1, INSTRUMENT, "bid", "limit", 6, 100.0)
+
+    assert [(trade.ask_idNum, trade.qty) for trade in trades] == [(first.idNum, 2)]
+    assert mine.cancelled
+    assert taker.remaining == 4 and taker.resting
+    assert behind.fulfilled == 0 and behind.resting
+    assert book.getBestBid(INSTRUMENT) == 100.0 == book.getBestAsk(INSTRUMENT)
+    assert taker.tid != behind.tid, "the crossed book is between two traders"
+
+    with pytest.raises(AssertionError, match="book is crossed"):
+        assert_not_crossed(book)
+
+
+class AcceptedProbe:
+    """Reads the accepted order back on every `Accepted`."""
+
+    def __init__(self):
+        self.engine = None
+        self.seen = []
+
+    def consume(self, event):
+        if not isinstance(event, Accepted):
+            return
+        order = self.engine.order(event.idNum)
+        in_book = order in self.engine.snapshot(INSTRUMENT, order.side)
+        self.seen.append((order.resting, in_book))
+
+
+def test_an_accepted_order_says_it_rests_before_any_level_holds_it():
+    """`Order.resting` is eligibility, not membership, and the gap is observable.
+
+    `submit` accepts, then crosses, then rests: a limit order reads `resting`
+    from the moment `create_order` returns and is in no level until the end.
+    Every submission passes through that state, and the sink `create_order`
+    emits `Accepted` to is the one observer that can be inside it -- so the
+    property's old summary line, "is this order in the book right now", was
+    answerable wrongly without anything going wrong at all.
+    """
+    probe = AcceptedProbe()
+    book = make_book(sink=probe)
+    probe.engine = book
+
+    order, _ = book.submit(1, INSTRUMENT, "bid", "limit", 5, 99.0)
+
+    assert probe.seen == [(True, False)]
+    assert order.resting and order in book.snapshot(INSTRUMENT, "bid")
+
+
+def test_assigning_a_resting_orders_price_leaves_a_cancelled_order_counted():
+    """`o.price = x` files the order under a level that no longer knows it.
+
+    `BookSide.remove` looks the order up by its *current* price, finds no such
+    level, and returns False -- so `cancelOrder` sets the flag, emits, returns
+    the order, and leaves it in the level it was actually resting in. The
+    engine then reports a cancelled order in `snapshot`, its quantity in
+    `getVolumeAtPrice`, and its old price as the best ask, for the rest of the
+    session. Nothing raises at any point.
+
+    `Order`'s docstring is the only thing standing between a caller and this.
+    """
+    book = make_book()
+    order, _ = book.submit(1, INSTRUMENT, "ask", "limit", 5, 100.0)
+
+    order.price = 200.0  # the assignment `Order` forbids
+    book.cancelOrder("ask", order.idNum)
+
+    assert order.cancelled and not order.resting
+    assert book.getVolumeAtPrice(INSTRUMENT, "ask", 100.0) == 5
+    assert book.snapshot(INSTRUMENT, "ask") == (order,)
+    assert book.getBestAsk(INSTRUMENT) == 100.0
+
+
+def test_assigning_a_resting_orders_price_makes_matching_raise_after_accepting():
+    """The same desynchronization, reached by a taker instead of by a cancel.
+
+    `BookSide.fill` finds no level under the maker's new price, so it advances
+    `fulfilled` and leaves the maker in the queue with nothing left. The walk's
+    replacement cursor hands the same maker over again, `_execute` asks for a
+    fill of zero, and `fill` refuses it -- from the middle of a submission
+    whose `Accepted` and first `Filled` are already emitted and settled.
+
+    The refusal is `fill`'s own guard doing its job. The point is where it
+    fires: a `PyLOBError` out of `submit` after the stream has recorded a trade
+    is not a refusal a caller can treat as "nothing moved".
+    """
+    sink = ListSink()
+    book = make_book(sink=sink)
+    maker, _ = book.submit(1, INSTRUMENT, "ask", "limit", 5, 100.0)
+    maker.price = 200.0  # the assignment `Order` forbids
+    before = len(sink.events)
+
+    with pytest.raises(InvalidOrder, match="fill quantity must be positive"):
+        book.submit(2, INSTRUMENT, "bid", "limit", 9, 100.0)
+
+    emitted = [type(event).__name__ for event in sink.events[before:]]
+    assert emitted == ["Accepted", "Filled"], emitted
+    assert book.balance(1, INSTRUMENT) == -5.0
+    assert book.balance(2, INSTRUMENT) == 5.0
+
+
+def test_an_unclosed_match_walk_hides_the_levels_it_is_holding():
+    """An open walk reads from the outside exactly like a corrupted heap.
+
+    `match_levels` lifts each price off `_best` before yielding its level and
+    pushes back the survivors in a `finally`, so a walk that is neither closed
+    nor exhausted leaves live levels invisible to `best_price` -- a book whose
+    top is missing, with `_levels` and the snapshot still reporting it. Closing
+    the walk is the whole repair, and `OrderBook.match` is written around that.
+    """
+    book = make_book()
+    for price in (100.0, 100.01, 100.02):
+        book.submit(1, INSTRUMENT, "ask", "limit", 1, price)
+    asks = book.book(INSTRUMENT).asks
+
+    walk = asks.match_levels(None)
+    assert next(walk).price == 100.0
+    assert asks.best_price() == 100.01, "the walk is holding 100.0"
+    assert asks.level_at(100.0) is not None, "and the level is still live"
+
+    walk.close()
+    assert asks.best_price() == 100.0
+
+
+# --------------------------------------------------------------------------
+# lob-0mv: the identity `fromData` promised to replay
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("missing", ["idNum", "timestamp"])
+@pytest.mark.parametrize("how", ["absent", "none"])
+def test_a_from_data_quote_without_its_own_identity_is_refused(missing, how):
+    """Absent and present-as-`None` are the same quote: it carries no value.
+
+    `None` is what `submit` reads as "assign one", so admitting it here would
+    be the silent assignment under another spelling -- and it is not
+    `_required`'s `None`, which means "leave this field alone" and has a field
+    to leave alone.
+    """
+    book = make_book()
+    quote = dict(
+        tid=1,
+        instrument=INSTRUMENT,
+        side="bid",
+        type="limit",
+        qty=5,
+        price=100.0,
+        idNum=77,
+        timestamp=12.5,
+    )
+    if how == "absent":
+        del quote[missing]
+    else:
+        quote[missing] = None
+
+    with pytest.raises(InvalidOrder, match=repr(missing)) as refusal:
+        book.processOrder(quote, fromData=True)
+
+    assert "fromData=False" in str(refusal.value), (
+        "the message names the missing field but not the call that assigns "
+        "one: %s" % refusal.value
+    )
+    assert not list(book.orders())
+    assert book.snapshot(INSTRUMENT, "bid") == ()
+
+
+def test_the_same_quote_without_fromData_is_stamped_by_the_engine():
+    """The refusal is the flag's, not the quote's: `fromData=False` still works.
+
+    A quote carrying no identity is an ordinary submission, and that is the
+    call for it. Asserted here because the whole cost of the refusal is that a
+    caller who wanted the old behaviour has to say so, and this is the line
+    they have to be able to write.
+    """
+    book = make_book()
+    quote = dict(tid=1, instrument=INSTRUMENT, side="bid", type="limit", qty=5)
+    quote["price"] = 100.0
+
+    trades, returned = book.processOrder(quote, fromData=False)
+
+    assert trades == [] and returned is quote
+    assert quote["idNum"] == 1 and quote["timestamp"] == book.time
+    assert book.order(1).resting
+
+
+def test_a_refused_from_data_quote_moves_nothing_at_all():
+    """The gate runs before `submit`, so the clock and the counters are untouched.
+
+    The same assertion `test_a_refused_quote_moves_nothing_at_all` makes of the
+    five required fields, for the two the flag adds: read through the next
+    accepted order, which is the only place a consumed identifier or priority
+    stamp could ever show up.
+    """
+    sink = ListSink()
+    book = make_book(sink=sink)
+    first, _ = book.submit(1, INSTRUMENT, "bid", "limit", 5, 100.0)
+    before_events = list(sink.events)
+    before_time = book.time
+
+    quote = dict(
+        tid=2, instrument=INSTRUMENT, side="ask", type="limit", qty=3, price=101.0
+    )
+    with pytest.raises(InvalidOrder):
+        book.processOrder(quote, fromData=True)
+
+    assert "idNum" not in quote and "timestamp" not in quote
+    assert sink.events == before_events
+    assert book.time == before_time
+    assert book.snapshot(INSTRUMENT, "ask") == ()
+
+    second, _ = book.submit(1, INSTRUMENT, "bid", "limit", 5, 100.0)
+    assert second.idNum == first.idNum + 1
+    assert second.priority == first.priority + 1
+    assert second.timestamp == first.timestamp + 1
+
+
+def test_a_from_data_quote_that_carries_both_replays_them():
+    """The path the refusal protects, unchanged: the quote's own identity wins.
+
+    `test_process_order_from_data_uses_the_quotes_own_identity` in
+    `tests/test_engine_bookkeeping.py` is the fuller version; this is the
+    control that keeps the new gate from being a filter.
+    """
+    book = make_book()
+    quote = dict(
+        tid=2,
+        instrument=INSTRUMENT,
+        side="ask",
+        type="limit",
+        qty=3,
+        price=101.0,
+        idNum=77,
+        timestamp=12.5,
+    )
+
+    book.processOrder(quote, fromData=True)
+
+    order = book.order(77)
+    assert order is not None and order.timestamp == 12.5
+    assert book.time == 12.5

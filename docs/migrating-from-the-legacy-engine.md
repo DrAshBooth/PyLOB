@@ -83,8 +83,22 @@ Gone:
   smuggled through the quote on every submission.
 
 On the `fromData` path the legacy engine required `timestamp` in the quote (and
-`idNum`, or its insert failed); here either one absent is assigned rather than
-refused, so a quote carrying neither replays as an ordinary submission.
+`idNum`, or its insert failed). So does this one: a `fromData` quote missing
+either — absent, or present as `None` — raises `InvalidOrder` naming it. The
+flag says the quote's identity comes from the data, and a path that invents the
+identity it was handed the flag to reproduce gives back a run that no longer
+traces to its source, silently. A quote with no identity of its own is an
+ordinary submission and `fromData=False` is the call for it; the flag is per
+call, so a feed mixing rows that carry an identifier with rows that do not is
+two calls rather than one.
+
+> **Stability note.** Nothing ratifies this refusal —
+> `openspec/specs/order-lifecycle` does not mention `fromData`. It restores
+> what the legacy engine required, so no ported caller meets it, and it was
+> chosen over the alternative of documenting the silent assignment as
+> deliberate (`lob-0mv`). The engine that replaced the legacy one assigned
+> both quietly until this landed, so code written against *that* behaviour —
+> not against legacy — is the only code it breaks.
 
 ## Timestamps are floats
 
