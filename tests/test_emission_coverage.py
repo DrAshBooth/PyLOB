@@ -86,9 +86,10 @@ from __future__ import annotations
 
 import sqlite3
 
+import PyLOB
 import pytest
 from PyLOB.engine import InvalidOrder, Order, OrderBook, PyLOBError, UnknownOrder
-from PyLOB.events import OrderType, SessionStarted, Side
+from PyLOB.events import STREAM_VERSION, OrderType, SessionStarted, Side
 from PyLOB.sinks.sqlite import SQLiteSink, read_events
 
 # The replay suite is a sibling test module (`tests/` has no `__init__.py`, so
@@ -974,8 +975,10 @@ def test_the_refusals_and_guards_build_no_event_when_sinkless():
     Same tripwire as `test_sink_equality.test_a_sinkless_engine_builds_no_
     event`: `OrderBook` has no `__slots__`, so assigning `emit` shadows the
     bound method for this instance and every internal `self.emit(...)` finds
-    it. `SessionStarted` is built in the constructor, before the tripwire goes
-    on, and is the one event a sinkless engine ever builds.
+    it. The tripwire goes on after construction, which the constructor's own
+    `if self.recording:` gate makes harmless -- a sinkless engine builds no
+    `SessionStarted` either, and `test_the_version_lookup_stays_under_the_
+    recording_gate` is what holds that gate in place.
     """
     book = OrderBook(tick_size=replay_suite.TICK, sink=None)
     assert not book.recording
@@ -991,3 +994,64 @@ def test_the_refusals_and_guards_build_no_event_when_sinkless():
         "a sinkless engine constructed %d events; ADR-0002's throughput "
         "figure assumes it constructs none" % len(built)
     )
+
+
+# --------------------------------------------------------------------------
+# the opening event names the engine that emitted it
+# --------------------------------------------------------------------------
+
+
+def test_the_engine_states_its_own_version_in_the_opening_event():
+    """`recording-sink`: a recording says which engine produced it.
+
+    The engine half of that requirement. `PyLOB.__version__` claims to be
+    there "for researchers recording which version produced a session", and
+    until this field existed nothing recorded it -- the claim was made by the
+    code that did not keep it. Asserted against the literal rather than
+    against a spelling of it, so a bumped version that stopped reaching the
+    stream fails here.
+
+    The sink is a list that encodes nothing, so what is asserted is what the
+    *engine* constructed. That it survives being written down and re-folded is
+    `test_sink_durability`'s half.
+    """
+    sink = ListSink()
+    build(sink)
+
+    opening = sink.events[0]
+    assert isinstance(opening, SessionStarted)
+    assert opening.pylob_version == PyLOB.__version__ != ""
+
+    # Provenance and nothing else. The number that decides whether this stream
+    # replays is the other one, and a recording that names a release is not
+    # thereby promised to be replayable by it.
+    assert opening.stream_version == STREAM_VERSION
+
+
+def test_the_version_lookup_stays_under_the_recording_gate():
+    """ADR-0002 covers the lookup, not only the construction.
+
+    The literal reaches the event through a function-local `from . import
+    __version__`: module scope cannot work, because `PyLOB/__init__` imports
+    `.engine` before defining the literal, and that failure is loud -- nothing
+    in this suite would import. Being under `if self.recording:` is the part
+    that is *quiet* to break. A tidy-up that hoisted the import to the top of
+    `__init__` would leave every other test here green while making a sinkless
+    engine pay for a fact it never emits.
+
+    So the name is removed from the package and the two paths are compared:
+    the sinkless one must not notice, and the recording one must -- the second
+    half being what proves the first is an observation and not a tautology.
+    """
+    saved = PyLOB.__version__
+    del PyLOB.__version__
+    try:
+        OrderBook(tick_size=TICK, sink=None)  # asks nothing, misses nothing
+        with pytest.raises(ImportError):
+            OrderBook(tick_size=TICK, sink=ListSink())
+    finally:
+        PyLOB.__version__ = saved
+
+    sink = ListSink()
+    OrderBook(tick_size=TICK, sink=sink)
+    assert sink.events[0].pylob_version == PyLOB.__version__

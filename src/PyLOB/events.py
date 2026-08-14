@@ -33,7 +33,8 @@ The vocabulary
 
 Configuration (low frequency, session setup, re-emitted when config changes):
 
-    SessionStarted        tick size and stream version
+    SessionStarted        tick size, stream version, and the library version
+                          that produced the stream
     InstrumentConfigured  symbol -> currency
     TraderConfigured      a trader's commission schedule and self-match flag
 
@@ -171,6 +172,18 @@ __all__ = [
 #: below would make an older persisted stream replay wrongly rather than
 #: merely incompletely. A sink records it; a replayer refuses what it does not
 #: understand.
+#:
+#: Worked example, because the rule above was stated and then never exercised.
+#: `SessionStarted.pylob_version` was added without bumping this:
+#: no replay path reads it (`replay` takes `tick_size` and `stream_version` off
+#: that event and nothing else), so a stream that predates the field replays
+#: not merely completely but *identically*, and by this constant's own test no
+#: bump is owed. The refusal an old reader needs when it meets a new file is
+#: bought instead by `sinks.sqlite.decode_event`, which names an unknown field
+#: rather than letting `TypeError` out of a constructor -- permanently, for
+#: every additive field, and without stranding a recording, which a bump here
+#: would do to all of them at once (both readers of this number demand exact
+#: equality and neither has a window). ADR-0008.
 STREAM_VERSION: Final = 1
 
 
@@ -214,6 +227,20 @@ class SessionStarted:
     A sink writes a session/meta row; a replayer builds its fresh engine with
     this `tick_size` so quantization matches, and refuses a `stream_version`
     it does not implement.
+
+    `pylob_version` is the release of this library that produced the events --
+    the provenance `PyLOB.__version__` says a recording "should note alongside
+    its results". It rides the stream rather than being stamped by whatever
+    writes the file, so a log re-folded into a fresh database goes on naming
+    the engine that *derived* the fills rather than the one that performed the
+    fold. A replay is the other case and answers differently on purpose: it
+    re-derives every fill in a new engine, which emits an opening event of its
+    own, so a recorded replay names the replaying release.
+
+    It identifies the release and nothing more: no replay path reads it, and
+    it is not the number that governs whether a stream can be replayed at all
+    -- `stream_version` is. A recording that names a release is not thereby
+    promised to be replayable by it.
     """
 
     KIND: ClassVar[str] = "session_started"
@@ -222,6 +249,17 @@ class SessionStarted:
     timestamp: float
     tick_size: float
     stream_version: int = STREAM_VERSION
+    #: `None`, and **never** `PyLOB.__version__`. Unlike `stream_version`
+    #: above, this default is not a formality: every payload recorded before
+    #: this field existed decodes through it (`decode_event` does
+    #: `EVENT_BY_KIND[kind](**payload)`), so defaulting to the live constant
+    #: would make every one of those recordings claim it was produced by
+    #: whatever release happens to be reading it. `None` means "this stream
+    #: does not state a version", which is the true answer for such a file. A
+    #: recording engine always supplies the field, so `None` from a current
+    #: engine is impossible and no reader must tell "old file" from "new file
+    #: that declined".
+    pylob_version: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

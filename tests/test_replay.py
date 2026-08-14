@@ -50,6 +50,7 @@ from collections import Counter
 from dataclasses import replace as replace_field
 from typing import NamedTuple
 
+import PyLOB
 import pytest
 from harness import MONEY_ABS, MONEY_REL
 from PyLOB import ReplayError, replay
@@ -628,13 +629,78 @@ def test_replay_refuses_two_sessions_concatenated():
 def test_replay_refuses_a_stream_version_it_does_not_implement():
     """`SessionStarted.stream_version`: refuse what this release cannot read.
 
-    `read_events` refuses it too, from the recorded `session` row -- but a
-    caller replaying a list of events never goes near that check, so the
-    replayer keeps its own, as `events.SessionStarted` says it must.
+    `read_events` refuses it too -- `check_log` reads the number out of the
+    opening event's raw JSON, deliberately without decoding the event, since
+    decoding one whose fields may have changed is the thing being guarded
+    against. But a caller replaying a list of events never goes near that
+    check, so the replayer keeps its own, as `events.SessionStarted` says it
+    must.
     """
     events = recorded_events()
     with pytest.raises(ReplayError, match="stream_version"):
         replay([replace_field(events[0], stream_version=99)] + events[1:])
+
+
+# --------------------------------------------------------------------------
+# what replay ignores
+# --------------------------------------------------------------------------
+
+
+def test_a_stream_that_states_no_version_replays_identically():
+    """`pylob_version` is inert to replay, and ADR-0008 rests on it.
+
+    The ADR declined to bump `STREAM_VERSION` for this field on the constant's
+    own test -- bumped when an older stream would replay *wrongly* rather than
+    merely incompletely -- and the evidence was that `replay` reads exactly
+    two fields off `SessionStarted`: `tick_size`, to build the engine, and
+    `stream_version`, to refuse. That is an assertion about the code, so it
+    belongs in a test and not only in a design document. Every recording made
+    before the field exists is the population it is an assertion about.
+
+    Three streams, differing only in what their opening event says about the
+    engine that made it -- the real answer, no answer at all, and somebody
+    else's release. Same book, same ledger, same trades, in the same order.
+    """
+    original = recorded_events(n_ops=200, seed=31)
+    assert original[0].pylob_version == PyLOB.__version__, "the real one, first"
+
+    baseline, baseline_trades = replay(original)
+    for stated in (None, "0.0.1-not-this-one"):
+        book, trades = replay(
+            [replace_field(original[0], pylob_version=stated)] + original[1:]
+        )
+        assert_same_end_state(capture(baseline), capture(book))
+        assert trade_log(trades) == trade_log(baseline_trades)
+    assert baseline_trades, "a replay of a session that never traded proves little"
+
+
+def test_a_recorded_replay_names_the_engine_that_re_derived_it(tmp_path):
+    """Pinned because it is the one place the answer is arguable.
+
+    A replay is not a re-fold. Re-folding a log copies events into a fresh
+    database, so the recording it produces must keep naming the engine that
+    derived those fills -- `test_sink_durability.test_a_derived_recording_
+    keeps_the_originals_answer`. A replay *re-derives* them: `replay` builds a
+    new `OrderBook`, which matches, computes commissions, and emits its own
+    opening event. So the file a recorded replay writes names the replaying
+    release, and the input's answer is not carried across.
+
+    That is what the code does and there is nothing in `replay` that could do
+    otherwise without `OrderBook.__init__` growing a provenance parameter,
+    which is a public API change and an ADR's business, not this test's.
+    Asserted rather than assumed so that the day someone decides a replay
+    should inherit the original's answer, this turns red and says where.
+    """
+    original = recorded_events(n_ops=120, seed=32)
+    elsewhere = [replace_field(original[0], pylob_version=None)] + original[1:]
+
+    path = tmp_path / "replayed.db"
+    book, _ = replay(elsewhere, sink=SQLiteSink(path))
+    book.close()
+
+    opening = next(iter(read_events(path)))
+    assert opening.pylob_version == PyLOB.__version__
+    assert original[0].pylob_version == PyLOB.__version__, "and so does a live engine"
 
 
 # --------------------------------------------------------------------------

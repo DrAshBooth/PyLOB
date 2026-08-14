@@ -1153,9 +1153,20 @@ class OrderBook:
         # per session costs nothing measurable; an invariant with an asterisk
         # on it does, the first time someone relies on the plain statement.
         if self.recording:
+            # Function-local, and it has to be: `PyLOB/__init__.py` imports
+            # `.engine` (:41) before it defines `__version__` (:68), so the
+            # same line at module scope is an ImportError on a partially
+            # initialized package. Kept under the gate with the emission it
+            # feeds, so ADR-0002's "a sinkless engine constructs no event"
+            # goes on costing a sinkless engine nothing, this lookup included.
+            from . import __version__
+
             self.emit(
                 SessionStarted(
-                    seq=self.next_seq(), timestamp=self.time, tick_size=tick_size
+                    seq=self.next_seq(),
+                    timestamp=self.time,
+                    tick_size=tick_size,
+                    pylob_version=__version__,
                 )
             )
 

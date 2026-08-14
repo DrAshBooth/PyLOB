@@ -31,6 +31,12 @@ schema explains itself wherever it is read. This is only the map of it.
                                      in `SQLiteSink(path, meta=...)`; empty
                                      when they named nothing. `read_meta`
                                      reads it, and does not need the log
+    which engine produced this       `session.pylob_version`, the release that
+                                     emitted the events -- projected out of
+                                     `SessionStarted` and not stamped here, so
+                                     a re-fold of an old log still names the
+                                     engine that derived its fills. NULL means
+                                     the recording predates version stamping
     whether the file can be trusted  `check_log`, which reads `session_end`
                                      and `event_loss` so that you need not
 
@@ -241,7 +247,7 @@ import sqlite3
 import time
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import suppress
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from itertools import groupby
 from typing import Any
 
@@ -298,7 +304,16 @@ _log = logging.getLogger(__name__)
 #: and complete answer rather than a question the file cannot answer. What the
 #: *readers* do with that is ADR-0007's decision and not this constant's; the
 #: writer stays exact either way, for the reason `_check_schema_version` gives.
-SCHEMA_VERSION = 4
+#:
+#: 5 added `session.pylob_version`, the release that produced the events. The
+#: bump is not optional even though nothing here reads the column: ADR-0007
+#: refused to ship an addition unstamped, because a file stamped 4 carrying a
+#: version-5 column is a file whose stamp is a lie and the whole apparatus
+#: rests on the stamp being true. Like 4 and unlike 2 and 3, it takes nothing
+#: away from an older file -- an absent column says "this recording predates
+#: version stamping", which is true, complete, and cannot be misread as the
+#: good answer the way an absent `event_loss` table can.
+SCHEMA_VERSION = 5
 
 #: Oldest schema version the *readers* open. ADR-0007 put `check_log`,
 #: `read_events` and `read_meta` on a window running from here through
@@ -314,6 +329,12 @@ SCHEMA_VERSION = 4
 #: whether anything was lost or whether the session ever closed, and reading
 #: absence as the good answer would report a salvaged run as a clean one --
 #: which is why the window starts at 3 and not at 1.
+#:
+#: 4 passes the test more cleanly than either, so the bump to 5 left it here.
+#: A version-4 file has no `pylob_version` column, and the honest answer from
+#: it is "this recording predates version stamping" -- true, complete, and
+#: unambiguous, because there is no reading of an absent column under which
+#: the file appears to name a version. So the window is [3, 5].
 #:
 #: The writer is not on this window and refuses anything but `SCHEMA_VERSION`;
 #: `_check_schema_version` says why the two halves differ.
@@ -368,11 +389,25 @@ CREATE TABLE IF NOT EXISTS session_end (
     event_count INTEGER NOT NULL
 );
 
+-- The engine-provided facts of the session, projected from `SessionStarted`.
+-- Every column here is read out of that event; nothing in this table is
+-- supplied by whatever wrote the file. `session_meta` is the caller's half of
+-- the same story.
 CREATE TABLE IF NOT EXISTS session (
     seq            INTEGER PRIMARY KEY,
     timestamp      REAL    NOT NULL,
     tick_size      REAL    NOT NULL,
-    stream_version INTEGER NOT NULL
+    stream_version INTEGER NOT NULL,
+    -- Which release of PyLOB produced these events: `PyLOB.__version__` as it
+    -- stood in the engine that emitted them. Taken from the event and never
+    -- from the version doing the writing, so re-folding a log into a fresh
+    -- database -- which `_warn_what_an_older_file_lacks` recommends -- keeps
+    -- naming the engine that derived the fills rather than the one that
+    -- performed the fold. NULL means the stream states no version: a
+    -- recording made before schema 5, whose events predate the field.
+    -- Provenance only. It is not `stream_version` and does not decide whether
+    -- this recording can be replayed.
+    pylob_version  TEXT
 );
 
 CREATE TABLE IF NOT EXISTS session_meta (
@@ -589,12 +624,13 @@ _ANY_TRADE = "SELECT EXISTS (SELECT 1 FROM trade)"
 _META_SELECT = "SELECT key, value FROM session_meta ORDER BY key"
 
 _SESSION_UPSERT = """
-INSERT INTO session (seq, timestamp, tick_size, stream_version)
-VALUES (?, ?, ?, ?)
+INSERT INTO session (seq, timestamp, tick_size, stream_version, pylob_version)
+VALUES (?, ?, ?, ?, ?)
 ON CONFLICT (seq) DO UPDATE SET
     timestamp = excluded.timestamp,
     tick_size = excluded.tick_size,
-    stream_version = excluded.stream_version
+    stream_version = excluded.stream_version,
+    pylob_version = excluded.pylob_version
 """
 
 _INSTRUMENT_UPSERT = """
@@ -1122,6 +1158,12 @@ class SQLiteSink:
                         event.timestamp,
                         event.tick_size,
                         event.stream_version,
+                        # Off the event, never `PyLOB.__version__`: this is a
+                        # fold of the log like every projection here, and a
+                        # column stamped by the folding release would make a
+                        # re-fold of an old log claim that release produced
+                        # it. `sinks/` imports nothing from `PyLOB` for this.
+                        event.pylob_version,
                     )
                 )
             case InstrumentConfigured():
@@ -1521,6 +1563,25 @@ def _has_object(conn: sqlite3.Connection, name: str) -> bool:
     return row is not None
 
 
+def _has_column(conn: sqlite3.Connection, table: str, column: str) -> bool:
+    """Whether `table` carries `column` in this database.
+
+    The finer-grained sibling of `_has_object`, and the reader window needs
+    both. `CREATE TABLE IF NOT EXISTS` adds a missing table but never a
+    missing column, so a bump that adds one leaves an older file with the
+    table present and the column absent -- `trade` without `currency` at
+    version 3, `session` without `pylob_version` at version 4. Asking
+    `_has_object` about either says yes and means nothing.
+
+    Asked rather than inferred from `user_version`, for the reason
+    `_read_meta` gives about `session_meta`: the column is the fact and the
+    stamp is only the claim about it.
+    """
+    return any(
+        row[1] == column for row in conn.execute("PRAGMA table_info(%s)" % table)
+    )
+
+
 def _check_schema_window(conn: sqlite3.Connection) -> int:
     """Refuse a file no reader here can answer from; return its version.
 
@@ -1558,24 +1619,46 @@ def _warn_what_an_older_file_lacks(conn: sqlite3.Connection, version: int) -> No
     """Say what a file inside the window does not carry, on opening it.
 
     ADR-0007 accepts an older file on the grounds that a reader can answer
-    honestly from it; this is where the answering happens. Two things a
-    version-3 file lacks, and they are not the same kind of absence.
+    honestly from it; this is where the answering happens. It is the one place
+    that knows what each older version does not carry, and it asks the file
+    rather than reading its stamp: absence is checked with `_has_object` and
+    `_has_column`, so a warning describes the database in hand.
 
-    No `session_meta` table needs nothing said. No rows is exactly what "the
-    caller supplied none" looks like in a current file, so `read_meta`
-    answering `{}` is true of both, which is the whole reason 3 is in the
-    window.
+    **Three absences, and only one of them is worth a word.**
 
-    No `trade.currency` is the other kind. Those trades did settle cash legs
-    -- the file simply never recorded which currency they settled in -- so
-    there is nothing here to rebuild `trade_leg` from, and synthesising a
-    degraded view would be worse than having none: two instrument legs and no
-    cash legs is how the current schema says the instrument had no declared
-    currency, which is a different fact and, for these trades, a false one. So
-    the view stays absent, and the reader is told why rather than meeting `no
-    such table: trade_leg` and guessing.
+    No `session_meta` table (version 3) needs nothing said. No rows is exactly
+    what "the caller supplied none" looks like in a current file, so
+    `read_meta` answering `{}` is true of both, which is the whole reason 3 is
+    in the window.
 
-    The log is untouched by any of this, and re-recording it through a current
+    No `session.pylob_version` (versions 3 and 4) is deliberately silent too,
+    and the choice is worth recording because the obvious instinct is to warn.
+    Three things decide it. There is no misreading to correct: an absent
+    column cannot be read as the file naming a version, which is precisely the
+    argument that kept 4 inside the reader window, and a warning exists to
+    forestall a wrong conclusion rather than to enumerate. There is no remedy
+    to name: the log does not carry the version either, so re-recording -- the
+    thing this function tells a version-3 reader to do -- produces a current
+    file with the column NULL, and a warning that can only say "and nothing
+    will fix it" is not information a reader can act on. And the cost is paid
+    on the good path: `read_events` runs `check_log` on every read, so this
+    would fire on every read of every recording made before schema 5, which is
+    all of them -- burying the one warning below that a reader must not miss.
+    A human who asks the question directly gets a better answer than a log
+    line anyway: `SELECT pylob_version FROM session` on a pre-5 file raises
+    `no such column`, naming the version and the column at the point of asking.
+
+    No `trade.currency` (version 3) is the kind that is worth a word. Those
+    trades did settle cash legs -- the file simply never recorded which
+    currency they settled in -- so there is nothing here to rebuild
+    `trade_leg` from, and synthesising a degraded view would be worse than
+    having none: two instrument legs and no cash legs is how the current
+    schema says the instrument had no declared currency, which is a different
+    fact and, for these trades, a false one. So the view stays absent, and the
+    reader is told why rather than meeting `no such table: trade_leg` and
+    guessing.
+
+    The log is untouched by that one, and re-recording it through a current
     sink rebuilds the projections at this version -- the fold reads the
     currency out of the `InstrumentConfigured` events it passes, which is
     where the original got it. That is the remedy, so the warning names it.
@@ -1583,6 +1666,8 @@ def _warn_what_an_older_file_lacks(conn: sqlite3.Connection, version: int) -> No
     Only worth saying about a file that traded: a version-3 recording with no
     trades in it is missing a column that would have said nothing.
     """
+    if _has_column(conn, "trade", "currency"):
+        return
     if not (_has_object(conn, "trade") and conn.execute(_ANY_TRADE).fetchone()[0]):
         return
     _log.warning(
@@ -1731,9 +1816,38 @@ def decode_event(kind: str, payload: str) -> Event:
 
     Exact: `payload` holds every field, including the ones the projections
     also carry, so nothing is reconstructed from a summary.
+
+    A field this release's event class does not have is refused, by name, as
+    an `EventLogError`. It is the forward-compatibility boundary: ADR-0008
+    decided that an additive, inert event field does not bump `STREAM_VERSION`
+    -- so `check_log`'s version comparison, which reads the version "out of
+    the raw JSON rather than a decoded event, since decoding a version whose
+    fields have changed is the thing being guarded against", will pass a file
+    written by a newer PyLOB straight through to here. This is where it stops,
+    and the message says what a version number would have said.
+
+    **Refused, not dropped.** Dropping the field would be the lenient reading
+    and is exactly wrong for this module: a future field that *is* load-bearing
+    would vanish without a word and the stream would replay faithfully-looking
+    and wrong, which is the precise failure `STREAM_VERSION` exists to prevent.
+    Refusing is also the only unreadable-file outcome here that was not already
+    an `EventLogError` -- it used to be a `TypeError` out of a dataclass
+    constructor, the same shape of defect as a bare `KeyError` escaping a
+    public API.
     """
     event_type = EVENT_BY_KIND[kind]
     data = json.loads(payload)
+    # Asked before anything is converted or constructed, rather than caught
+    # after: `TypeError` out of `event_type(**data)` is also what a wrong
+    # *type* raises, and the two failures deserve different messages.
+    unknown = sorted(set(data) - {spec.name for spec in fields(event_type)})
+    if unknown:
+        raise EventLogError(
+            f"the {kind} event at seq {data.get('seq', '?')} carries "
+            f"{', '.join(unknown)}, which this PyLOB's {event_type.__name__} "
+            f"does not have: the file was most likely written by a newer "
+            f"PyLOB than the one reading it"
+        )
     for name, enum_type in _ENUM_FIELDS.items():
         if name in data:
             data[name] = enum_type(data[name])

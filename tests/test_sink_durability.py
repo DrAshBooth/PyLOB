@@ -64,13 +64,16 @@ not involve waiting for a real disk to fill is to arrange the failure.
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 import random
 import shutil
 import sqlite3
 from contextlib import suppress
+from dataclasses import replace as replace_field
 
+import PyLOB
 import pytest
 from PyLOB.engine import InvalidOrder, OrderBook
 from PyLOB.events import (
@@ -91,6 +94,7 @@ from PyLOB.sinks.sqlite import (
     IncompleteLogError,
     SQLiteSink,
     check_log,
+    decode_event,
     read_events,
     read_meta,
 )
@@ -1077,6 +1081,13 @@ def test_a_foreign_schema_version_is_refused(tmp_path, version):
     window, which is what this test is about -- and every reader is on the
     same window, `read_meta` included: a file this module cannot read is not
     one it can report the provenance of either.
+
+    Re-checked when 5 shipped, since that put 4 inside the window and made the
+    paragraph above load-bearing rather than hypothetical: the version
+    immediately below is now genuinely read, by
+    `test_a_version_4_recording_still_reads`, and this pair still names two
+    versions no window reaches. Version 2 is outside it too and is not
+    parametrised here; 1 stands for that end, as it did before.
     """
     path = tmp_path / "old.db"
     sink = SQLiteSink(path, buffer_size=100)
@@ -1515,6 +1526,192 @@ def test_read_meta_is_empty_rather_than_absent_when_none_was_supplied(tmp_path):
 
 
 # --------------------------------------------------------------------------
+# which engine produced this recording (ADR-0008)
+# --------------------------------------------------------------------------
+
+#: A release this test run is certainly not, so "the log's answer" and "the
+#: reader's answer" can never coincide by accident.
+OTHER_RELEASE = "0.0.1-not-this-one"
+
+
+def engine_version(path):
+    """`session.pylob_version`: the release the recording says produced it."""
+    conn = sqlite3.connect(path)
+    try:
+        rows = conn.execute("SELECT pylob_version FROM session").fetchall()
+    finally:
+        conn.close()
+    assert len(rows) == 1, "one session per recording"
+    return rows[0][0]
+
+
+def fold(events, target):
+    """Feed a list of events into a fresh sink, as `refold` does with a file."""
+    sink = SQLiteSink(target, buffer_size=1)
+    for event in events:
+        sink.consume(event)
+    sink.close()
+    return target
+
+
+def test_a_recording_says_which_engine_produced_it(tmp_path):
+    """`recording-sink`, sink side: the file names its own engine.
+
+    `PyLOB.__version__` says it is there so that a recorded session can "note
+    alongside its results" which version produced them, and for the life of
+    that sentence nothing did. It is a column rather than a filename
+    convention or a caller's habit for the reason `session_end` is a row: a
+    fact that depends on somebody having remembered is indistinguishable
+    afterwards from a fact nobody had.
+
+    Queryable beside the other three engine-provided session facts, which is
+    what putting it in `session` rather than behind `json_extract` on the
+    payload buys, and readable back through the library, since the event it
+    was projected from is in the log.
+    """
+    path = recorded(tmp_path, "named.db")
+
+    assert engine_version(path) == PyLOB.__version__
+    assert engine_version(path), "an empty version is not a statement"
+
+    opening = next(iter(read_events(path)))
+    assert isinstance(opening, SessionStarted)
+    assert opening.pylob_version == PyLOB.__version__
+
+    # Provenance and nothing else: it is not the number that governs replay,
+    # and the schema stamp is a third thing again.
+    assert opening.stream_version == STREAM_VERSION
+    conn = sqlite3.connect(path)
+    try:
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+    finally:
+        conn.close()
+
+
+def test_a_derived_recording_keeps_the_originals_answer(tmp_path):
+    """The assertion that fails if anyone reaches for `PyLOB.__version__` here.
+
+    `session` is a fold of the log, so the column has to be read out of
+    `SessionStarted` and never stamped by whatever performs the fold. The
+    difference is invisible to `test_the_projections_are_the_fold_of_the_log`
+    -- which does cover this column, since `dump` is `SELECT *`, but re-folds
+    with the same release the original was recorded by, so a stamp and a
+    projection agree there. Only a log naming a *different* release separates
+    them, and that is this test.
+
+    It is not a contrived case. `_warn_what_an_older_file_lacks` tells the
+    reader of an old recording to re-record it through a current sink, and
+    `test_reading_an_older_file_says_what_it_does_not_carry` asserts the
+    remedy works: a stamped column would mean the module's own advice quietly
+    rewrote the provenance of every file that took it.
+    """
+    original = recorded(tmp_path, "original.db")
+    assert OTHER_RELEASE != PyLOB.__version__, "the fixture proves nothing otherwise"
+
+    # A log recorded by another release, read back through this one.
+    events = list(read_events(original))
+    elsewhere = fold(
+        [replace_field(events[0], pylob_version=OTHER_RELEASE)] + events[1:],
+        tmp_path / "elsewhere.db",
+    )
+    assert engine_version(elsewhere) == OTHER_RELEASE
+    assert engine_version(elsewhere) != PyLOB.__version__
+
+    # A log from before the field existed re-folds to *no* version, not to the
+    # re-folder's. This is the one the decoding default decides: a
+    # `pylob_version` defaulting to the live constant would put this lie in
+    # `decode_event`, where it is harder to see than in the sink.
+    unstamped = fold(
+        [replace_field(events[0], pylob_version=None)] + events[1:],
+        tmp_path / "unstamped.db",
+    )
+    assert engine_version(unstamped) is None
+
+    # Everything else about the three recordings is identical, so what was
+    # varied is the only thing that moved.
+    for derived in (elsewhere, unstamped):
+        assert list(read_events(derived))[1:] == events[1:]
+
+
+def test_the_version_does_not_reach_the_callers_metadata(tmp_path):
+    """`session_meta` is the caller's table and stays the caller's table.
+
+    A reserved key such as `pylob.version` was the cheapest way to record this
+    -- no schema bump at all -- and it would have broken a scenario ratified
+    the same week: "a session recorded without metadata" must read back empty.
+    The two answers live in different tables precisely so that neither has to
+    be filtered out of the other.
+    """
+    path = tmp_path / "no-meta.db"
+    book, _ = build(path, buffer_size=17)
+    workload(book, random.Random(3), n_ops=50)
+    book.close()
+
+    assert read_meta(path) == {}, "the caller supplied none, and none appeared"
+    assert meta_rows(path) == []
+    assert engine_version(path) == PyLOB.__version__, "and it is still recorded"
+
+    # Nor the other way about: a caller's own version key is left alone.
+    theirs = tmp_path / "their-key.db"
+    book, _ = build(theirs, buffer_size=17, meta={"pylob_version": "theirs"})
+    workload(book, random.Random(3), n_ops=50)
+    book.close()
+
+    assert read_meta(theirs) == {"pylob_version": "theirs"}
+    assert engine_version(theirs) == PyLOB.__version__
+
+
+def test_decode_event_refuses_a_field_it_does_not_understand(tmp_path):
+    """ADR-0008's other half: the refusal that pays for not bumping the stream.
+
+    An additive field does not bump `STREAM_VERSION`, so `check_log`'s version
+    comparison -- which reads the number out of the raw JSON exactly so that
+    it need not decode an event whose fields may have changed -- passes a file
+    written by a newer PyLOB straight through. Simulated here by adding a
+    field no event class has to a payload of a genuine recording, which is
+    what such a file looks like from this side.
+
+    The file is not damaged and `check_log` correctly says so; the refusal
+    belongs at the point of decoding, names the field, and is an
+    `EventLogError` like every other unreadable file in this module rather
+    than a `TypeError` out of a dataclass constructor.
+    """
+    path = recorded(tmp_path, "from-the-future.db")
+    check_log(path)
+
+    conn = sqlite3.connect(path)
+    try:
+        seq, kind, payload = conn.execute(
+            "SELECT seq, kind, payload FROM event ORDER BY seq LIMIT 1"
+        ).fetchone()
+        data = json.loads(payload)
+        data["settlement_lag"] = 3
+        conn.execute(
+            "UPDATE event SET payload = ? WHERE seq = ?", (json.dumps(data), seq)
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    # Still not a damaged file, and still not read as one: the stream version
+    # did not move, and by ADR-0008 it was not supposed to.
+    check_log(path)
+
+    with pytest.raises(EventLogError, match="settlement_lag"):
+        list(read_events(path))
+
+    # Refused rather than dropped, and named. Dropping would let a future
+    # field the replay path *does* read vanish without a word, leaving a
+    # faithful-looking and wrong stream -- the failure `STREAM_VERSION` exists
+    # to prevent, arriving by the one route a version number cannot guard.
+    with pytest.raises(EventLogError, match="newer PyLOB") as refusal:
+        decode_event(kind, json.dumps(data))
+    assert not isinstance(refusal.value, TypeError), (
+        "an unreadable file raises EventLogError here like everywhere else"
+    )
+
+
+# --------------------------------------------------------------------------
 # an older recording, and what it can still be asked (ADR-0007)
 # --------------------------------------------------------------------------
 
@@ -1684,6 +1881,73 @@ def as_version_3(source, target):
     return target
 
 
+#: `session` as version 4 declared it: the current table without the column
+#: version 5 added. Small enough to state, unlike `V3_SCHEMA`, because that is
+#: the whole difference between the two versions.
+V4_SESSION = """
+CREATE TABLE session_v4 (
+    seq            INTEGER PRIMARY KEY,
+    timestamp      REAL    NOT NULL,
+    tick_size      REAL    NOT NULL,
+    stream_version INTEGER NOT NULL
+);
+"""
+
+
+def as_version_4(source, target):
+    """Rebuild the recording at `source` as a genuine version-4 file.
+
+    Version 4 differs from 5 in one column of one table, so only that table is
+    rebuilt: everything else is the file the current sink wrote. `V3_SCHEMA`
+    is stated in full because version 3 differed in several places; copying
+    the whole DDL again for one column would be a duplicate needing its own
+    maintenance at every future bump.
+
+    **The log is aged too, and that is the point.** A version-4 file was
+    written by a PyLOB whose `SessionStarted` had no `pylob_version` at all,
+    so the key comes out of the payload as well as the column. Dropping only
+    the column would leave a file whose log still names a version -- a thing
+    no real version-4 recording is, and one that would hide the assertion that
+    matters most here: a payload missing the key is the entire population of
+    recordings made before this field, and it is `SessionStarted`'s default
+    that decides what they decode as.
+
+    `ALTER TABLE ... DROP COLUMN` would be the obvious spelling for the column
+    and does not work here: SQLite implements it by rewriting the stored
+    `CREATE` text, and every column in this schema carries a `--` comment,
+    which that rewrite chokes on ("incomplete input"). The table is therefore
+    rebuilt the portable way -- new table, copy, drop, rename.
+
+    Stamping `PRAGMA user_version = 4` on a current file would test nothing,
+    for `as_version_3`'s reason: what ADR-0007 answers is what a reader does
+    when the schema differs, and a file that still has the column is a
+    version-5 file wearing a label.
+    """
+    shutil.copy(source, target)
+    conn = sqlite3.connect(target)
+    try:
+        conn.executescript(V4_SESSION)
+        conn.execute(
+            "INSERT INTO session_v4 (seq, timestamp, tick_size, stream_version) "
+            "SELECT seq, timestamp, tick_size, stream_version FROM session"
+        )
+        conn.execute("DROP TABLE session")
+        conn.execute("ALTER TABLE session_v4 RENAME TO session")
+        for seq, payload in conn.execute(
+            "SELECT seq, payload FROM event WHERE kind = ?", (SessionStarted.KIND,)
+        ).fetchall():
+            data = json.loads(payload)
+            del data["pylob_version"]
+            conn.execute(
+                "UPDATE event SET payload = ? WHERE seq = ?", (json.dumps(data), seq)
+            )
+        conn.execute("PRAGMA user_version = 4")
+        conn.commit()
+    finally:
+        conn.close()
+    return target
+
+
 def recorded(tmp_path, name, n_ops=200, seed=11):
     """A closed, healthy recording with trades in it, at the current version."""
     path = tmp_path / name
@@ -1742,6 +2006,80 @@ def test_a_version_3_recording_still_reads(tmp_path):
     # An absent `session_meta` table is the same answer as an empty one: the
     # caller supplied no metadata. That is what puts version 3 in the window.
     assert read_meta(old) == {}
+
+
+def test_a_version_4_recording_still_reads(tmp_path, caplog):
+    """`recording-sink`: an older recording says it does not know, and reads.
+
+    ADR-0007's test applied to the bump that added `session.pylob_version`,
+    and it passes more cleanly here than for either earlier version. A
+    version-4 file simply has no such column, and the honest answer from it is
+    "this recording predates version stamping" -- true, complete, and
+    unambiguous, because there is no reading of an absent column under which
+    the file appears to name a version. Contrast the absent `event_loss` of a
+    version-2 file, which reads as "nothing was lost": the good answer to a
+    question that file cannot answer, and why the window starts at 3.
+
+    So no exception, the events unchanged, and -- deliberately -- not a word
+    in the log. The version-3 warning exists because `trade_leg` cannot be
+    rebuilt from what that file holds and the reader is owed the reason. This
+    absence costs the reader one fact, misleads them about nothing, and has no
+    remedy to name: the log does not carry the version either, so re-recording
+    -- the thing the version-3 warning tells a reader to do -- produces a
+    current file with the column NULL, as asserted below. `check_log` runs on
+    every read, so warning here would fire on every read of every recording
+    made before schema 5, which is all of them, and bury the one warning that
+    must not be missed.
+    """
+    original = recorded(tmp_path, "current-v4.db")
+    old = as_version_4(original, tmp_path / "v4.db")
+
+    conn = sqlite3.connect(old)
+    try:
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 4
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(session)")}
+        assert conn.execute("SELECT COUNT(*) FROM session").fetchone()[0] == 1
+        opening = json.loads(
+            conn.execute(
+                "SELECT payload FROM event WHERE kind = ? ORDER BY seq LIMIT 1",
+                (SessionStarted.KIND,),
+            ).fetchone()[0]
+        )
+    finally:
+        conn.close()
+    # Genuinely a version-4 file rather than a version-5 one wearing the
+    # label: without these, every assertion below would pass on a relabelled
+    # current file and test nothing at all.
+    assert "pylob_version" not in columns
+    assert "stream_version" in columns, "and the rest of the table is intact"
+    assert "session" in objects(old), "`_has_object` cannot answer this one"
+    assert "pylob_version" not in opening, "nor does its log carry the field"
+
+    with caplog.at_level(logging.WARNING, logger="PyLOB.sinks.sqlite"):
+        check_log(old)
+        events = list(read_events(old))
+        assert read_meta(old) == read_meta(original) == {}
+    assert caplog.text == "", (
+        "a missing provenance column misleads about nothing, so reading one "
+        "says nothing -- a deliberate choice, not an omission"
+    )
+
+    # The whole population of recordings made before this field decodes
+    # through `SessionStarted.pylob_version`'s default, and this is where that
+    # default is exercised. `None` means "this stream does not state a
+    # version". A default of the live constant -- the tempting copy of
+    # `stream_version` above it -- would make every one of those recordings
+    # claim it had been produced by whatever release is reading it, which is
+    # the sink-stamped column's lie relocated into the decoder and harder to
+    # see. Nothing else about the events moved.
+    assert events[0].pylob_version is None
+    assert events[1:] == list(read_events(original))[1:]
+
+    # And so re-recording it cannot invent one: there is nothing to rebuild
+    # the column from, which is exactly why no warning above names re-folding
+    # as a remedy.
+    refold(old, tmp_path / "rebuilt-v5.db")
+    assert engine_version(tmp_path / "rebuilt-v5.db") is None
 
 
 def test_a_version_3_recording_is_still_refused_for_writing(tmp_path):
