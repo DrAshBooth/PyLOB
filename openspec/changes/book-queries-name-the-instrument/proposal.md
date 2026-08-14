@@ -1,5 +1,10 @@
 # Proposal: book-queries-name-the-instrument
 
+> **Approved by the maintainer, 2026-08-14.** Accepted as proposed. No
+> behaviour change: this ratifies the scoping both implementations already
+> follow and that six existing tests already enforce — none of them bound to
+> these two requirements, which is the gap. Converted into beads.
+
 ## Why
 
 Two `book-queries` requirements describe a query that takes an instrument
