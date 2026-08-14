@@ -1,0 +1,74 @@
+## Purpose
+
+The read side of the book: best and worst prices, volume available at a
+price, last-trade price, and the book snapshot. Under IOC market orders the
+book contains only priced limit orders, so every query has a defined answer.
+
+## ADDED Requirements
+
+### Requirement: Depth is available as an aggregated price ladder
+
+The book SHALL answer, for one instrument and one side, an ordered ladder of
+price levels: every distinct price at which orders rest on that side, best
+price first, each paired with the total unfulfilled quantity resting at
+exactly that price. A caller SHALL be able to bound the answer to the best N
+levels. A side with nothing resting SHALL yield an empty ladder rather than an
+error, and a bound that is not a positive whole number SHALL raise a library
+exception.
+
+#### Scenario: Orders at one price aggregate into one level
+
+- **WHEN** bids of 5@99, 3@99 and 4@98 rest and the bid ladder is requested
+- **THEN** the ladder reads (99, 8) then (98, 4), in that order
+
+#### Scenario: Partial fills are excluded from the level's volume
+
+- **WHEN** a resting bid of 10@99 has 4 fulfilled and the bid ladder is
+  requested
+- **THEN** that level's volume is 6
+
+#### Scenario: The ladder is bounded to the best levels
+
+- **WHEN** bids rest at 99, 98 and 97 and the bid ladder is requested bounded
+  to 2 levels
+- **THEN** the ladder holds exactly the 99 and 98 levels, in that order
+
+#### Scenario: Empty side yields an empty ladder
+
+- **WHEN** every order on a side has been cancelled or fully filled and that
+  side's ladder is requested
+- **THEN** the ladder is empty and no exception is raised
+
+#### Scenario: A non-positive bound raises
+
+- **WHEN** a ladder is requested with a bound of 0
+- **THEN** a library exception is raised
+
+### Requirement: The ladder agrees with the other read-side queries
+
+A ladder taken with no intervening operations SHALL agree with the
+best-price, volume-at-price and snapshot queries taken at the same moment: its
+first entry's price SHALL be that side's best price, its last entry's price
+that side's worst price, its volumes accumulated from the best level downwards
+SHALL equal volume-at-price at each of those prices, and its (price, volume)
+pairs SHALL equal the snapshot's unfulfilled quantities aggregated by price.
+
+#### Scenario: The ends of the ladder are the ends of the side
+
+- **WHEN** an unbounded ladder is taken on a non-empty side
+- **THEN** its first entry's price equals that side's best price and its last
+  entry's price equals that side's worst price
+
+#### Scenario: Cumulative depth equals volume at price
+
+- **WHEN** an unbounded bid ladder is taken and its volumes are accumulated
+  from the best level downwards
+- **THEN** the running total at each of its prices equals the volume-at-price
+  query for the bid side at that price
+
+#### Scenario: The ladder is the snapshot, aggregated
+
+- **WHEN** an unbounded ladder and a snapshot are taken for the same
+  instrument and side with no intervening operations
+- **THEN** aggregating the snapshot's unfulfilled quantities by price
+  reproduces the ladder exactly, levels and order alike
