@@ -1,11 +1,22 @@
-"""
-Created on Apr 11, 2013
+"""A walkthrough of PyLOB, in the order README.md introduces it.
 
-@author: Ash Booth
+Run it from a clone with `uv run python src/example.py`. It prints a running
+commentary and writes nothing outside a temporary directory it creates and
+removes.
 
-For a full walkthrough of PyLOB functionality and usage,
-see the wiki @ https://github.com/ab24v07/PyLOB/wiki
+Two acts:
 
+1. `walkthrough` -- one book, no sink. Limit orders that rest, a limit order
+   that crosses, one that crosses only partially, a market order, a cancel, a
+   modify, and one last submission through the legacy dict-quote API.
+2. `recorded` -- the same engine with a `SQLiteSink` attached, and the SQL
+   that reads the session back afterwards.
+
+`./verify` runs this file end to end, so it cannot drift from the library.
+
+Written by Ash Booth in April 2013 and kept in step with the code since. The
+wiki this file used to point readers at was not: it describes an
+implementation two engines ago, and README.md is the guide now.
 """
 
 import sqlite3
@@ -122,11 +133,12 @@ def walkthrough(lob):
 def recorded(db_path):
     """The optional second act: the same engine, with a recorder attached.
 
-    Sinkless is the default and the fast path: ADR-0002 measures the
-    throughput target with no sink attached, and an engine without one builds
-    no event at all. Attaching a `SQLiteSink` costs roughly 8x throughput and
-    buys the whole session back as queryable history -- worth it for the runs
-    you mean to inspect afterwards, wasted on the ones you do not.
+    Sinkless is the default and the fast path: an engine with no sink builds
+    no event at all, and the throughput floor is measured in that
+    configuration (ADR-0005, superseding ADR-0002). Attaching a `SQLiteSink`
+    costs roughly 8x throughput and buys the whole session back as queryable
+    history -- worth it for the runs you mean to inspect afterwards, wasted on
+    the ones you do not.
     """
     from PyLOB.sinks.sqlite import SQLiteSink
 
@@ -149,6 +161,11 @@ def recorded(db_path):
 
 
 def main():
+    # One book is one session, and the two acts below are two of them: there
+    # is no `reset()` because constructing a fresh `OrderBook` is the reset,
+    # and at 0.8 microseconds it is the pattern a per-episode gym or sweep
+    # should use rather than avoid (README, "Sessions and episodes").
+    #
     # No sink is the default: no I/O, nothing persisted, nothing constructed.
     walkthrough(OrderBook(tick_size=0.01))
 
