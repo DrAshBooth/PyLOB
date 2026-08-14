@@ -67,6 +67,7 @@ from __future__ import annotations
 import logging
 import math
 import random
+import shutil
 import sqlite3
 from contextlib import suppress
 
@@ -74,10 +75,14 @@ import pytest
 from PyLOB.engine import InvalidOrder, OrderBook
 from PyLOB.events import (
     STREAM_VERSION,
+    ClosableEventSink,
+    EventSink,
     InstrumentConfigured,
     SessionStarted,
     TraderConfigured,
+    close_sink,
 )
+from PyLOB.sinks import ListSink
 from PyLOB.sinks.sqlite import (
     DEFAULT_BUFFER_SIZE,
     SCHEMA_VERSION,
@@ -694,6 +699,49 @@ def test_a_killed_session_is_identifiable_as_incomplete(tmp_path):
     assert len(list(read_events(path, strict=False))) == len(written)
 
 
+def test_a_killed_db_copied_without_its_wal_names_the_wal(tmp_path):
+    """The one way a careful researcher loses a killed run to a misdiagnosis.
+
+    In WAL mode a live recording is up to three files, and a killed process
+    checkpoints none of them: the `.db` is an empty shell while every
+    committed event sits in the `-wal` beside it. Copy the `.db` alone -- the
+    obvious thing to do with something named `session.db` -- and the file that
+    arrives has no schema at all, which the version check reported as "schema
+    version 0 is not this module's version 3". That sends a reader looking for
+    an old release of this module, when what they need is a file they left
+    behind, and the run is recoverable the whole time they are not looking.
+    """
+    live = tmp_path / "live"
+    live.mkdir()
+    path = live / "killed.db"
+    sink = killed_session(path)
+    assert (live / "killed.db-wal").exists(), "WAL mode, and nothing checkpointed"
+
+    alone = tmp_path / "alone"
+    alone.mkdir()
+    copied = alone / "killed.db"
+    shutil.copyfile(path, copied)
+    with pytest.raises(sqlite3.OperationalError, match="no such table"):
+        seqs(copied)  # the copy is a shell: not one event came with it
+
+    with pytest.raises(EventLogError) as refusal:
+        check_log(copied)
+    message = str(refusal.value)
+    assert "is not this module's version" not in message, "not a version mismatch"
+    assert "no tables" in message
+    assert "killed.db-wal" in message, "the file actually holding the events"
+    assert "killed.db-shm" in message
+
+    # And the advice is good: with the sidecar, the same copy is the killed
+    # run it always was, prefix and all.
+    for suffix in ("-wal", "-shm"):
+        shutil.copyfile(f"{path}{suffix}", f"{copied}{suffix}")
+    with pytest.raises(IncompleteLogError):
+        check_log(copied)
+    assert len(list(read_events(copied, strict=False))) == len(seqs(path))
+    assert sink.buffered > 0, "the live sink was never closed behind our backs"
+
+
 def test_a_cleanly_closed_log_is_not_flagged(tmp_path):
     """The same run, closed. Nothing about it is suspect."""
     path = tmp_path / "closed.db"
@@ -1176,3 +1224,43 @@ def test_commission_is_reported_in_the_currency_it_was_charged_in(tmp_path):
     # And the total is unmoved: the fix splits the commission by currency, it
     # does not recompute it.
     assert math.isclose(sum(charged.values()), 4.0, rel_tol=1e-9)
+
+
+# --------------------------------------------------------------------------
+# the other sink this package ships
+# --------------------------------------------------------------------------
+
+
+def test_the_shipped_list_sink_is_the_three_line_sink_events_py_promises():
+    """`EventSink` described a sink that was not anywhere to be imported.
+
+    Every suite that wants to know what the engine emitted wrote its own; the
+    2026-08 clarity review counted four copies. This is that class, shipped
+    once, and it has to keep being what the protocol says it is: no `close`
+    (the case `close_sink` exists for), every event, in `seq` order.
+    """
+    sink = ListSink()
+    book = OrderBook(tick_size=TICK, sink=sink)
+    book.configure_instrument(INSTRUMENT, CURRENCY)
+    for tid in (1, 2):
+        book.configure_trader(tid, name=str(tid))
+    for side in ("bid", "ask"):
+        book.submit(
+            tid=1 if side == "bid" else 2,
+            instrument=INSTRUMENT,
+            side=side,
+            order_type="limit",
+            qty=5,
+            price=100.0,
+        )
+
+    assert isinstance(sink, EventSink)
+    assert not isinstance(sink, ClosableEventSink), "no close, and none needed"
+    assert [event.seq for event in sink.events] == list(range(len(sink.events)))
+    kinds = [type(event).__name__ for event in sink.events]
+    assert kinds[0] == "SessionStarted"
+    assert "Filled" in kinds, "the crossing pair traded, and the sink saw it"
+
+    close_sink(sink)  # a no-op on a sink with nothing to flush
+    book.close()
+    assert len(sink.events) == len(kinds), "and closing emitted nothing further"

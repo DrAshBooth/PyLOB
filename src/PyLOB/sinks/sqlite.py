@@ -5,6 +5,33 @@ recorder. This module is that recorder. It implements `events.EventSink`
 structurally -- no subclassing, no registration -- and the engine neither
 imports it nor knows whether it exists.
 
+Which table answers which question
+----------------------------------
+
+For a reader arriving from the README with a recorded `.db` and a question.
+`sqlite3 session.db .schema` is the reference and stays the reference: every
+table and column carries its comment inside its own `CREATE` statement, so the
+schema explains itself wherever it is read. This is only the map of it.
+
+    what became of an order          `orders`; `resting_order` for the ones
+                                     still on the book, and what is left of
+                                     them to trade
+    what traded, and at what price   `trade`, one row per execution;
+                                     `instrument.last_price` for the latest
+    what a trader holds              `balance`, per trader per instrument-or-
+                                     currency -- derived, never emitted
+    what a trader paid in commission `trader_commission`, per currency
+    what the engine actually emitted `event` -- the log itself, one JSON row
+                                     per event, and the input to a replay
+    whether the file can be trusted  `check_log`, which reads `session_end`
+                                     and `event_loss` so that you need not
+
+`resting_order` and `trader_commission` are views over `orders`, not tables.
+Per-trade balance movements are not stored -- `balance` holds the running sum
+-- but each trade's four movements are derivable from its `trade` row, whose
+price, quantity and per-side commission deltas are exactly what the balance
+rule below consumes.
+
 Shape of the database
 ---------------------
 
@@ -131,6 +158,31 @@ refuse it. The resulting mode is checked, warned about when it is not `wal`,
 and readable as `journal_mode`, because a durability story nobody verified is
 not one.
 
+**A recording in WAL mode is up to three files, and the `.db` alone is not
+it.** Commits land in `session.db-wal` and move into `session.db` only at a
+checkpoint. `close` closes the connection, which checkpoints, so a session
+that ended properly is the single file it looks like. A session that was
+*killed* checkpointed nothing: its `.db` can be a 4 KB shell while every
+recorded event sits in the `-wal` beside it. So copy a killed run's
+`session.db`, `session.db-wal` and `session.db-shm` together, or checkpoint
+before copying -- `sqlite3 session.db 'PRAGMA wal_checkpoint(TRUNCATE)'`, or
+just open and close the file with any SQLite client, after which the `.db`
+travels alone. Copying the `.db` by itself does not corrupt anything and
+loses nothing that is still on the original disk; it produces a file with no
+tables in it, which `check_log` reports as exactly that, and the events are
+where they always were.
+
+That is the loud outcome, and it is the likely one for a short run. A long
+one may have auto-checkpointed part way, and then the lone `.db` holds the
+events up to that checkpoint and none after it -- tables present, `seq`
+running from 0 without a gap, no `event_loss` row, no `session_end` because
+the run was killed. `check_log` calls that an incomplete log, which is true,
+and cannot tell you it is *also* a partial copy: a truncated prefix of a
+killed session is byte-for-byte what a shorter killed session looks like, and
+no extent was ever recorded to contradict it. This is the reason to copy all
+three files rather than a matter of tidiness, and it is the one way to lose
+recorded events without the file saying so.
+
 Scope
 -----
 
@@ -205,6 +257,12 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS event (
     seq        INTEGER PRIMARY KEY,
     kind       TEXT    NOT NULL,
+    -- The engine's clock, NOT epoch time: simulated time, or an operation
+    -- counter, or whatever the caller passed -- ordering and spacing are
+    -- meaningful, the absolute value is not a date. Plot against it, do not
+    -- convert it. Every other `timestamp`/`_ts` column here is this same
+    -- clock, carried from the event; wall clock lives only in the `_at`
+    -- columns (`event_loss.recorded_at`, `session_end.recorded_at`).
     timestamp  REAL    NOT NULL,
     -- events.is_replayable, materialised at write time.
     replayable INTEGER NOT NULL,
@@ -358,6 +416,10 @@ INSERT INTO session_end (recorded_at, last_seq, event_count) VALUES (?, ?, ?)
 """
 
 _LOG_EXTENT = "SELECT COUNT(*), MAX(seq) FROM event"
+
+# Zero means the file has no schema at all, which is a different problem from
+# having the wrong one: see `_no_tables_message`.
+_TABLE_COUNT = "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table'"
 
 _SESSION_UPSERT = """
 INSERT INTO session (seq, timestamp, tick_size, stream_version)
@@ -1089,14 +1151,19 @@ def check_log(source: str | os.PathLike[str] | sqlite3.Connection) -> None:
     every reader gets the same answer. `read_events` calls it; call it
     directly to ask the question without reading the stream.
 
-    Five ways a file fails, in order of how badly. The first four are
+    Six ways a file fails, in order of how badly. The first five are
     corruption -- something is wrong with the file. The last is only
     incompleteness, and is raised as `IncompleteLogError` for callers who
     want to tell those apart.
 
     **The schema is not this one.** `PRAGMA user_version` must be
     `SCHEMA_VERSION`. Checked first, because the rest of these queries assume
-    this module's tables.
+    this module's tables. Version 0 with no tables in the file is reported
+    separately, because it is not a version mismatch at all and the honest
+    diagnosis saves a session: it is what a killed run's `.db` looks like when
+    it was copied without its `-wal` sidecar (see Durability), and a reader
+    told "version 0 is not version 3" goes looking for an old release of this
+    module instead of for the file holding their events.
 
     **The sink recorded a loss.** Any `event_loss` row is a loss this sink
     knew about, wherever in the stream it fell, and it is on disk without
@@ -1140,9 +1207,37 @@ def check_log(source: str | os.PathLike[str] | sqlite3.Connection) -> None:
         conn.close()
 
 
+def _no_tables_message(conn: sqlite3.Connection) -> str:
+    """What to say about a database file that holds nothing whatsoever.
+
+    Schema version 0 and not a single table is the absence of a schema, not an
+    old one, and the overwhelmingly likeliest way a researcher produces it is
+    by copying a killed run's `.db` without the `-wal` beside it -- the one
+    file that then holds every event. Naming the sidecar is the difference
+    between recovering the session and concluding the data is gone.
+    """
+    row = conn.execute("PRAGMA database_list").fetchone()
+    name = os.path.basename(row[2]) if row and row[2] else "session.db"
+    return (
+        f"{name} holds no tables at all: nothing was ever written to this "
+        f"file, and schema version 0 is the absence of a schema rather than "
+        f"an older one. If this is a copy of a recording, it was copied "
+        f"without its write-ahead log: an unfinished session keeps its recent "
+        f"commits in {name}-wal, so the events are there and not here. Copy "
+        f"{name}, {name}-wal and {name}-shm together from wherever the run "
+        f"wrote them, or checkpoint before copying -- sqlite3 {name} 'PRAGMA "
+        f"wal_checkpoint(TRUNCATE)' -- and this file reads normally. If there "
+        f"is no {name}-wal anywhere, then this file is not a recording"
+    )
+
+
 def _check_log(conn: sqlite3.Connection) -> None:
     version = conn.execute("PRAGMA user_version").fetchone()[0]
     if version != SCHEMA_VERSION:
+        # An empty file is a different accident from an old file, and saying
+        # "version" to somebody holding the first sends them nowhere.
+        if version == 0 and conn.execute(_TABLE_COUNT).fetchone()[0] == 0:
+            raise EventLogError(_no_tables_message(conn))
         raise EventLogError(
             f"database schema version {version} is not this module's "
             f"version {SCHEMA_VERSION}"
