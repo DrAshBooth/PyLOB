@@ -50,6 +50,24 @@ def result():
     return measure()
 
 
+@pytest.fixture(scope="module")
+def repeated():
+    """One three-repeat measurement, shared by everything that describes one.
+
+    Module-scoped for `result`'s reason, and it saves three times as much: a
+    three-repeat run costs three calibration passes at ~60 ms each, and the
+    tests below used to take one such run *each*.
+
+    They are all assertions about the *shape* of a multi-repeat report -- which
+    summary is a median and which a best-of, that each sample pairs its own two
+    factors, how the spread is derived from the samples it is a spread of --
+    and each is checked against that same report's own `samples`. So they hold
+    of any three-repeat run, and taking five of them proved the same five
+    things about five runs rather than anything more.
+    """
+    return measure(repeats=3)
+
+
 def test_a_run_reports_everything_the_spec_asks_for(result):
     assert result.workload == "mixed-v1"
     assert result.seed == workloads.CANONICAL_SEED
@@ -104,20 +122,16 @@ def test_a_different_seed_is_a_different_run(result):
     assert other.workload_checksum != result.workload_checksum
 
 
-def test_the_calibration_runs_alongside_and_is_reported():
-    result = measure(repeats=2)
-
-    assert result.calibration.name == "calib-v1"
-    assert result.calibration.seconds > 0
-    assert result.calibration_spread >= 0
+def test_the_calibration_runs_alongside_and_is_reported(repeated):
+    assert repeated.calibration.name == "calib-v1"
+    assert repeated.calibration.seconds > 0
+    assert repeated.calibration_spread >= 0
 
 
-def test_every_repeat_pairs_a_calibration_with_the_engine_pass_that_followed():
+def test_every_repeat_pairs_a_calibration_with_the_engine_pass_that_followed(repeated):
     """The work index is only meaningful if its two factors share a moment."""
-    result = measure(repeats=3)
-
-    assert len(result.samples) == 3
-    for sample in result.samples:
+    assert len(repeated.samples) == 3
+    for sample in repeated.samples:
         assert sample.calibration_seconds > 0
         assert sample.sinkless.orders == ORDERS
         assert sample.work_index == pytest.approx(
@@ -125,27 +139,31 @@ def test_every_repeat_pairs_a_calibration_with_the_engine_pass_that_followed():
         )
 
 
-def test_the_work_index_is_the_median_of_the_repeats(result):
-    """Median, not best-of: see `runner`'s docstring for why they differ."""
-    indices = sorted(sample.work_index for sample in result.samples)
+def test_the_work_index_is_the_median_of_the_repeats(repeated):
+    """Median, not best-of: see `runner`'s docstring for why they differ.
 
-    assert result.work_index == pytest.approx(statistics.median(indices))
-    assert result.work_index > 0
+    Taken over three repeats and not one: the median of a single sample is
+    every other summary of it too, so a one-repeat run cannot tell a median
+    apart from a best-of and this asserted nothing about which was taken.
+    """
+    indices = sorted(sample.work_index for sample in repeated.samples)
+
+    assert repeated.work_index == pytest.approx(statistics.median(indices))
+    assert repeated.work_index > 0
 
 
-def test_the_reported_throughput_is_the_best_repeat_not_the_median():
+def test_the_reported_throughput_is_the_best_repeat_not_the_median(repeated):
     """The two summaries are of the same repeats and are not the same number.
 
     `orders_per_sec` is best-of-N because it answers "how fast is this
     engine"; `work_index` is a median because it answers "did it change".
     """
-    result = measure(repeats=3)
-    best = max(sample.sinkless.orders_per_sec for sample in result.samples)
+    best = max(sample.sinkless.orders_per_sec for sample in repeated.samples)
 
-    assert result.sinkless.orders_per_sec == pytest.approx(best)
+    assert repeated.sinkless.orders_per_sec == pytest.approx(best)
 
 
-def test_the_calibration_figure_a_comparison_uses_is_the_median():
+def test_the_calibration_figure_a_comparison_uses_is_the_median(repeated):
     """The confidence ratio must come from the statistic the verdict does.
 
     The comparison's machine-speed figure used to be the *best* calibration
@@ -154,31 +172,29 @@ def test_the_calibration_figure_a_comparison_uses_is_the_median():
     that happened. That mismatch is how a run whose calibration varied by 94%
     across repeats reported itself confident.
     """
-    result = measure(repeats=3)
-    seconds = [sample.calibration_seconds for sample in result.samples]
+    seconds = [sample.calibration_seconds for sample in repeated.samples]
 
-    assert result.calibration_median_seconds == pytest.approx(
+    assert repeated.calibration_median_seconds == pytest.approx(
         statistics.median(seconds)
     )
-    assert result.calibration.seconds == pytest.approx(min(seconds)), (
+    assert repeated.calibration.seconds == pytest.approx(min(seconds)), (
         "the best pass is still reported; it is simply not what is compared"
     )
 
 
-def test_the_dispersion_of_the_judged_quantity_is_reported():
+def test_the_dispersion_of_the_judged_quantity_is_reported(repeated):
     """The one within-run number that sees a machine that would not hold still.
 
     Read against the tolerance by `baselines.compare`: a run whose judged
     quantity moved further across its own repeats than the band separating
     "ok" from "regression" did not measure one thing three times.
     """
-    result = measure(repeats=3)
-    indices = [sample.work_index for sample in result.samples]
+    indices = [sample.work_index for sample in repeated.samples]
 
-    assert result.work_index_spread == pytest.approx(
-        (max(indices) - min(indices)) / result.work_index
+    assert repeated.work_index_spread == pytest.approx(
+        (max(indices) - min(indices)) / repeated.work_index
     )
-    assert result.work_index_spread >= 0
+    assert repeated.work_index_spread >= 0
 
 
 def test_a_single_repeat_disperses_by_nothing():

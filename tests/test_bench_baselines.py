@@ -652,19 +652,44 @@ SMOKE = ["--orders", "400", "--repeats", "1", "--no-sink", "--no-qos"]
 KEY = baselines.baseline_key("mixed-v1", 42, 400, "calib-v1")
 
 
+#: The text a recording run wrote, keyed by the arguments it was given. See
+#: `record_baseline`.
+_RECORDED: dict[tuple[str, ...], str] = {}
+
+
 def record_baseline(path, *extra):
     """Record a baseline at `path` and return the document and its record.
 
     `--force` because the machine running the suite is not promised to be
     quiet; the gate that would otherwise refuse has its own tests above.
+
+    The recording run happens once per set of arguments and its output is
+    replayed to later callers. A recording is the most expensive thing in this
+    file -- a real engine pass, a real 60 ms calibration pass, and a provenance
+    capture that shells out to git -- and a dozen tests below want *a* recorded
+    baseline to mutate and judge a later run against, not a *freshly* recorded
+    one. They ask for it with identical arguments against an identical empty
+    path, so the eleven repeats re-ran one code path on one input.
+
+    Nothing here is stubbed. The first caller performs the whole recording for
+    real, and the text every other caller gets is that recording's own output --
+    the same text the shipped-file contract is asserted against below. Each
+    caller parses its own document from its own file, so the mutations below
+    still cannot reach another test. What stopped being repeated is the
+    measurement, not any assertion about it.
     """
-    assert main(
-        [*SMOKE, "--baselines", str(path), "--rebaseline", "--force", *extra]
-    ) in (
-        0,
-        1,
-    )
-    document = json.loads(path.read_text(encoding="utf-8"))
+    text = _RECORDED.get(extra)
+    if text is None:
+        assert main(
+            [*SMOKE, "--baselines", str(path), "--rebaseline", "--force", *extra]
+        ) in (
+            0,
+            1,
+        )
+        text = _RECORDED[extra] = path.read_text(encoding="utf-8")
+    else:
+        path.write_text(text, encoding="utf-8")
+    document = json.loads(text)
     return document, document["baselines"][KEY]
 
 
