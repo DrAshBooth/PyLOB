@@ -1,6 +1,6 @@
 """Acceptance tests for the commissions contract.
 
-Contract: `openspec/changes/spec-commissions-balances/specs/commissions/spec.md`.
+Contract: `openspec/specs/commissions/spec.md`.
 The schedule is `min(max_pct * V / 100, max(min_commission, per_unit * Q))` over
 the order's cumulative fills, computed in floating point with no currency
 quantization -- so every comparison goes through `approx_money`, never `==`.

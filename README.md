@@ -293,10 +293,12 @@ Where to read next:
 executable contracts are `tests/reference/matcher.py` and
 `tests/test_emission_coverage.py`.
 
-**History:** the two dated reviews, `docs/engine-review-2026-08.md` and
-`docs/clarity-review-2026-08.md`, and `brain/architecture.md` — a 2026-08-10
-draft written before the in-memory engine landed, so a record of what was
-believed then rather than a description of the code now.
+**History:** the three dated reviews — `docs/architecture-review-2026-08.md`
+on the SQL engine PR #7 built, `docs/engine-review-2026-08.md` on the engine
+that replaced it, and `docs/clarity-review-2026-08.md` — each carrying a
+banner saying what has happened since. Then `brain/architecture.md` — a
+2026-08-10 draft written before the in-memory engine landed, so a record of
+what was believed then rather than a description of the code now.
 
 The code is open-sourced via the MIT Licence: see [LICENSE.md](LICENSE.md) for
 the full text. (copied from http://opensource.org/licenses/mit-license.php)

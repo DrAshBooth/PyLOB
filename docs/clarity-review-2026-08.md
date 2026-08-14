@@ -1,5 +1,45 @@
 # Clarity review — 2026-08-14
 
+> **Status, 2026-08-14.** Four of the five headline changes have landed; the
+> first has not, and it is the one the review ranks highest.
+>
+> - **1, ship `replay()`** — **not done.** `PyLOB` still exports no `replay`,
+>   no `cancel`/`modify`, no `depth()`, no `session_meta` and no `trade_leg`,
+>   and the only executable replays remain the two private copies in the test
+>   suite. These are public API additions, so they go through OpenSpec, and
+>   that proposal is not yet written. The finding stands as put.
+> - **2, the front door** — done. The README has a benchmarking section that
+>   names and runs the harness, an eight-line quickstart run verbatim from a
+>   clean venv, the sixth spec it used to omit, and the sessions-and-episodes
+>   paragraph. `example.py` says what it teaches and in what order. Both now
+>   record that ADR-0002 is superseded by ADR-0005, and quote 439 orders/sec
+>   as a historical origin rather than a live figure.
+> - **3 and 4, the docstrings** — done, in one documentation-only pass whose
+>   ASTs are identical to the previous file's once docstrings are stripped.
+>   The three traps moved to where a reader meets them; the 32 bead-id
+>   citations were cut to the load-bearing remainder and are now explained by
+>   one glossary paragraph; the 3.1x/4.5x contradiction collapsed to
+>   ADR-0004. The ~700-line target below was **declined with
+>   reasoning** rather than met: it was a whole-repo estimate, and what is
+>   left in `engine.py` is per-method contract — spec citations, refusal
+>   reasons, replay-coherence markers — whose removal would cost contract
+>   rather than archaeology. The protected list survived intact.
+> - **5, inspection docs and the WAL trap** — done, and the trap turned out to
+>   have a second face the review had not seen: a *checkpointed* lone `.db` is
+>   a contiguous prefix of a killed run and is provably indistinguishable from
+>   a shorter killed run, so no check inside the file can catch it. Detection
+>   being impossible, the error message carries the warning instead.
+>
+> From "Also filed": `ListSink` shipped, `brain/architecture.md` is bannered,
+> and the `quantize`/`clipPrice` alias is flipped so the modern name is the
+> definition. The P3 group is being worked through.
+>
+> One item has since reversed. §2 and the reading map describe a wiki the
+> README disavowed; the wiki was rewritten for this engine on 2026-08-14, and
+> the README and `pyproject.toml` point at it again. Its `Implementation` page
+> is the part kept as history. Nothing below is edited — the findings are the
+> record of what was found — and only this note is new.
+
 Requested by the maintainer before the baseline recording run, with a stated
 focus: clarity, readability, redundancy, and use by researchers. Five parallel
 lenses — a researcher's empirical first day, engine readability, redundancy

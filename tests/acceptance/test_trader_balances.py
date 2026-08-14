@@ -1,6 +1,6 @@
 """Acceptance tests for the trader-balances contract.
 
-Contract: `openspec/changes/spec-commissions-balances/specs/trader-balances/spec.md`.
+Contract: `openspec/specs/trader-balances/spec.md`.
 A balance is a running per-(trader, instrument-or-currency) bucket moved by
 trades and commissions. The values are floating-point sums with no currency
 quantization, so every balance comparison goes through `approx_money`, never

@@ -2,7 +2,7 @@
 
 `OrderBook` is the matching engine (`PyLOB.engine`): price-time priority in
 one layer, no I/O, no database. It is the engine ADR-0001 moved matching
-into, and since ADR-0003 retired the 2013 SQL engine it is the only one --
+into, and since ADR-0003 retired the SQL engine PR #7 built it is the only one --
 `OrderBook(db=conn)` no longer means anything, and there is no
 `LegacyOrderBook` to reach for. The public API that engine defined is kept
 (`processOrder`, `cancelOrder`, `modifyOrder`, `getVolumeAtPrice`,
@@ -43,10 +43,15 @@ from .events import EventSink, OrderType, Side
 #: installable from a git URL at a commit that `importlib.metadata` would
 #: report by whatever version string the wheel was built with, and the
 #: constraint that PyLOB "reads nothing off disk" (`config.yaml`) applies to
-#: its own metadata too. Kept equal to pyproject's `version` by hand; it is
-#: read by researchers recording which library produced a session, and by
-#: nothing in the library itself. `events.STREAM_VERSION` is the number that
-#: governs whether a recorded session can be replayed -- this one does not.
+#: its own metadata too.
+#:
+#: **This line is the version.** `pyproject.toml` declares `version` dynamic
+#: and hatchling reads this literal out of the file's text at build time, so
+#: the wheel and the sdist cannot disagree with it -- edit here, and nowhere
+#: else. Nothing in the library reads it; it is here for researchers recording
+#: which version produced a session. `events.STREAM_VERSION` is the number
+#: that governs whether a recorded session can be replayed -- this one does
+#: not.
 __version__: Final = "0.1.0"
 
 __all__ = [

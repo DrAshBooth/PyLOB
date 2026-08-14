@@ -8,9 +8,9 @@ every instrument and currency.
 
 The two implementations are `PyLOB.engine.OrderBook` and `tests/reference`, a
 matching engine written from the frozen specs that shares no code with it. Both
-are driven through the acceptance suites' adapter surface
-(`tests/acceptance/conftest.py`), which is what makes a differential harness
-expressible at all: `limit`, `market`, `cancel`, `modify`, `reopen`,
+are driven through the acceptance suites' adapter surface (`tests/harness/`),
+which is what makes a differential harness expressible at all: `limit`,
+`market`, `cancel`, `modify`, `reopen`,
 `order_state`, `snapshot`, `trades`, `best`, `worst`, `volume_at`,
 `last_price`, `balance` mean the same thing on both sides of the comparison.
 
@@ -123,7 +123,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import pytest
-from acceptance_surface import (
+from harness import (
     CURRENCY,
     INSTRUMENT,
     MONEY_ABS,

@@ -14,9 +14,9 @@ Two acts:
 
 `./verify` runs this file end to end, so it cannot drift from the library.
 
-Written by Ash Booth in April 2013 and kept in step with the code since. The
-wiki this file used to point readers at was not: it describes an
-implementation two engines ago, and README.md is the guide now.
+Written by Ash Booth in April 2013 and kept in step with the code since.
+README.md is the short guide; the wiki carries the long-form walkthrough and a
+guide to reading a recorded session back.
 """
 
 import sqlite3

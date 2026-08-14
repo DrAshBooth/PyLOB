@@ -7,7 +7,7 @@ either renaming (`book` -> `snapshot`) or repackaging (a `RefOrder` as a
 this file it is in the wrong file, because a rule with nowhere to cite a spec
 clause is a rule nobody derived.
 
-The surface is the one `tests/acceptance/conftest.py` documents:
+The surface is the one `tests/harness/` documents:
 
 operations
     `limit`, `market`, `cancel`, `modify`, `reopen`, `close`
@@ -19,8 +19,12 @@ Speaking exactly that surface is what lets `tests/test_differential.py` drive
 the model and the engine through one code path and compare the two.
 """
 
-from acceptance_surface import (
-    SURFACE,
+from harness import (
+    CURRENCY,
+    DEFAULT_TICK,
+    INSTRUMENT,
+    NO_COMMISSION,
+    TRADERS,
     UNSET,
     BookEntry,
     OrderRef,
@@ -200,12 +204,12 @@ class ReferenceAdapter:
 
 def build_reference(
     db_path,
-    traders=SURFACE.TRADERS,
-    commissions=SURFACE.NO_COMMISSION,
+    traders=TRADERS,
+    commissions=NO_COMMISSION,
     self_matching=(),
-    instrument=SURFACE.INSTRUMENT,
-    currency=SURFACE.CURRENCY,
-    tick_size=SURFACE.DEFAULT_TICK,
+    instrument=INSTRUMENT,
+    currency=CURRENCY,
+    tick_size=DEFAULT_TICK,
 ):
     """Build the reference model, configured like any other engine under test.
 

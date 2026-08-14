@@ -60,8 +60,8 @@ Keeping both costs roughly one extra row-write per event. Cheap, and it buys
 the two consumers what each needs without compromise: replay (lob-5rt.7)
 reads the log, outcome comparison (lob-5rt.11) reads the projections.
 
-The schema is event-shaped, not shaped like the matching schema of the 2013
-SQL engine ADR-0003 retired (design.md decision 5). Nothing here is matching
+The schema is event-shaped, not shaped like the matching schema of the SQL
+engine ADR-0003 retired (design.md decision 5). Nothing here is matching
 state and nothing triggers: no views that compute eligibility, no triggers
 that move balances. Rows are written by Python, in one direction, after the
 fact.

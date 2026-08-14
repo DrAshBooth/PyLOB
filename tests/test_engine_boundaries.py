@@ -421,7 +421,7 @@ def test_a_fill_is_settled_or_it_does_not_happen():
     book = make_book()
     book.configure_trader(1, "1", commission_min=0.5, commission_max_percnt=1.0)
     book.submit(1, INSTRUMENT, "ask", "limit", 5, 100.0)
-    maker = book.book(INSTRUMENT).asks.level_at(100.0).first()
+    maker = book.snapshot(INSTRUMENT, "ask")[0]
     taker, trades = book.submit(2, INSTRUMENT, "bid", "market", 3)
 
     assert len(trades) == 1 and maker.fulfilled == 3 and taker.fulfilled == 3

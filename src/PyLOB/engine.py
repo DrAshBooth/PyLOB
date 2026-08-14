@@ -65,8 +65,8 @@ one end. `getWorstBid`/`getWorstAsk` are reporting queries (`book-queries`)
 and deserve to be cheap, but they do not deserve to slow down insertion. A
 sorted list of prices would answer both ends and range scans in one structure,
 but pays an O(L) memmove on every new level; a red-black tree pays more code
-than the research scale is worth (ADR-0001 rejected the 2013 implementation's
-tree for the same reason).
+than the research scale is worth (the inmemory-engine design.md, decision 1,
+rejected the 2013 implementation's tree for the same reason).
 
 Identity
 --------
@@ -652,12 +652,6 @@ class PriceLevel:
             len(self._orders),
             self.volume,
         )
-
-    def first(self) -> Order | None:
-        """The order at the front of the queue, or None if the level is empty."""
-        for order in self._orders.values():
-            return order
-        return None
 
     def append(self, order: Order) -> None:
         """Put `order` at the back of the queue."""

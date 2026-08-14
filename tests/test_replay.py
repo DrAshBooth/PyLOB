@@ -30,12 +30,11 @@ taker, and whether it may trade at all depends on `fulfilled`, which the replay
 has to have rebuilt correctly from every earlier command rather than read from
 a projection.
 
-`tests/acceptance/conftest.py`'s `InMemoryAdapter.reopen` performs the same
-reload behind the engine-neutral acceptance surface. `replay` below is the
-engine-level equivalent: it is not imported from there because that surface
-hides exactly what this suite exists to compare (per-order accounting,
-priority stamps, the whole ledger, more than one instrument), and a conftest of
-another suite is not an importable module.
+`harness.inmemory`'s `InMemoryAdapter.reopen` performs the same reload behind
+the engine-neutral acceptance surface. `replay` below is the engine-level
+equivalent: it is not reused from there because that surface hides exactly
+what this suite exists to compare -- per-order accounting, priority stamps,
+the whole ledger, more than one instrument.
 """
 
 from __future__ import annotations
@@ -45,6 +44,7 @@ from collections import Counter
 from typing import NamedTuple
 
 import pytest
+from harness import MONEY_ABS, MONEY_REL
 from PyLOB.engine import OrderBook as InMemoryOrderBook
 from PyLOB.sinks.sqlite import SQLiteSink, read_events
 
@@ -55,13 +55,9 @@ from PyLOB.sinks.sqlite import SQLiteSink, read_events
 # Commissions and balances are unrounded floating-point sums -- the
 # `commissions` contract is explicit that the value is the exact result of the
 # formula, with no currency quantization -- so they are compared within a
-# tolerance and never for bit equality. Same rel/abs as the acceptance suites'
-# `approx_money` fixture (tests/acceptance/conftest.py); restated here rather
-# than imported because a conftest belonging to another suite is not an
-# importable module, and reaching into one to share two constants would couple
-# this file to a directory it has no other business in.
-MONEY_REL = 1e-9
-MONEY_ABS = 1e-9
+# tolerance and never for bit equality. `MONEY_REL` / `MONEY_ABS` are the
+# acceptance suites' own, from `tests/harness/`, which is where the
+# `approx_money` fixture gets them too.
 
 
 def approx_money(expected):

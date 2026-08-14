@@ -6,7 +6,7 @@ build-backend = "hatchling.build"
 # project. Install from GitHub -- see README.md.
 [project]
 name = "PyLOB"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Fast limit order book simulation with price-time priority, for research"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -57,6 +57,13 @@ select = ["E4", "E7", "E9", "F"]
 # repo does not have.
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# `tests/harness/` and `tests/reference/` are libraries the suites import, not
+# suites themselves. Without this, `tests/` only lands on `sys.path` as a side
+# effect of pytest importing some module directly inside it -- which happens
+# after `tests/acceptance/conftest.py` is imported, and left the harness
+# reachable only through a by-path loader and a namespace-package accident.
+# Stating it makes one import of `harness` mean one module object.
+pythonpath = ["tests"]
 # The slowest test here takes 0.28s and the whole of `./verify` takes seven,
 # so thirty seconds is a hundred times the headroom any plausible machine
 # contention needs. It is set for the failure mode a matching engine has and
@@ -70,6 +77,29 @@ testpaths = ["tests"]
 # forty tests costs thirty seconds forty times over -- so a slow red run still
 # means "something is spinning", and the failures say which tests.
 timeout = 30
+
+# `PyLOB.__version__` is the version. It is a literal in the module rather than
+# an `importlib.metadata` lookup, because the package "reads nothing off disk"
+# (`openspec/config.yaml`) and that applies to its own metadata; hatchling
+# reads the literal here at *build* time, so the two are one string rather than
+# two kept equal by hand.
+#
+# Read, not imported. The `code` source cannot be used here: it execs the file
+# as a standalone module named after its own path, and `src/PyLOB/__init__.py`
+# opens with `from .engine import ...` -- a relative import with no parent
+# package, which raises before any `__version__` exists. Moving the literal to
+# an import-free `_version.py` would satisfy `code` at the cost of a file and
+# an indirection; the `regex` source below reads the same literal out of the
+# file's text and executes nothing at all.
+#
+# The pattern is spelled out because hatchling's default one is
+# `^__version__ *= *"..."` and does not allow an annotation, while the literal
+# is `__version__: Final = "0.1.0"`. This one tolerates the annotation and
+# still anchors on the name; the `version` group is the part hatchling reads,
+# and is what `hatch version x.y.z` would rewrite in place.
+[tool.hatch.version]
+path = "src/PyLOB/__init__.py"
+pattern = '''^__version__ *(?::[^=]+)? *= *(?P<quote>['"])(?P<version>[^'"]+)(?P=quote)'''
 
 # Python only. The wheel used to carry the twelve *.sql query files the SQL
 # engine loaded as attributes at import time; ADR-0003 retired that engine, and

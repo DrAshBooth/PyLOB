@@ -2,8 +2,8 @@
 
 Issue #8 (pinned at `c0dd932`) reports two separate ways a resting order can
 be matched for more than its stated size, both of them mistakes in how the
-cumulative-executed quantity is written. Both were diagnosed in the 2013 SQL
-engine ADR-0003 has since retired:
+cumulative-executed quantity is written. Both were diagnosed in the SQL engine
+PR #7 built, which ADR-0003 has since retired:
 
 * **Finding 1** -- the `trade_insert` trigger applied a new trade's quantity
   with `where idNum in (new.bid_order, new.ask_order)`, but those columns held
@@ -55,12 +55,7 @@ the smallest way to exercise both sides of a match.
 
 import pytest
 
-# The engine-neutral adapter surface lives in the acceptance conftest. A
-# conftest applies to its own directory and below, so this file cannot inherit
-# its fixtures and imports the builder instead -- `tests/` is on `sys.path`
-# while this module is imported, which makes `acceptance` an importable
-# namespace package.
-from acceptance.conftest import build_inmemory
+from harness import build_inmemory
 
 TID = 1
 
