@@ -58,6 +58,35 @@ If any part of that is unavailable -- not Darwin, not heterogeneous, the
 the report says the core class is unknown. That is the "without heroics" line:
 this is one `ctypes` signature and one plausibility check, and it gives up
 rather than trying harder.
+
+What is remembered and what is re-read
+--------------------------------------
+
+A capture used to cost about 50 ms, nearly all of it spawning processes:
+three `git` calls, four `sysctl`s and one `pmset`. The suite captures twenty
+times, so it spent over a second re-asking questions whose answers had not
+moved.
+
+The line is not "what is expensive". It is *what can change while this process
+runs*:
+
+- **Remembered for the life of the process.** The CPU brand string and the
+  core-count topology -- no process is handed a different chip halfway
+  through -- and HEAD's short sha and branch. The sha answers *which code is
+  this*, and the code running in this process was read off disk when it was
+  imported; a commit landing in the checkout afterwards (routine when several
+  agents share a worktree) does not retroactively change what got imported.
+- **Read again on every capture.** Power source, load average, and whether the
+  working tree is dirty. Those describe the machine and the tree *at the
+  moment of the measurement*, which is the entire reason ADR-0005 asks for
+  them. Remembering one would not make provenance faster so much as make it
+  lie: a cached battery reading reports mains power for a run taken on
+  battery, and a cached clean tree reports that the sha describes code it does
+  not. Stale provenance is worse than slow provenance, because it explains a
+  surprising number with something that was not true.
+
+The efficiency-cluster reference in `measure_core_class` is a *measurement* of
+this machine now, not a constant about it, so it is taken fresh too.
 """
 
 from __future__ import annotations
@@ -69,8 +98,9 @@ import platform
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Final
+from typing import Any, Final, TypeVar
 
 __all__ = [
     "CoreClock",
@@ -82,6 +112,12 @@ __all__ = [
 ]
 
 _DARWIN: Final = sys.platform == "darwin"
+
+_T = TypeVar("_T")
+
+#: Answers to the questions above that cannot change while this process runs.
+#: Written only by `_remembered`; a test that wants a cold module clears it.
+_PROCESS_FACTS: dict[str, Any] = {}
 
 #: `qos_class_t` values from <sys/qos.h>.
 _QOS_USER_INTERACTIVE: Final = 0x21
@@ -115,6 +151,26 @@ def _libc() -> ctypes.CDLL | None:
 _LIBC: Final = _libc()
 
 
+def _remembered(key: str, compute: Callable[[], _T]) -> _T:
+    """Call `compute` once per process -- but keep only a successful answer.
+
+    Everything in this module degrades to `None`, and it does so for two
+    reasons that look identical from here: the tool is absent (a permanent
+    answer) or this particular call did not work (a `git` index lock held by
+    another process in the same checkout, a timeout, a spawn that lost a race
+    with the machine's load). So `None` is never kept. The permanent case pays
+    for one cheap retry per capture, and the transient case does not get frozen
+    into every provenance record this process goes on to write -- which is the
+    failure that would matter, since a baseline is recorded from one.
+    """
+    if key in _PROCESS_FACTS:
+        return _PROCESS_FACTS[key]
+    value = compute()
+    if value is not None:
+        _PROCESS_FACTS[key] = value
+    return value
+
+
 def _sysctl(key: str) -> str | None:
     """One `sysctl -n` value, or None if the key or the tool is missing."""
     if not _DARWIN:
@@ -129,8 +185,24 @@ def _sysctl(key: str) -> str | None:
     return value if out.returncode == 0 and value else None
 
 
+def _static_sysctl(key: str) -> str | None:
+    """`_sysctl` for a key that describes the hardware rather than its state.
+
+    Remembered, because the hardware is. Anything whose value moves while the
+    machine runs -- load, power, thermals -- must call `_sysctl` directly and
+    pay for its spawn every time.
+    """
+    return _remembered("sysctl:%s" % key, lambda: _sysctl(key))
+
+
 def _cpu_brand() -> str | None:
-    brand = _sysctl("machdep.cpu.brand_string")
+    """The processor's brand string: a fact about the chip, so asked once.
+
+    Only the `sysctl` is remembered. The `/proc/cpuinfo` fallback below reads a
+    virtual file rather than spawning anything, and the cost this is about is
+    the spawn.
+    """
+    brand = _static_sysctl("machdep.cpu.brand_string")
     if brand:
         return brand
     try:
@@ -150,9 +222,15 @@ def _core_counts() -> dict[str, int | None]:
     homogeneous CPU there is one level and both counts are the total, which is
     the honest answer: every core is a performance core when there is only one
     kind.
+
+    The `sysctl` answers are remembered -- a cluster layout is a property of
+    the chip -- but the dict is rebuilt around them on every call, both so a
+    caller that stores it in a provenance record cannot mutate the copy the
+    next caller gets, and so `os.cpu_count()`, which costs nothing and is the
+    one figure here a kernel could in principle change under us, stays live.
     """
     total = os.cpu_count()
-    levels = _sysctl("hw.nperflevels")
+    levels = _static_sysctl("hw.nperflevels")
     if levels is None:
         return {"logical": total, "performance": None, "efficiency": None}
     try:
@@ -163,7 +241,7 @@ def _core_counts() -> dict[str, int | None]:
         return {"logical": total, "performance": total, "efficiency": 0}
 
     def level(index: int) -> int | None:
-        raw = _sysctl("hw.perflevel%d.logicalcpu" % index)
+        raw = _static_sysctl("hw.perflevel%d.logicalcpu" % index)
         try:
             return int(raw) if raw is not None else None
         except ValueError:
@@ -220,9 +298,29 @@ def repo_root() -> Path:
 
 
 def _commit() -> dict[str, Any]:
-    sha = _git("rev-parse", "--short", "HEAD")
+    """Which commit this is, and whether the tree still matches it.
+
+    `sha` and `branch` are remembered. They answer "which code is this?", and
+    the code in this process was read off disk at import: a commit landing in
+    the checkout while the process runs does not change what was imported, so
+    the first answer is the one that describes the measurement, and it is two
+    `git` spawns at ~11 ms each -- most of the cost of a capture.
+
+    `dirty` is not remembered, and must not be. It is not a property of HEAD
+    but a reading of the working tree at the moment of the measurement, and
+    trees move under running processes: an editor saves, a build writes, an
+    agent in the next worktree over edits a shared file. Its whole job is to
+    say *do not trust the sha* -- `baselines.quiet_machine_complaints` refuses
+    to record a baseline from a dirty tree on the strength of it -- so a
+    remembered `False` would quietly disarm the check it exists to arm, on
+    exactly the runs where it matters. It stays live, at one `git status` per
+    capture.
+    """
+    sha = _remembered("commit:sha", lambda: _git("rev-parse", "--short", "HEAD"))
+    branch = _remembered(
+        "commit:branch", lambda: _git("rev-parse", "--abbrev-ref", "HEAD")
+    )
     status = _git("status", "--porcelain")
-    branch = _git("rev-parse", "--abbrev-ref", "HEAD")
     return {
         "sha": sha,
         "branch": branch,

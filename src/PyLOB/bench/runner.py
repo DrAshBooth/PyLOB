@@ -33,6 +33,32 @@ calibration-then-engine, and the spread across repeats is reported: it is the
 most direct evidence available of whether the machine held still, and
 `--rebaseline` refuses to record when it did not.
 
+Nor supplied from outside. `measure` could accept a calibration figure from
+its caller rather than taking one, which would save about 1.5 seconds of
+`tests/test_bench_baselines.py`, where every recording runs the real thing.
+**Declined** (lob-ig3, 2026-08). The saving is real, and it is bought by
+breaking each of the three properties ADR-0005 hangs the comparison on: the
+calibration pass runs *alongside every benchmark run*, so no run can report a
+machine speed that nothing measured; the pair is taken microseconds apart,
+which is what makes their ratio a statement about the engine rather than about
+the moment; and the calibration is versioned *by name*, so a drifting
+reference computation forces a re-baseline, where a bare figure arrives with
+no name on it and nothing to check it against.
+
+The consequence is not confined to a test. A supplied figure flows straight
+into `baselines.save`, and neither `record_problems` nor
+`quiet_machine_complaints` can tell a denominator that was measured from one
+that was merely asserted -- so the seam ends at a recorded baseline whose
+denominator never happened, in the one file whose entire value is that it can
+be trusted. The end-to-end shape of those tests is the point of them, not an
+accident of how they were written.
+
+The suite already has the better answer to its own cost, and it is in the file
+that would have paid for this one: `record_baseline` performs one real
+recording and replays its text to the dozen tests that want *a* recorded
+baseline rather than a *freshly* recorded one. What stops being repeated there
+is the measurement, not the truth of it.
+
 Two figures, taken two different ways
 -------------------------------------
 
