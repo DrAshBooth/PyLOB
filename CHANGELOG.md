@@ -183,11 +183,22 @@ derived from a neighbouring requirement.
   file and no `sqlite3` involved.
 - `import PyLOB` does not import `sqlite3`. That is a promise, and a subprocess
   test holds it.
-- The sink schema is at version 4. *Readers* accept a window down to version 3,
-  so a recording made before `trade_leg` and `session_meta` existed still opens,
-  says on the way in what it does not carry, and answers what it can; the
-  *writer* stays exact, so nothing appends to an old recording
+- A recording names the library version that produced it, in
+  `session.pylob_version`, without the caller having supplied anything. The
+  statement travels in the event stream, so re-folding a log into a fresh
+  database keeps the original's answer rather than stamping the re-folding
+  release. A replay is not a re-folding — it re-derives its events by matching
+  again — so a recorded replay names the replaying release.
+- The sink schema is at version 5. *Readers* accept a window down to version 3,
+  so a recording made before `trade_leg`, `session_meta` or the version stamp
+  existed still opens, says on the way in what it does not carry, and answers
+  what it can; the *writer* stays exact, so nothing appends to an old recording
   ([ADR-0007](docs/adr/0007-sink-readers-accept-a-schema-version-window.md)).
+- Adding a field to an event does not move `STREAM_VERSION` when no replay path
+  reads it, because moving it would strand every recording ever made for both
+  reading and replay. `decode_event` refuses a field it does not understand
+  instead, which buys the same clean failure permanently and for every future
+  field ([ADR-0008](docs/adr/0008-additive-event-fields-do-not-bump-the-stream-version.md)).
 - A sink observes the stream and does not act on the engine: `consume` runs
   inside the operation being recorded, a sink must not call back into the
   engine from it, and the engine does not detect or refuse one that does. The
