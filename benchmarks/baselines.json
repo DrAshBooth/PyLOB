@@ -2,14 +2,61 @@
   "baselines": {
     "mixed-v1|seed=42|orders=20000|calib=calib-v1": {
       "calibration": "calib-v1",
-      "calibration_seconds": null,
-      "note": "PLACEHOLDER. The key and the field names are real; every measured value is null on purpose. Recording a baseline is a deliberate act on a quiet machine on mains power -- see the top-level note.",
-      "placeholder": true,
-      "sink_orders_per_sec": null,
-      "sinkless_orders_per_sec": null,
-      "work_index": null
+      "calibration_best_seconds": 0.058564,
+      "calibration_checksum": 4717557328431862,
+      "calibration_seconds": 0.058808,
+      "calibration_spread": 0.0091,
+      "interpreter": {
+        "build": "main Mar 11 2025 17:41:13",
+        "compiler": "Clang 20.1.0 ",
+        "implementation": "CPython",
+        "version": "3.11.11"
+      },
+      "placeholder": false,
+      "provenance": {
+        "arch": "arm64",
+        "commit": {
+          "branch": "master",
+          "dirty": false,
+          "sha": "f75a30b"
+        },
+        "core_class": "performance",
+        "cores": {
+          "efficiency": 4,
+          "logical": 8,
+          "performance": 4
+        },
+        "cpu": "Apple M1",
+        "effective_ghz": 3.2,
+        "efficiency_core_ghz": 0.974,
+        "interpreter": {
+          "build": "main Mar 11 2025 17:41:13",
+          "compiler": "Clang 20.1.0 ",
+          "implementation": "CPython",
+          "version": "3.11.11"
+        },
+        "loadavg": [
+          1.69,
+          2.65,
+          2.63
+        ],
+        "machine": "MacBook-Pro-6.local",
+        "platform": "macOS-14.6.1-arm64-arm-64bit",
+        "power_source": "ac",
+        "python": "CPython 3.11.11",
+        "qos": "user-interactive"
+      },
+      "recorded_utc": "2026-08-14T12:08:10+00:00",
+      "repeats": 5,
+      "sink_orders_per_sec": 17692.6,
+      "sinkless_orders_per_sec": 194715.8,
+      "tolerance": 0.2,
+      "trades": 15099,
+      "work_index": 11365.76,
+      "work_index_spread": 0.0289,
+      "workload_checksum": 15240231136383276365
     }
   },
-  "note": "PLACEHOLDER -- no baseline has been recorded. Every measured value below is null on purpose. ADR-0005 makes a throughput figure meaningful only alongside the calibration figure taken with it: a run is judged on its work index (orders processed per calibration pass), so a baseline recorded on a contended machine, on battery, or on an efficiency core is a bad denominator for everyone who ever runs this, and normalisation does not repair it. Until a real one is recorded the harness reports NO BASELINE and exits 0, rather than pretending to guard. To record: `uv run python -m PyLOB.bench --rebaseline`, which refuses on a machine that is not quiet and rewrites this file so the change is reviewable in the diff.",
+  "note": "Recorded baselines. A number here is only comparable alongside the calibration figure taken with it (ADR-0005); the harness scales by their ratio. Change a workload or a calibration and its name changes, which changes the key, which reads as 'no baseline' until it is recorded again -- and if the name does not change, the recorded workload and calibration checksums and the recorded interpreter identity are compared on every run, so a baseline that measured something else refuses to judge instead of judging wrongly.",
   "schema": 1
 }
