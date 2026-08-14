@@ -158,7 +158,9 @@ def recorded(db_path):
     Sinkless is the default and the fast path: an engine with no sink builds
     no event at all, and the throughput floor is measured in that
     configuration (ADR-0005, superseding ADR-0002). Attaching a `SQLiteSink`
-    costs roughly 8x throughput and buys the whole session back as queryable
+    costs roughly an order of magnitude in throughput (ADR-0002 measured 8x by
+    hand; the recorded baseline's own pair is 11x) and buys the session back as
+    queryable
     history -- worth it for the runs you mean to inspect afterwards, wasted on
     the ones you do not.
 

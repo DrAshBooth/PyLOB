@@ -290,8 +290,10 @@ sustained run. Read that range as an indication of scale and not as a promise:
 it was taken by hand on a contended machine, and throughput varies with the
 shape of the workload.
 
-Attaching a `SQLiteSink` costs roughly 8x throughput, as
-[ADR-0002](docs/adr/0002-throughput-target-measured-sinkless.md) measured it.
+Attaching a `SQLiteSink` costs roughly an order of magnitude in throughput:
+[ADR-0002](docs/adr/0002-throughput-target-measured-sinkless.md) measured 8x
+by hand, and the recorded baseline's own pair — 194,716 sinkless against
+17,693 with a sink — is 11x. Take the scale, not the figure.
 The cost is the sink's per-event encoding — `dataclasses.asdict` plus
 `json.dumps`, plus a projection row-write per event — and not the matching
 engine: raising the sink's buffer size from 512 to 16,384 moved the figure by
@@ -364,11 +366,13 @@ where the name has not changed, the recorded checksums and interpreter
 identity are compared on every run, so a baseline that measured something else
 refuses to judge rather than judging wrongly.
 
-**No baseline has been recorded yet.** `benchmarks/baselines.json` holds a
-placeholder whose measured values are all null on purpose, so the harness
-reports NO BASELINE and exits 0 rather than pretending to guard. Recording the
-first one is the maintainer's, on a quiet machine on mains power: a bad
-baseline is a bad denominator for everyone who ever runs this.
+**The recorded baseline.** `benchmarks/baselines.json` holds one, taken on
+2026-08-14 on a quiet Apple M1 on mains power: 194,716 orders/sec sinkless and
+17,693 with a `SQLiteSink` attached, against a calibration work index of
+11,366. `python -m PyLOB.bench` measures your machine's calibration alongside
+its own run and judges the normalised figure against that floor, so the
+comparison survives being made on different hardware. It is a floor and not a
+target: it is there to notice a regression, not to be beaten.
 
 Where to read next:
 ===================
