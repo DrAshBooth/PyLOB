@@ -32,11 +32,78 @@ smoke() {
   uv run python src/example.py > /dev/null
 }
 
+# The wheel ships `src/PyLOB/**/*.py` and nothing else, which is what
+# `openspec/config.yaml` promises a user installing from GitHub. It is true
+# today and has not always been: an earlier sdist carried the agent tooling and
+# the planning archive. Asserted as a property rather than a file list, so
+# adding a module is not a gate failure but shipping a `.db`, a test or the
+# `openspec/` tree is.
+#
+# The failure this catches is the kind no other stage can: it is invisible in
+# the working tree and lands on whoever installs the package.
+# Every ratified spec and every open change parses, and its scenarios are
+# where the format says they are. `openspec` has no quiet flag and prints a
+# line per item, so its output is held back unless it fails -- the other
+# stages are silent when they pass and this one should be too.
+#
+# It is here because the specs are the contract the acceptance suites, the
+# reference matcher and every proposal are written against, and nothing else
+# reads them: a `#### Scenario:` demoted to three hashes passes every other
+# stage in this file.
+specs() {
+  local out rc
+  out="$(uv run openspec validate --all --strict 2>&1)"
+  rc=$?
+  [ "$rc" -eq 0 ] || printf '%s\n' "$out"
+  return "$rc"
+}
+
+packaging() {
+  local out rc
+  out="$(mktemp -d)"
+  if uv build --wheel -o "$out" > /dev/null 2>&1; then
+    uv run python - "$out" <<'PY'
+import glob
+import sys
+import zipfile
+
+wheels = glob.glob(sys.argv[1] + "/*.whl")
+if len(wheels) != 1:
+    sys.exit("expected exactly one wheel, built %d" % len(wheels))
+
+names = zipfile.ZipFile(wheels[0]).namelist()
+stray = [
+    name
+    for name in names
+    if ".dist-info/" not in name
+    and not (name.startswith("PyLOB/") and name.endswith(".py"))
+]
+if stray:
+    sys.exit("the wheel ships what it should not: %s" % ", ".join(sorted(stray)))
+if "PyLOB/__init__.py" not in names:
+    sys.exit("the wheel ships no PyLOB/__init__.py, so it imports nothing")
+PY
+    rc=$?
+  else
+    echo "the wheel would not build"
+    rc=1
+  fi
+  rm -rf "$out"
+  return "$rc"
+}
+
 # === checks: do not add to this block without asking the user first ===
-stage "format" uv run ruff format --check src
-stage "lint"   uv run ruff check src
-stage "test"   uv run pytest -q tests
-stage "smoke"  smoke
+# `format`, `lint`, `test` and `smoke` are the original four. `specs`,
+# `packaging`, and widening `format`/`lint` from `src` to `src tests` were
+# added on 2026-08-14 with the maintainer's approval, each because a failure
+# had been demonstrated to pass the gate as it stood. Together they cost about
+# one second.
+stage "format"    uv run ruff format --check src tests
+stage "lint"      uv run ruff check src tests
+stage "test"      uv run pytest -q tests
+stage "specs"     specs
+stage "smoke"     smoke
+stage "packaging" packaging
 # === end checks ===
 
 echo "verify: $(( $(date +%s) - start ))s"
