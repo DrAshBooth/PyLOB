@@ -12,8 +12,13 @@ Three rules hold this module together.
 `quantize_price`. An oracle that borrows the code under test agrees with it by
 construction: the day someone "fixes a divergence" by importing the engine's
 quantizer, this file stops being a check and starts being a mirror.
-`tests/test_differential.py::test_the_reference_imports_nothing_from_the_engine`
-reads this file's import statements and asserts it.
+`tests/test_differential.py` asserts it twice over --
+`test_the_reference_imports_nothing_from_the_engine` reads this file's import
+statements, and `test_the_reference_runs_with_the_engine_unimportable` loads
+this file and *runs* it in an interpreter where `PyLOB` cannot be imported at
+all. The second test is there because reading import statements only catches
+borrowing that is spelled as an import statement, and
+`sys.modules["PyLOB.engine"]` is not.
 
 **Every rule cites the clause it implements.** The citations are of the form
 `order-lifecycle: "Market orders are immediate-or-cancel"` and name a
@@ -37,10 +42,46 @@ ADR-0003 accepts this openly, and these are the specific places:
   two multiples. Both implementations round half to even. That agreement is an
   assumption they share, not a result the oracle checks; an acceptance
   scenario is what pins it.
-* **Refusals the specs do not name.** The specs name four invalid submissions
-  and the unknown/duplicate identifier cases. Where the engine refuses
-  something else -- a market order carrying a price, a cancel of an order
-  already cancelled -- the model follows and says so at the rule.
+* **Refusals the specs do not name.** The ratified list is short: four invalid
+  submissions (non-positive quantity, unknown order type, unknown side, a
+  limit order with no price), the unknown and duplicate identifier cases, and
+  modify's two -- a side change, and (since `modify-refuses-filled-orders`) an
+  order the book has already filled. *Every other refusal in this file is the
+  engine's convention, followed rather than derived*, and each is named at the
+  rule that makes it:
+
+  - a market order carrying a price (`submit`);
+  - a cancel of an order already cancelled, and a cancel of an order with
+    nothing left to cancel (`cancel`). The second is the exact sibling of the
+    modify refusal `modify-refuses-filled-orders` adds, and that change says
+    in as many words that it leaves cancel's own unratified;
+  - a cancel naming a side that is not the order's (`cancel`). The specs
+    reject a side change on *modify* and say nothing about addressing a cancel
+    by the wrong side;
+  - a modify of a cancelled order, and a modify of a market order (`modify`);
+  - the input gate itself (`_positive`, `_check_qty`, `_assign_idNum`,
+    `ReferenceBook.quantize`): a quantity that is not a whole number, a price
+    that is not a real number or is not positive, an identifier that is not an
+    integer, a price that quantizes to zero, and the whole gate applied again
+    to a modify, which `order-lifecycle` describes only for a submission. The
+    engine's own module docstring calls positivity and its quantity ceiling
+    "decisions rather than readings of the specs"; this file made the first
+    of those decisions the same way, from the same place.
+
+  `tests/test_differential.py::test_both_refuse_what_the_specs_refuse` keeps
+  the two groups apart and asserts both, so a convention one implementation
+  later drops fails a test instead of becoming a divergence nobody is looking
+  for.
+* **The volume-at-price *query* price.** Both implementations put the query
+  price on the tick grid before answering; `book-queries` does not say to.
+  It defines the answer for "an opposite-side order priced at P" and leaves an
+  off-grid P to the reader. The two even give the same reason in nearly the
+  same words (`volume_at` here, `OrderBook.getVolumeAtPrice` there), which is
+  what a decision followed rather than derived looks like from the outside.
+  The differential harness structurally cannot question this one: a probe
+  between two ticks compares what the two quantizers *return*, and two
+  implementations that both quantize the query agree about it whatever the
+  specs say. An acceptance scenario would pin it; there is none.
 * **Floating-point association.** The model moves a trade's cash leg and its
   commission leg separately, as `trader-balances` and `commissions` describe
   them; the engine debits the sum in one step. `a - v - c` and `a - (v + c)`
@@ -217,9 +258,26 @@ class RefOrder:
 class RefTrade:
     """One execution.
 
-    `order-lifecycle: "Market orders are immediate-or-cancel"` -- "each fill
-    prices at the resting order's limit price" -- so `price` is the maker's
-    limit and never the taker's.
+    `price` is the maker's resting limit and never the taker's. That is the
+    load-bearing rule here -- every other field is bookkeeping, and this one
+    decides how much money moves -- so it is worth being exact about how much
+    of it is ratified.
+
+    For a *market* taker the clause is direct: `order-lifecycle: "Market
+    orders are immediate-or-cancel"`, scenario "Trades price at the maker" --
+    "each fill prices at the resting order's limit price". `book-queries:
+    "Last-trade price is reporting, not matching state"` repeats it in the
+    same scope ("IOC market orders always price at the maker").
+
+    For a *crossing limit* taker -- a bid at 102 taking an ask resting at 101,
+    which is most of what this model matches -- no requirement says it. The
+    only ratified text where the taker's limit and the maker's price differ is
+    `trader-balances: "Self-matching is gated per trader"`, scenario "Flag
+    enables self-match": a bid at 102 "trades with trader 1's own resting ask
+    at 101", and `tests/acceptance/test_trader_balances.py` reads that 101 as
+    the fill price. One scenario, in a capability about something else, is the
+    whole grounding for the general rule, and saying so is better than
+    citing the market-order clause as though it reached.
     """
 
     instrument: str
@@ -399,11 +457,14 @@ class ReferenceBook:
         targets exactly one order", and an identifier no order has raises with
         the book unchanged.
 
-        Two further refusals the specs do not name, where the engine refuses
-        and this model follows: an order already cancelled, and an order with
-        nothing left to cancel. A cancel that can remove nothing is not a
-        cancel, and reporting success for one is how a caller loses an order
-        it believes it withdrew.
+        Three further refusals the specs do not name, where the engine refuses
+        and this model follows: an order already cancelled, an order with
+        nothing left to cancel, and a `side` that is not the order's. A cancel
+        that can remove nothing is not a cancel, and reporting success for one
+        is how a caller loses an order it believes it withdrew; a cancel
+        addressed to the wrong side has named an order it is not looking at.
+        Note where the third one is *not* from: `order-lifecycle` rejects a
+        side change on **modify**, and says nothing about cancel's `side`.
 
         Commission already charged stays charged -- `commissions: "Cancelling
         a partially filled order keeps its commission"` -- which is why
@@ -438,6 +499,13 @@ class ReferenceBook:
           of its price level's queue; a pure quantity decrease keeps its
           place" -- so a fresh priority stamp is taken in the first case and
           withheld in the second.
+
+        Two refusals here have no clause behind them, and follow the engine: a
+        cancelled order, and a market order. Neither is a thing the book can
+        still be holding, so a modify naming one is addressing an order that
+        left; `order-lifecycle` simply does not say so. The quantity check is
+        the submission gate applied again, which the specs also describe only
+        for a submission -- see the module docstring's list.
 
         `qty=None` and `price=None` each mean *leave that one alone*. A
         price=None is emphatically not "become a market order": an order that
@@ -661,9 +729,15 @@ class ReferenceBook:
         priced >= P when S is bid; asks priced <= P when S is ask), and 0 when
         nothing qualifies".
 
-        The query price goes on the grid first: a price off the grid is not a
-        price this book can hold, so asking about it is asking about the grid
-        point it names.
+        The query price goes on the grid first, and *that* is not in the
+        clause. `book-queries` defines the answer for an opposite-side order
+        priced at P and says nothing about a P between two ticks; quantizing
+        it is a decision -- a price off the grid is not a price this book can
+        hold, so asking about it is asking about the grid point it names --
+        and the engine had made it first, in nearly this sentence. It is the
+        one rule here that the differential cannot check: both sides quantize,
+        so both sides agree, whatever the specs turn out to mean. See the
+        module docstring, "Where the model is weaker".
         """
         price = self.quantize(price)
         orders = self.book(instrument, side)

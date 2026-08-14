@@ -156,7 +156,10 @@ bit.
 
 import ast
 import functools
+import os
 import random
+import subprocess
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -983,9 +986,22 @@ class Run:
 
         The generator's, because whoever chose the prices is the only party
         that knows where the book will be. The off-grid one is not decoration:
-        `book-queries` puts the query price on the grid before answering, so a
-        probe between two ticks is the only thing that compares the two
+        both implementations put the query price on the grid before answering,
+        so a probe between two ticks is the only thing that compares the two
         quantizers on the *read* path. Both generators supply that mix.
+
+        Note what that probe does *not* check, because it looks as though it
+        should. `book-queries` does not say to quantize the query price: it
+        defines the answer for "an opposite-side order priced at P" and leaves
+        an off-grid P unaddressed. Quantizing it is a decision the engine took
+        and the reference matcher followed -- the two even give the same
+        reason in nearly the same words -- and a differential comparing two
+        implementations that made the same unratified choice agrees about it
+        by construction. So an off-grid probe compares what the two quantizers
+        *return*; it cannot ask whether quantizing was right. Only an
+        acceptance scenario could, and `book-queries` has none.
+        `tests/reference/matcher.py`'s "Where the model is weaker" lists this
+        with the other shared assumptions.
         """
         return self.generator.probes
 
@@ -1198,6 +1214,23 @@ def test_the_reference_imports_nothing_from_the_engine():
 
     Reading the import statements rather than trusting a convention, because a
     convention is what this would be otherwise.
+
+    A *relative* import counts as an offender, exactly as it does for the
+    shared workload generator below. Inside a package it is the short way to
+    reach the engine and it never spells the word: the reference package's
+    `__init__` imports `.adapter` before `.matcher`, `.adapter` imports
+    `harness`, and `harness` imports `PyLOB.engine` -- so by the time this
+    module's first line runs, the engine is a sibling attribute away and a
+    two-line `from ._borrow import _tick_decimal` would have picked it up.
+
+    What this test still cannot see is why
+    `test_the_reference_runs_with_the_engine_unimportable` sits next to it: it
+    catches borrowing that is *spelled* as an import statement, and
+    `sys.modules[...]`, `importlib.import_module` and a reach through
+    `harness.inmemory` -- which re-exports the engine under a first component
+    that is not `PyLOB` -- are not. All three were demonstrated against this
+    check and passed it, as did the relative import the paragraph above now
+    catches (lob-vx2). Keep both tests.
     """
     source = Path(reference_matcher.__file__).read_text()
     imported = []
@@ -1205,13 +1238,142 @@ def test_the_reference_imports_nothing_from_the_engine():
         if isinstance(node, ast.Import):
             imported.extend(alias.name for alias in node.names)
         elif isinstance(node, ast.ImportFrom):
-            imported.append(node.module or "")
+            imported.append("." * node.level + (node.module or ""))
 
     assert imported, "no imports found -- did the parse work?"
-    offenders = [name for name in imported if name.split(".")[0] == "PyLOB"]
+    offenders = [
+        name
+        for name in imported
+        if name.startswith(".") or name.split(".")[0] == "PyLOB"
+    ]
     assert not offenders, (
         "the reference matcher imports %r from the engine it is supposed to "
         "check independently" % (offenders,)
+    )
+
+
+#: The child program `test_the_reference_runs_with_the_engine_unimportable`
+#: runs. It is a whole interpreter rather than a block in that test because
+#: the isolation has to be total, and a process is the one boundary that
+#: cannot leak back into the suite that opened it.
+ISOLATION_PROGRAM = '''
+"""Load the reference matcher with `PyLOB` unimportable, then use it."""
+
+import importlib.util
+import sys
+
+
+class NoEngine:
+    """Refuses `PyLOB` to anything that asks, by any spelling."""
+
+    def find_spec(self, name, path=None, target=None):
+        if name == "PyLOB" or name.startswith("PyLOB."):
+            raise ImportError(
+                "the reference matcher reached for %s, which is the engine it "
+                "exists to check independently" % name
+            )
+        return None
+
+
+# Both halves matter: the finder stops a fresh import, and clearing
+# `sys.modules` stops a lookup of what the parent process had already
+# imported -- which is the spelling a static import check cannot see.
+for name in [n for n in sys.modules if n == "PyLOB" or n.startswith("PyLOB.")]:
+    del sys.modules[name]
+sys.meta_path.insert(0, NoEngine())
+
+spec = importlib.util.spec_from_file_location("matcher_in_isolation", sys.argv[1])
+matcher = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = matcher
+spec.loader.exec_module(matcher)
+
+# Importing it is not enough: a borrow deferred to call time -- `quantize`
+# delegating to `sys.modules["PyLOB.engine"].quantize_price` -- survives any
+# check that only imports. So run the model: quantize, cross, price the fill,
+# read the book, modify, cancel, refuse.
+assert matcher.quantize(100.03, 0.05) == 100.05, "the tick grid moved"
+
+book = matcher.ReferenceBook(tick_size=0.05)
+book.configure_instrument("FAKE", "USD")
+book.configure_trader(1, commission_min=2.5, commission_max_percnt=1.0)
+resting, _ = book.submit(1, "FAKE", "ask", "limit", 5, price=100.03)
+_taker, trades = book.submit(2, "FAKE", "bid", "market", 3)
+
+assert [(t.price, t.qty) for t in trades] == [(100.05, 3)], trades
+assert book.best("FAKE", "ask") == 100.05
+assert book.volume_at("FAKE", "ask", 100.04) == 2
+assert book.last_price("FAKE") == 100.05
+assert book.balance(1, "FAKE") == -3.0
+assert book.order(resting.idNum).commission == 2.5
+
+assert book.modify(resting.idNum, qty=4) == []
+book.cancel(resting.idNum)
+assert book.best("FAKE", "ask") is None
+
+try:
+    book.submit(1, "FAKE", "bid", "limit", 0, price=100.0)
+except matcher.ReferenceInvalid:
+    pass
+else:
+    raise AssertionError("the model accepted a non-positive quantity")
+
+borrowed = sorted(n for n in sys.modules if n == "PyLOB" or n.startswith("PyLOB."))
+assert not borrowed, "the engine is loaded after all: %r" % (borrowed,)
+'''
+
+
+def test_the_reference_runs_with_the_engine_unimportable(tmp_path):
+    """Take `PyLOB` away entirely and the model still matches. That is the proof.
+
+    The check above reads import statements, which is one spelling of
+    borrowing among several. Four others were demonstrated against it as it
+    stood, and all four passed (lob-vx2):
+    `sys.modules["PyLOB.engine"]._tick_decimal`,
+    `importlib.import_module("PyLOB.engine")`, a relative import of a sibling
+    module that did the absolute import, and `from harness.inmemory import
+    ...`, whose first component is not `PyLOB` at all. That check now catches
+    the relative one; the other three are not import statements naming the
+    engine and no reading of the source will make them one. Enumerating
+    spellings is a losing game, so this test asks the question from the other
+    end: not what the source says, but what the module actually resolves.
+
+    `matcher.py` is loaded in a child interpreter with every `PyLOB` module
+    deleted from `sys.modules` and a meta-path finder refusing to let one
+    back, and is then *used* -- quantize, submit, cross, price the fill, read
+    the book, modify, cancel, refuse. Using it is not decoration: a borrow
+    that waits until it is called survives a check that only imports, and the
+    quantizer is the one most worth borrowing.
+
+    Loaded from its path rather than as `reference.matcher`, because importing
+    the package the ordinary way is itself how the engine arrives:
+    `tests/reference/__init__.py` imports `.adapter`, which imports `harness`,
+    which imports `PyLOB.engine`. `tests/` stays on the child's path so that a
+    borrow *through* `harness` fails on the engine behind it and says so,
+    rather than on `harness` being unimportable and leaving the reader to
+    guess.
+
+    A child process rather than this one, because scrubbing `sys.modules` in
+    the interpreter running the suite would leave the rest of the session to
+    be put back afterwards, and a test that has to put the world back is a
+    test that can fail to.
+    """
+    script = tmp_path / "run_the_matcher_without_the_engine.py"
+    script.write_text(ISOLATION_PROGRAM)
+    matcher_path = Path(reference_matcher.__file__)
+
+    done = subprocess.run(
+        [sys.executable, str(script), str(matcher_path)],
+        capture_output=True,
+        text=True,
+        # Comfortably inside the suite's own 30s timeout, so a child that
+        # hangs is reported by this test rather than by the runner.
+        timeout=20,
+        env={**os.environ, "PYTHONPATH": str(matcher_path.parents[1])},
+    )
+
+    assert done.returncode == 0, (
+        "the reference matcher cannot run with `PyLOB` unimportable, so it is "
+        "not the independent oracle this harness rests on:\n%s" % done.stderr
     )
 
 
@@ -1400,17 +1562,75 @@ def test_every_input_class_the_table_names_is_still_expected():
     )
 
 
+#: Refusals `order-lifecycle` names, quoted or paraphrased from its own text.
+#: "Submissions with non-positive quantity, unknown order type, unknown side,
+#: or (for limit orders) missing price SHALL raise a library exception";
+#: "Unknown identifier raises" and "Externally supplied duplicate is rejected"
+#: under "Order identifiers are unique and stable"; a side change and an order
+#: the book has already filled, under "Modify is validated and priority-aware"
+#: -- the second added by `modify-refuses-filled-orders`, whose delta carries
+#: the clause until that change is archived into `openspec/specs/`.
+SPEC_REFUSALS = {
+    "non-positive quantity": lambda book: book.limit("bid", 0, 100.0, 1),
+    "negative quantity": lambda book: book.limit("ask", -3, 100.0, 1),
+    "unknown side": lambda book: book.limit("buy", 5, 100.0, 1),
+    "unknown order type": lambda book: book._submit("stop", "bid", 5, 1, price=100.0),
+    "limit order with no price": lambda book: book.limit("bid", 5, None, 1),
+    "cancel of an unknown identifier": lambda book: book.cancel(9999),
+    "modify of an unknown identifier": lambda book: book.modify(9999, qty=2),
+    "supplied identifier already in use": lambda book: book.limit(
+        "bid", 5, 100.0, 1, idNum=1, timestamp=1.0
+    ),
+    "modify to a different side": lambda book: book.modify(1, qty=3, side="ask"),
+    # Order 2 is fully filled and therefore gone from the book. The spec
+    # refuses raising it rather than silently returning a finished order to
+    # the book with a fresh priority stamp.
+    "modify of a fully filled order": lambda book: book.modify(2, qty=9),
+}
+
+#: Refusals no clause names. The engine makes them, the reference matcher
+#: follows, and `tests/reference/matcher.py`'s "Where the model is weaker"
+#: lists them as what they are. Asserted here for the same reason they are
+#: listed there: a convention two implementations share is worth being able to
+#: see, and this is where a reader meets it as executable fact rather than as
+#: prose. If one of them ever stops refusing, that is a decision to take
+#: deliberately -- through a spec delta -- and this test is what forces the
+#: conversation instead of letting the behaviour drift.
+CONVENTION_REFUSALS = {
+    # `order-lifecycle` gives a market order no price of its own; it does not
+    # say what to do with one that carries a price anyway. Both refuse rather
+    # than ignore it, which is the choice that cannot silently mislead.
+    "market order carrying a price": lambda book: book._submit(
+        "market", "bid", 5, 1, price=100.0
+    ),
+    # The exact sibling of "modify of a fully filled order" above, and the one
+    # `modify-refuses-filled-orders` deliberately left unratified.
+    "cancel of a fully filled order": lambda book: book.cancel(2),
+    # The specs reject a side change on *modify*. Cancel's `side` is the
+    # engine's own rule, and the model follows it.
+    "cancel naming the wrong side": lambda book: book.cancel(1, side="ask"),
+    "modify of a cancelled order": lambda book: book.modify(4, qty=3),
+    "modify of a market order": lambda book: book.modify(6, qty=3),
+}
+
+
 def test_both_refuse_what_the_specs_refuse(tmp_path):
     """The illegal input the workload does not generate, asserted directly.
 
-    `order-lifecycle` names these: a non-positive quantity, an unknown side, an
-    unknown order type, a limit order with no price, an identifier no order
-    has, an externally supplied identifier already in use, a modify that
-    changes the side, and a modify of an order the book has already filled. Both implementations must refuse each one with *their own
-    library exception* -- "Submissions with ... SHALL raise a library
-    exception. The API SHALL never terminate the host process" -- and leave the
-    book exactly as it was: "an exception is raised, no state changes, and the
-    process continues".
+    Two groups, and the split is the point of the test rather than tidiness.
+    `SPEC_REFUSALS` are the ones `order-lifecycle` names; `CONVENTION_REFUSALS`
+    are the ones it does not, where the engine refuses and the reference
+    matcher follows it. Both must hold, and only the first group may be
+    described as the specs speaking: a market order carrying a price is
+    refused by both implementations and named by neither spec, and calling
+    that a spec refusal would put words into a ratified document that nobody
+    ratified.
+
+    Both implementations must refuse each one with *their own library
+    exception* -- "Submissions with ... SHALL raise a library exception. The
+    API SHALL never terminate the host process" -- and leave the book exactly
+    as it was: "an exception is raised, no state changes, and the process
+    continues".
 
     Asserting the library base class rather than `Exception` is what makes the
     process clause testable: a `SystemExit` (which is what the legacy engine
@@ -1431,40 +1651,32 @@ def test_both_refuse_what_the_specs_refuse(tmp_path):
         reference.limit("bid", 5, 100.0, 1)
         engine.limit("bid", 5, 100.0, 1)
 
-        # A fully filled order to aim the terminal-state refusal at. The pair
-        # consumes itself exactly -- ask 5 @ 105 met by bid 5 @ 105 -- so both
-        # books are left holding only order 1, and the closing assertion below
-        # still speaks for the whole book rather than for a remainder.
+        # The states the refusals above address, built once on both sides: a
+        # fully filled limit order (2, met exactly by 3), a cancelled one (4),
+        # and a market order that finished by filling rather than by being
+        # cancelled (6, taking 5). Each pair consumes itself exactly, so both
+        # books are left holding only order 1 and the closing assertion still
+        # speaks for the whole book rather than for a remainder.
         for book in (reference, engine):
             book.limit("ask", 5, 105.0, 2)
             book.limit("bid", 5, 105.0, 3)
-        known = [1, 2, 3]
+            book.limit("bid", 5, 99.0, 4)
+            book.cancel(4)
+            # The last argument is the trader, not the identifier: these two
+            # are orders 5 and 6, submitted by traders 2 and 3. Different
+            # traders because this profile gates self-matching, and a market
+            # order that skipped its own liquidity would finish *cancelled*
+            # and never reach the market-order refusal it is here for.
+            book.limit("ask", 5, 101.0, 2)
+            book.market("bid", 5, 3)
+        known = [1, 2, 3, 4, 5, 6]
         assert not differences(reference, engine, profile, known_ids=known)
 
-        refusals = {
-            "non-positive quantity": lambda book: book.limit("bid", 0, 100.0, 1),
-            "negative quantity": lambda book: book.limit("ask", -3, 100.0, 1),
-            "unknown side": lambda book: book.limit("buy", 5, 100.0, 1),
-            "unknown order type": lambda book: book._submit(
-                "stop", "bid", 5, 1, price=100.0
-            ),
-            "limit order with no price": lambda book: book.limit("bid", 5, None, 1),
-            "market order carrying a price": lambda book: book._submit(
-                "market", "bid", 5, 1, price=100.0
-            ),
-            "cancel of an unknown identifier": lambda book: book.cancel(9999),
-            "modify of an unknown identifier": lambda book: book.modify(9999, qty=2),
-            "supplied identifier already in use": lambda book: book.limit(
-                "bid", 5, 100.0, 1, idNum=1, timestamp=1.0
-            ),
-            "modify to a different side": lambda book: book.modify(
-                1, qty=3, side="ask"
-            ),
-            # Order 2 is fully filled and therefore gone from the book. The
-            # spec refuses raising it rather than silently returning a
-            # finished order to the book with a fresh priority stamp.
-            "modify of a fully filled order": lambda book: book.modify(2, qty=9),
-        }
+        # Merged rather than looped over twice, so one list of refusals runs
+        # against one pair of books; the count is what would catch a name
+        # appearing in both groups and silently replacing the other.
+        refusals = {**SPEC_REFUSALS, **CONVENTION_REFUSALS}
+        assert len(refusals) == len(SPEC_REFUSALS) + len(CONVENTION_REFUSALS)
         sides = (
             (reference, reference_matcher.ReferenceError),
             (engine, PyLOBError),
