@@ -27,12 +27,9 @@ dependencies = []
 [project.urls]
 Homepage = "https://github.com/DrAshBooth/PyLOB"
 Repository = "https://github.com/DrAshBooth/PyLOB"
-# Documentation points at the README, not the wiki: the wiki still describes
-# the red-black-tree implementation PR #7 replaced in 2023, and sending an
-# installing user to a description of code that is not in the package they
-# installed is worse than sending them nowhere. Point it back at the wiki when
-# `rewrite-docs` has rewritten it.
-Documentation = "https://github.com/DrAshBooth/PyLOB#readme"
+# The wiki was rewritten for the shipped engine in 2026-08; its walkthrough and
+# analysis pages are the long-form documentation, so this points there again.
+Documentation = "https://github.com/DrAshBooth/PyLOB/wiki"
 Issues = "https://github.com/DrAshBooth/PyLOB/issues"
 
 # Pinned exactly: these are the versions ./verify enforced as `uvx ruff@0.9.10`

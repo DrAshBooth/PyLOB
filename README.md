@@ -178,9 +178,14 @@ operation, and `recording-sink` by `tests/test_emission_coverage.py` and the
 Design decisions and their rejected alternatives are indexed in
 [docs/adr/README.md](docs/adr/README.md).
 
-The wiki has not been rewritten yet. It describes the pure-Python
-red-black-tree implementation that PR #7 replaced in 2023 — two engines ago —
-so treat it as historical rather than as a guide to the code you installed.
+The [wiki](https://github.com/DrAshBooth/PyLOB/wiki) carries the long-form
+versions of what is above: a
+[usage walkthrough](https://github.com/DrAshBooth/PyLOB/wiki/Usage-walkthrough)
+that goes further than `example.py`, and a
+[recording and analysis guide](https://github.com/DrAshBooth/PyLOB/wiki/Recording-and-analysis)
+with the queries for reading a session back. Its `Implementation` page is kept
+under a banner as history — it describes the red-black-tree implementation PR
+#7 replaced in 2023, two engines ago.
 
 Speed:
 ======
