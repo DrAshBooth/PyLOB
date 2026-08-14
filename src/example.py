@@ -189,8 +189,9 @@ def replayed(db_path):
 def main():
     # One book is one session, and the two acts below are two of them: there
     # is no `reset()` because constructing a fresh `OrderBook` is the reset,
-    # and at 0.8 microseconds it is the pattern a per-episode gym or sweep
-    # should use rather than avoid (README, "Sessions and episodes").
+    # and at 8.3 microseconds for a configured one it is the pattern a
+    # per-episode gym or sweep should use rather than avoid (ADR-0006, and
+    # README's "Sessions and episodes" for the measurements).
     #
     # No sink is the default: no I/O, nothing persisted, nothing constructed.
     walkthrough(OrderBook(tick_size=0.01))

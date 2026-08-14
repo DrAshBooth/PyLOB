@@ -37,8 +37,20 @@
 > One item has since reversed. §2 and the reading map describe a wiki the
 > README disavowed; the wiki was rewritten for this engine on 2026-08-14, and
 > the README and `pyproject.toml` point at it again. Its `Implementation` page
-> is the part kept as history. Nothing below is edited — the findings are the
-> record of what was found — and only this note is new.
+> is the part kept as history.
+>
+> **One number below is wrong.** "What must not be changed" cites zero-ceremony
+> construction at 0.8 µs. Two independent re-measurements on the same machine
+> (2026-08-14) put a bare `OrderBook()` at 0.40–0.42 µs and a *configured* one
+> — instrument plus twenty traders, which is what an episode actually builds —
+> at 8.3–8.5 µs. The finding it supports is unaffected and if anything
+> strengthened: construction is still far below anything an episode notices,
+> and fresh-per-episode is the measured-faster pattern (ADR-0006). The README
+> and `src/example.py` now carry the measured figures; this line is left as
+> written.
+>
+> Nothing below is edited — the findings are the record of what was found —
+> and only this note is new.
 
 Requested by the maintainer before the baseline recording run, with a stated
 focus: clarity, readability, redundancy, and use by researchers. Five parallel

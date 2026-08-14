@@ -77,23 +77,47 @@ fresh engine. It is executed on every `./verify`, so it cannot rot silently.
 Sessions and episodes:
 ======================
 One `OrderBook` is one session. It opens at construction and ends at
-`close()`, which flushes the sink and does nothing else — on a book with no
-sink it does nothing at all.
+`close()`, which flushes the sink and does nothing else — it clears neither
+the book, nor the order store, nor the ledgers, and on a book with no sink it
+does nothing at all.
 
 There is no `reset()`, and none is needed: **construct a fresh `OrderBook` for
 each episode.** That is the intended pattern for RL gyms and parameter sweeps,
-not a workaround. Construction is a handful of empty dicts, measured at 0.8 µs
-(`docs/clarity-review-2026-08.md`), which no episode notices; and the
-pre-retirement review measured fresh-engine-per-episode as *both the cheaper
-and the faster* reset pattern — reusing one book across episodes is slower as
-well as heavier (`docs/engine-review-2026-08.md`).
+not a workaround, and the missing method is the answer rather than an omission:
+[ADR-0006](docs/adr/0006-no-reset-episode-is-a-fresh-orderbook.md) records why
+a `reset()` could not clear the store without giving up the identity rule two
+paragraphs down, and why it would not pay for itself even if it could.
 
-Heavier, because a book remembers every order it has ever seen. The store maps
-`idNum` to `Order` and is never pruned: a filled or cancelled order stays
-addressable for its `fulfilled` and `commission`, and identifiers stay unique
-for the whole lifetime of the book, which is what the `order-lifecycle`
-contract requires. So a book driven through a long sweep grows without bound,
-by design. A fresh book per episode is what bounds it.
+Construction is a handful of empty dicts: 0.4 µs for the bare `OrderBook`, and
+8.5 µs for one with an instrument configured and twenty traders on it, which
+no episode notices. Fresh-per-episode is also, measured, the *faster* pattern.
+A hundred episodes of ten thousand `mixed-v1` orders ran at ~183k orders/sec
+building a new engine per episode, against ~167k pushing all of them through
+one long-lived book — about 10% ahead, with per-episode construction *and*
+teardown inside the timed region. The pre-retirement review found the same
+direction on its own machine (`docs/engine-review-2026-08.md`); as everywhere
+else here, the ratio is the durable part and the absolutes are indicative.
+
+Reusing one book is heavier as well as slower, because a book remembers every
+order it has ever seen. The store maps `idNum` to `Order` and is never pruned:
+a filled or cancelled order stays addressable for its `fulfilled` and
+`commission`, and identifiers stay unique for the whole lifetime of the book,
+which is what the `order-lifecycle` contract requires. So a book driven
+through a long sweep grows without bound, by design — and it grows linearly,
+at about 350 bytes of process memory per order submitted (1M orders cost
+356 MB, 2M cost 692 MB; the store itself is a steady 186 B/order and the rest
+is the book and the ledgers). Nobody has run ten million orders through one
+process, so take 10M × 350 B ≈ 3.5 GB as arithmetic off that slope rather than
+as a measurement — but take it seriously before pointing a long sweep at a
+single book. A fresh book per episode is what bounds it.
+
+Dropping a book is not free either, and the cost scales with what it retained:
+`del` plus a collection takes about 84 ms for a book holding a million orders,
+against 1.1 ms for a 5,000-order episode engine — some 4% of the 27 ms that
+episode took to run, and already paid inside the throughput figures above. So
+the fresh-engine loop pays teardown in proportion, a little at a time, where a
+book grown across a whole sweep pays it in one 84 ms-per-million piece
+whenever it is finally released. Short episodes are where that matters.
 
 For a sweep, then: run the episodes sinkless — the default, and free rather
 than merely cheap, since an engine with no sink constructs no event at all —

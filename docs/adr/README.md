@@ -9,3 +9,4 @@ ADR only if it is relevant.
 - [ADR-0003](0003-retire-the-legacy-sql-engine.md) — Accepted: the legacy SQL engine is retired; the differential oracle is replaced by a spec-derived reference matcher, not deleted (supersedes ADR-0001's transition clause)
 - [ADR-0004](0004-trade-is-a-namedtuple.md) — Accepted: `Trade` is a NamedTuple, not a frozen dataclass (a measured 9% of the sinkless hot path); the type widens to a tuple
 - [ADR-0005](0005-calibrated-throughput-baselines.md) — Accepted: throughput is judged against a calibration-normalised baseline, not a ratio to the deleted legacy engine (supersedes ADR-0002)
+- [ADR-0006](0006-no-reset-episode-is-a-fresh-orderbook.md) — Accepted: there is no `reset()` and `close()` clears nothing; an episode is a fresh `OrderBook`, which is measured faster and is the only bounded arrangement
