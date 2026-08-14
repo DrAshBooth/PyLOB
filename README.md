@@ -59,9 +59,20 @@ print(order.fulfilled)   # 3
 the executions it caused, in match order. The order goes on answering for
 itself afterwards — `order.fulfilled`, `order.remaining`, `order.resting`,
 `order.commission` — so nothing else needs to be tracked to see what became of
-it. `book.print("FAKE")` renders the ladder and the last-trade price (it both
-prints and returns the string); `getBestBid`, `getBestAsk`, `getWorstBid`,
-`getWorstAsk` and `getVolumeAtPrice` answer the read side one value at a time.
+it. `cancel(idNum)` and `modify(idNum, qty=..., price=...)` change a resting
+order afterwards: the identifier comes first and everything else is by
+keyword, so nothing can land in the wrong slot, and the clock is `timestamp=`
+as it is on `submit`. The 2013 spellings are unchanged and not deprecated:
+`cancelOrder` and `modifyOrder` are these two under their original names, and
+`processOrder` is `submit` in the dict-quote shape.
+
+`book.print("FAKE")` renders the ladder and the last-trade price (it both
+prints and returns the string). `book.depth("FAKE", "bid")` is the Level 2
+read: the aggregated ladder as `(price, volume)` pairs, one per price at which
+orders rest, best first, with `book.depth("FAKE", "bid", 5)` for the best five
+levels alone. `getBestBid`, `getBestAsk`, `getWorstBid`, `getWorstAsk` and
+`getVolumeAtPrice` answer one value at a time, and agree with the ladder by
+construction rather than by arrangement — all of them read the same levels.
 
 Configuration is optional but consequential. An instrument springs into being
 on first mention, and an unconfigured trader pays no commission — but a book
@@ -70,9 +81,10 @@ leg of a trade, not the cash leg. `configure_trader` sets a trader's
 commission schedule and whether it may match its own resting orders.
 
 `src/example.py` is the full walkthrough — limit orders, crossing, partial
-fills, market orders, cancel, modify, the legacy dict-quote API, the same run
-again with a recording sink attached, and that recording replayed back into a
-fresh engine. It is executed on every `./verify`, so it cannot rot silently.
+fills, market orders, the depth ladder, cancel and modify in both spellings,
+the legacy dict-quote API, the same run again with a recording sink attached,
+and that recording replayed back into a fresh engine. It is executed on every
+`./verify`, so it cannot rot silently.
 
 Sessions and episodes:
 ======================
@@ -125,6 +137,15 @@ and attach a sink to the few runs you mean to inspect afterwards. One database
 per session: a sink pointed at a file that already holds a session cannot
 write to it.
 
+Label the ones you keep, inside the file rather than in its name — fifty
+`.db`s told apart by their filenames stop being told apart the moment somebody
+moves them. `SQLiteSink("run-07.db", meta={"seed": 42, "episode": 7})` writes
+those keys into the recording, in the opening transaction rather than at
+`close`, so an episode killed before its first flush still says which one it
+was; `read_meta("run-07.db")` reads them back with their types intact, and
+does not ask the log to be complete first — which is the point, since the run
+worth naming is usually the one that died.
+
 Recording and inspecting a session:
 ===================================
 Attaching a sink turns the session into queryable history:
@@ -146,11 +167,16 @@ The database has two layers. `event` is the append-only log — one row per
 event, the whole event as JSON, the source of truth. `session`, `instrument`,
 `trader`, `orders`, `trade` and `balance` are projections of that log: current
 state, so that a question about it is a `SELECT` rather than a fold over
-200,000 JSON rows. Two views sit on top — `resting_order` (what is still on
-the book, with the quantity still available) and `trader_commission`
-(commission per trader per currency). Two further tables record what happened
-to the recording itself rather than to the market: `session_end` and
-`event_loss`.
+200,000 JSON rows. Three views sit on top — `resting_order` (what is still on
+the book, with the quantity still available), `trader_commission` (commission
+per trader per currency) and `trade_leg`, which unpivots each trade into the
+balance movements it caused, one row per (trader, symbol) leg. `balance` keeps
+only the running sum of those movements, so `trade_leg` is where per-trade
+attribution comes from; summing it back by trader and symbol returns
+`balance`, to within what a different order of float additions costs. Three
+further tables record something other than the market: `session_meta`, which
+holds whatever the run was labelled with, and `session_end` and `event_loss`,
+which say what happened to the recording itself.
 
 So, after a run:
 
@@ -175,6 +201,13 @@ and does not change, and how a killed run is told apart from a finished one.
 Do not read a recorded database without `check_log`/`read_events`, or at least
 without knowing what that header says about `session_end`: a session that was
 killed mid-run looks exactly like a shorter one.
+
+A database recorded before `trade_leg` and `session_meta` existed still reads.
+The readers take a window of schema versions rather than demanding the current
+one ([ADR-0007](docs/adr/0007-sink-readers-accept-a-schema-version-window.md)),
+so an older file opens, says on the way in what it does not carry, and answers
+what it can. The *writer* stays strict and refuses anything but the current
+version, so nothing appends to an old recording.
 
 Replaying a session:
 ====================

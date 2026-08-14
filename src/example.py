@@ -6,11 +6,14 @@ removes.
 
 Three acts:
 
-1. `walkthrough` -- one book, no sink. Limit orders that rest, a limit order
-   that crosses, one that crosses only partially, a market order, a cancel, a
-   modify, and one last submission through the legacy dict-quote API.
-2. `recorded` -- the same engine with a `SQLiteSink` attached, and the SQL
-   that reads the session back afterwards.
+1. `walkthrough` -- one book, no sink. Limit orders that rest, the depth
+   ladder they add up to, a limit order that crosses, one that crosses only
+   partially, a market order, a cancel, two modifies, and one last submission
+   through the legacy dict-quote API. Cancel and modify appear in both
+   spellings, because both are first-class and neither is deprecated.
+2. `recorded` -- the same engine with a `SQLiteSink` attached, labelled the
+   way a sweep would label it, and the SQL that reads the session back
+   afterwards.
 3. `replayed` -- that recording fed back into a fresh engine, which reaches
    the same book by matching again rather than by restoring anything.
 
@@ -74,6 +77,13 @@ def walkthrough(lob):
     # The current book may be viewed using a print
     lob.print(INSTRUMENT)
 
+    # `depth` is that same book aggregated: one (price, volume) pair per price
+    # at which orders rest, best price first, which is the "Level 2" view a
+    # strategy reads. The three separate asks at 101 are one level of 15. A
+    # second argument bounds the answer to the best N levels.
+    print("ask ladder:", lob.depth(INSTRUMENT, "ask"))
+    print("best two bid levels:", lob.depth(INSTRUMENT, "bid", 2))
+
     # Submitting a limit order that crosses the opposing best price will
     # result in a trade -- priced at the *resting* order's limit, because the
     # order already in the book named the terms.
@@ -101,22 +111,32 @@ def walkthrough(lob):
 
     ############ Cancelling Orders #############
 
-    # An order is cancelled by identifier; the side is optional and checked
-    # against the order when given.
+    # An order is cancelled by identifier. `cancel` takes it first and takes
+    # everything else by keyword: `side=` is optional and checked against the
+    # order when given, `timestamp=` is the clock, spelled as `submit` spells
+    # it. `cancelOrder("bid", idNum)` is the same operation under its 2013
+    # name, and records the same event.
     print("cancelling bid for 5 @ 97..")
-    lob.cancelOrder("bid", bid_at_97.idNum)
+    lob.cancel(bid_at_97.idNum)
     lob.print(INSTRUMENT)
 
     ########### Modifying Orders #############
 
-    # A resting order is modified by identifier. Asking for more quantity
-    # costs time priority: the order goes to the back of its price level.
-    lob.modifyOrder(bid_at_99.idNum, dict(side="bid", qty=14, price=99))
-    print("book after increase amount. will be put as end of queue")
+    # A resting order is modified by identifier too. Asking for more quantity
+    # costs time priority: the order goes to the back of its price level. An
+    # omitted `qty` or `price` leaves that one alone, and `modify` hands back
+    # `(order, trades)` the way `submit` does.
+    order, _ = lob.modify(bid_at_99.idNum, qty=14)
+    print(
+        "book after increase amount to %d (%d filled already, %d resting)."
+        " will be put as end of queue" % (order.qty, order.fulfilled, order.remaining)
+    )
     lob.print(INSTRUMENT)
 
-    # Changing the price costs time priority too -- and a price that crosses
-    # matches immediately, exactly as an arriving order would.
+    # The older spelling of the same operation: a dict naming side, qty and
+    # price, returning `(trades, quote)`. Changing the price costs time
+    # priority too -- and a price that crosses matches immediately, exactly as
+    # an arriving order would.
     lob.modifyOrder(bid_at_99.idNum, dict(side="bid", qty=14, price=103.2))
     print("book after improve bid price. will process the order")
     lob.print(INSTRUMENT)
@@ -141,10 +161,19 @@ def recorded(db_path):
     costs roughly 8x throughput and buys the whole session back as queryable
     history -- worth it for the runs you mean to inspect afterwards, wasted on
     the ones you do not.
-    """
-    from PyLOB.sinks.sqlite import SQLiteSink
 
-    lob = OrderBook(tick_size=0.01, sink=SQLiteSink(db_path))
+    `meta=` is what this recording says about itself -- a seed, an episode
+    number, a label -- written before the first event, so a run killed halfway
+    still names itself. `read_meta` reads it back. `trade_leg` is the other
+    thing worth knowing here: `balance` keeps the running sum of what a trade
+    moved, and the view keeps the movements themselves.
+    """
+    from PyLOB.sinks.sqlite import SQLiteSink, read_meta
+
+    lob = OrderBook(
+        tick_size=0.01,
+        sink=SQLiteSink(db_path, meta={"seed": 20260814, "episode": 1}),
+    )
     lob.configure_instrument(INSTRUMENT, CURRENCY)
     lob.configure_trader(100)
     lob.configure_trader(101)
@@ -157,9 +186,14 @@ def recorded(db_path):
     try:
         trades = conn.execute("select trade_id, price, qty from trade").fetchall()
         events = conn.execute("select count(*) from event").fetchone()[0]
+        legs = conn.execute(
+            "select tid, leg, symbol, amount from trade_leg order by tid, leg"
+        ).fetchall()
     finally:
         conn.close()
     print("recorded %d events at %s; trades: %r" % (events, db_path, trades))
+    print("recording labelled %r" % (read_meta(db_path),))
+    print("what that trade moved: %r" % (legs,))
 
 
 def replayed(db_path):

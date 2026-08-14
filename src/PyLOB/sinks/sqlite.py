@@ -20,6 +20,10 @@ schema explains itself wherever it is read. This is only the map of it.
                                      `instrument.last_price` for the latest
     what a trader holds              `balance`, per trader per instrument-or-
                                      currency -- derived, never emitted
+    what one trade moved             `trade_leg`, that trade's own balance
+                                     movements, one row per (trader, symbol)
+                                     leg -- the attribution a running sum
+                                     cannot give
     what a trader paid in commission `trader_commission`, per currency
     what the engine actually emitted `event` -- the log itself, one JSON row
                                      per event, and the input to a replay
@@ -30,11 +34,13 @@ schema explains itself wherever it is read. This is only the map of it.
     whether the file can be trusted  `check_log`, which reads `session_end`
                                      and `event_loss` so that you need not
 
-`resting_order` and `trader_commission` are views over `orders`, not tables.
-Per-trade balance movements are not stored -- `balance` holds the running sum
--- but each trade's four movements are derivable from its `trade` row, whose
-price, quantity and per-side commission deltas are exactly what the balance
-rule below consumes.
+`resting_order` and `trader_commission` are views over `orders`, `trade_leg`
+is a view over `trade`, and none of the three is a table. Balances are asked
+about two ways, and neither way needs arithmetic of the reader's: `balance`
+holds the running sum, and `trade_leg` holds the movements it is the sum of,
+one row per leg, booked in the currency the fill settled in rather than the
+one stamped on the order. It is the balance rule of `PyLOB.events` written out
+in SQL, so the unpivot lives here once instead of once per analysis.
 
 Shape of the database
 ---------------------
