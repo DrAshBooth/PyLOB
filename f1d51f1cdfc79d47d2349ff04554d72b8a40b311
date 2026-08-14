@@ -1,0 +1,31 @@
+ERRATUM (added 2026-08-14, after push).
+
+This commit's message describes only the sdist packaging fix and the repo/doc
+hygiene. It also contains, unannounced, the whole of the source-hygiene work
+(bead lob-7ig plus the source items of lob-kbx), because the orchestrator ran
+`git add -A` while a second agent was still writing to src/. Nothing was lost
+and ./verify was green at the time, but the message does not describe the diff.
+
+What is actually in here beyond the stated scope:
+
+- src/PyLOB/engine.py: quantize/clipPrice alias flipped so the modern name is
+  the definition; _check_working_price extracted from two verbatim copies;
+  BookSide.best_level and total_volume removed; takers/makers renamed to
+  taker_book/maker_book; naming glosses on fulfilled and the three counters.
+- BEHAVIOUR CHANGE: configure_instrument(symbol, currency) now raises
+  InvalidOrder when symbol == currency. Both legs would otherwise post to one
+  (tid, symbol) balance key and net silently. This enforces a constraint
+  openspec/config.yaml already states rather than inventing one, and refuses at
+  the gate before any state changes, so it emits no event.
+- src/PyLOB/events.py: Filled.taker_idNum/maker_idNum removed (no callers);
+  commission_max_percnt 'sic' note.
+- src/PyLOB/bench/provenance.py: effective_ghz and CoreClock.ipc removed;
+  request_performance_core collapsed; _repo_root made public as repo_root().
+- src/PyLOB/__init__.py: __version__ added.
+- tests/test_emission_coverage.py: two label strings following the alias flip.
+
+Deliberately NOT changed, and recorded because the reasoning matters: read
+queries still create an instrument on first mention. openspec/config.yaml's
+constraint block states that behaviour as what the frozen specs are written
+against, so changing it is an OpenSpec delta rather than a code fix. It is
+documented loudly in book() instead.
