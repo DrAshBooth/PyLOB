@@ -13,3 +13,6 @@ __pycache__/
 
 # Claude Code: skills are tracked, per-session scratch is not
 .claude/worktrees/
+
+# Benchmark recording logs: the baseline itself is committed, the run log is not.
+benchmarks/recording-*.log
