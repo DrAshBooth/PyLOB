@@ -113,8 +113,9 @@ else here, the ratio is the durable part and the absolutes are indicative.
 Reusing one book is heavier as well as slower, because a book remembers every
 order it has ever seen. The store maps `idNum` to `Order` and is never pruned:
 a filled or cancelled order stays addressable for its `fulfilled` and
-`commission`, and identifiers stay unique for the whole lifetime of the book,
-which is what the `order-lifecycle` contract requires. So a book driven
+`commission`, and identifiers stay unique across every instrument the engine
+holds for that engine's lifetime, which is what the `order-lifecycle` contract
+requires. So a book driven
 through a long sweep grows without bound, by design — and it grows linearly,
 at about 350 bytes of process memory per order submitted (1M orders cost
 356 MB, 2M cost 692 MB; the store itself is a steady 186 B/order and the rest
