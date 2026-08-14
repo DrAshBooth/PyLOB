@@ -190,15 +190,17 @@ capability per directory:
 | `commissions` | the per-unit-with-floor-and-cap schedule, per order, in the instrument's currency |
 | `trader-balances` | running per-(trader, instrument-or-currency) balances moved by trades and commissions |
 | `recording-sink` | the event stream the core emits and the queryable history a sink turns it into |
+| `benchmarking` | seeded deterministic workloads, throughput reported with its context, regression judged against a recorded baseline |
 
 Four of those — `order-lifecycle`, `book-queries`, `commissions` and
 `trader-balances` — have acceptance suites in `tests/acceptance/`, written one
 test per ratified scenario against an engine-neutral adapter surface. The
-other two are guarded by suites of their own: `order-matching` by
+other three are guarded by suites of their own: `order-matching` by
 `tests/reference/matcher.py`, a matcher written from the frozen specs alone
 that shares no code with the engine and is compared against it operation for
-operation, and `recording-sink` by `tests/test_emission_coverage.py` and the
-`tests/test_sink_*.py` suites.
+operation; `recording-sink` by `tests/test_emission_coverage.py` and the
+`tests/test_sink_*.py` suites; and `benchmarking` by
+`tests/test_bench_workloads.py` and the harness's own baseline guard.
 
 Design decisions and their rejected alternatives are indexed in
 [docs/adr/README.md](docs/adr/README.md).
