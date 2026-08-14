@@ -15,10 +15,11 @@ still counted by volume-at-price.
 Fixtures come from `tests/acceptance/conftest.py`: `engine` is an empty book
 reached through the engine-neutral adapter surface, never through an engine's
 own API, so a scenario here states a contract rather than an implementation.
-Two requirements here are written *per instrument* -- the snapshot and the
-last-trade price -- and one instrument cannot tell a book apart from the
-engine holding it, so those tests take `engine_factory(instruments=...)` and
-ask their queries of one instrument while a second one is loaded.
+Four requirements here name the instrument they answer for -- the best and
+worst prices, volume at price, the snapshot and the last-trade price -- and
+one instrument cannot tell a book apart from the engine holding it, so those
+tests take `engine_factory(instruments=...)` and ask their queries of one
+instrument while a second one is loaded.
 """
 
 import pytest
@@ -100,6 +101,52 @@ def test_side_emptied_by_an_unfillable_market_order_reports_none(engine):
     assert engine.volume_at("bid", 1) == 0
 
 
+def test_another_instruments_orders_do_not_move_these_prices(engine_factory):
+    """Best and worst prices reflect resting limit orders / Another instrument's orders do not move these prices.
+
+    "one engine holds bids of 5@99 on instrument A and 5@150 on instrument B,
+    and asks of 5@101 on A and 5@60 on B" -- A is the default instrument, B is
+    `OTHER`, quoted inside and across A's spread and the wrong way round, so
+    an engine reading out of one pooled book gets a wrong answer on every
+    instrument and side here rather than a right one by coincidence: pooled,
+    A's best bid reads 150 and B's worst bid 99, A's best ask 60 and B's worst
+    ask 101.
+
+    B's quote is crossed, which two books can be and one cannot. That is not a
+    trick of this suite: one trader owns both sides of it and self-matching is
+    gated unless the trader is flagged (`trader-balances`), so neither side of
+    it takes the other, and B holds the bid above A's ask and the ask below
+    A's bid at the same moment.
+
+    The instrument with nothing resting is B before it is quoted -- the engine
+    holds only the two instruments the scenario names, and "however much rests
+    on the others" is A's whole book at that moment.
+    """
+    engine = engine_factory(instruments=((OTHER, "USD"),))
+
+    engine.limit("bid", 5, 99, tid=1)
+    engine.limit("ask", 5, 101, tid=2)
+
+    assert engine.best("bid", OTHER) is None
+    assert engine.worst("bid", OTHER) is None
+    assert engine.best("ask", OTHER) is None
+    assert engine.worst("ask", OTHER) is None
+
+    engine.limit("bid", 5, 150, tid=5, instrument=OTHER)
+    engine.limit("ask", 5, 60, tid=5, instrument=OTHER)
+
+    # Both sides of both instruments: each query answers out of the book it
+    # names, and B's orders never reach A's answers or the other way round.
+    assert engine.best("bid") == 99
+    assert engine.worst("bid") == 99
+    assert engine.best("ask") == 101
+    assert engine.worst("ask") == 101
+    assert engine.best("bid", OTHER) == 150
+    assert engine.worst("bid", OTHER) == 150
+    assert engine.best("ask", OTHER) == 60
+    assert engine.worst("ask", OTHER) == 60
+
+
 # --------------------------------------------------------------------------
 # Requirement: Volume at price answers the marketable question
 # --------------------------------------------------------------------------
@@ -131,6 +178,31 @@ def test_volume_at_price_excludes_non_marketable_levels(engine):
 
     assert engine.volume_at("ask", 102) == 5
     assert engine.volume_at("ask", 100) == 0
+
+
+def test_another_instruments_volume_at_the_same_price_is_excluded(engine_factory):
+    """Volume at price answers the marketable question / Another instrument's volume at the same price is excluded.
+
+    "one engine holds a bid of 5@99 on instrument A and a bid of 7@99 on
+    instrument B ... the answer is 5 for A and 7 for B" -- the *same* price on
+    both instruments is the whole point of the scenario. At two prices, an
+    implementation that pooled the books and filtered by price alone would
+    answer both questions right by accident; at one price it answers 12 to
+    each of them, and neither instrument holds 12.
+
+    The instrument holding nothing is B before it is quoted, which is also
+    when every bid in the engine is A's: pooled, that question answers 5.
+    """
+    engine = engine_factory(instruments=((OTHER, "USD"),))
+
+    engine.limit("bid", 5, 99, tid=1)
+
+    assert engine.volume_at("bid", 99, OTHER) == 0
+
+    engine.limit("bid", 7, 99, tid=2, instrument=OTHER)
+
+    assert engine.volume_at("bid", 99) == 5
+    assert engine.volume_at("bid", 99, OTHER) == 7
 
 
 # --------------------------------------------------------------------------
