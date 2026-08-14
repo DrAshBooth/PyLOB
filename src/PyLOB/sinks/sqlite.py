@@ -23,6 +23,10 @@ schema explains itself wherever it is read. This is only the map of it.
     what a trader paid in commission `trader_commission`, per currency
     what the engine actually emitted `event` -- the log itself, one JSON row
                                      per event, and the input to a replay
+    which run this recording is      `session_meta`, whatever the caller named
+                                     in `SQLiteSink(path, meta=...)`; empty
+                                     when they named nothing. `read_meta`
+                                     reads it, and does not need the log
     whether the file can be trusted  `check_log`, which reads `session_end`
                                      and `event_loss` so that you need not
 
@@ -110,10 +114,12 @@ times it is closed.
 The file says so independently, which is the part that survives the process
 never reaching `close`. `check_log` -- which `read_events` runs before
 yielding anything -- refuses a log whose `seq` values do not run from 0
-without a gap, refuses one carrying any `event_loss` row, and refuses a
-`stream_version` or `user_version` this module does not implement. A
-recording that lost a batch, and a log truncated in the middle by anything
-else, cannot masquerade as a complete one.
+without a gap, refuses one carrying any `event_loss` row, refuses a
+`stream_version` this module does not implement, and refuses a schema
+`user_version` outside the window ADR-0007 put the readers on
+(`MIN_READABLE_SCHEMA_VERSION` through `SCHEMA_VERSION`). A recording that
+lost a batch, and a log truncated in the middle by anything else, cannot
+masquerade as a complete one.
 
 Ending, and being killed
 ------------------------
@@ -253,12 +259,14 @@ from ..events import (
 __all__ = [
     "SQLiteSink",
     "SCHEMA_VERSION",
+    "MIN_READABLE_SCHEMA_VERSION",
     "SCHEMA",
     "EventLogError",
     "IncompleteLogError",
     "check_log",
     "decode_event",
     "read_events",
+    "read_meta",
 ]
 
 _log = logging.getLogger(__name__)
@@ -285,6 +293,25 @@ _log = logging.getLogger(__name__)
 #: *readers* do with that is ADR-0007's decision and not this constant's; the
 #: writer stays exact either way, for the reason `_check_schema_version` gives.
 SCHEMA_VERSION = 4
+
+#: Oldest schema version the *readers* open. ADR-0007 put `check_log`,
+#: `read_events` and `read_meta` on a window running from here through
+#: `SCHEMA_VERSION`, so that bumping the version stops meaning every recording
+#: already made is refused.
+#:
+#: Not an arithmetic rule -- it is not "one back". Whoever raises
+#: `SCHEMA_VERSION` decides, and states, whether the version it replaces stays
+#: here, and the ADR's test is the one to apply: **can a reader answer the new
+#: question honestly from an old file?** Absence of `session_meta` is a true
+#: answer ("the caller supplied none"), so 3 stays. Versions 1 and 2 fail the
+#: same test -- an absent `event_loss` or `session_end` table cannot say
+#: whether anything was lost or whether the session ever closed, and reading
+#: absence as the good answer would report a salvaged run as a clean one --
+#: which is why the window starts at 3 and not at 1.
+#:
+#: The writer is not on this window and refuses anything but `SCHEMA_VERSION`;
+#: `_check_schema_version` says why the two halves differ.
+MIN_READABLE_SCHEMA_VERSION = 3
 
 #: Default events per transaction. Tuning only; design.md leaves the number to
 #: benchmark data, and the resulting database does not depend on it.
@@ -548,6 +575,12 @@ _LOG_EXTENT = "SELECT COUNT(*), MAX(seq) FROM event"
 # Zero means the file has no schema at all, which is a different problem from
 # having the wrong one: see `_no_tables_message`.
 _TABLE_COUNT = "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table'"
+
+# Did this session trade at all: EXISTS stops at the first row, so it costs
+# nothing on the long recordings it is asked about.
+_ANY_TRADE = "SELECT EXISTS (SELECT 1 FROM trade)"
+
+_META_SELECT = "SELECT key, value FROM session_meta ORDER BY key"
 
 _SESSION_UPSERT = """
 INSERT INTO session (seq, timestamp, tick_size, stream_version)
@@ -1380,14 +1413,19 @@ def check_log(source: str | os.PathLike[str] | sqlite3.Connection) -> None:
     incompleteness, and is raised as `IncompleteLogError` for callers who
     want to tell those apart.
 
-    **The schema is not this one.** `PRAGMA user_version` must be
-    `SCHEMA_VERSION`. Checked first, because the rest of these queries assume
-    this module's tables. Version 0 with no tables in the file is reported
-    separately, because it is not a version mismatch at all and the honest
-    diagnosis saves a session: it is what a killed run's `.db` looks like when
-    it was copied without its `-wal` sidecar (see Durability), and a reader
-    told "version 0 is not this module's version" goes looking for an old
-    release of this module instead of for the file holding their events.
+    **The schema is not one this module reads.** `PRAGMA user_version` must
+    fall in the window ADR-0007 put the readers on --
+    `MIN_READABLE_SCHEMA_VERSION` through `SCHEMA_VERSION` -- and not merely
+    equal `SCHEMA_VERSION`, which is what the *writer* goes on demanding. An
+    accepted file older than the current version reads normally and is warned
+    about once, naming what it does not carry. Checked first, because the rest
+    of these queries assume this module's tables. Version 0 with no tables in
+    the file is reported separately, because it is not a version mismatch at
+    all and the honest diagnosis saves a session: it is what a killed run's
+    `.db` looks like when it was copied without its `-wal` sidecar (see
+    Durability), and a reader told "version 0 is not a version this module
+    reads" goes looking for an old release of this module instead of for the
+    file holding their events.
 
     **The sink recorded a loss.** Any `event_loss` row is a loss this sink
     knew about, wherever in the stream it fell, and it is on disk without
@@ -1463,17 +1501,100 @@ def _no_tables_message(conn: sqlite3.Connection) -> str:
     )
 
 
-def _check_log(conn: sqlite3.Connection) -> None:
+def _has_object(conn: sqlite3.Connection, name: str) -> bool:
+    """Whether this database carries `name` as a table or a view.
+
+    Worth asking only because the reader window makes absence possible: a
+    version-3 file has no `session_meta` table and no `trade_leg` view, and a
+    reader that must answer for such a file asks rather than meeting `no such
+    table` on the way past.
+    """
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE name = ? LIMIT 1", (name,)
+    ).fetchone()
+    return row is not None
+
+
+def _check_schema_window(conn: sqlite3.Connection) -> int:
+    """Refuse a file no reader here can answer from; return its version.
+
+    Deliberately laxer than the writer's `_check_schema_version`, and the two
+    are supposed to differ: ADR-0007 put the readers on a window,
+    `MIN_READABLE_SCHEMA_VERSION` through `SCHEMA_VERSION`, because reading an
+    older file in that range only ever reports what the file carries, while
+    *writing* one would give it the new tables and views from the schema DDL
+    but never a new column -- so it would present as the current version while
+    being structurally unable to answer what that version promises.
+
+    Outside the window is still refused outright, on the ADR's own test: an
+    absent `event_loss` or `session_end` table is a question a version-1 or -2
+    file cannot answer, and no reader can be honest about it.
+
+    Version 0 with no tables at all is reported separately. It is the absence
+    of a schema rather than an old one, and `_no_tables_message` names the
+    file the events are actually in.
+    """
     version = conn.execute("PRAGMA user_version").fetchone()[0]
-    if version != SCHEMA_VERSION:
+    if not MIN_READABLE_SCHEMA_VERSION <= version <= SCHEMA_VERSION:
         # An empty file is a different accident from an old file, and saying
         # "version" to somebody holding the first sends them nowhere.
         if version == 0 and conn.execute(_TABLE_COUNT).fetchone()[0] == 0:
             raise EventLogError(_no_tables_message(conn))
         raise EventLogError(
-            f"database schema version {version} is not this module's "
-            f"version {SCHEMA_VERSION}"
+            f"database schema version {version} is not one this module reads: "
+            f"it reads versions {MIN_READABLE_SCHEMA_VERSION} through "
+            f"{SCHEMA_VERSION}"
         )
+    return version
+
+
+def _warn_what_an_older_file_lacks(conn: sqlite3.Connection, version: int) -> None:
+    """Say what a file inside the window does not carry, on opening it.
+
+    ADR-0007 accepts an older file on the grounds that a reader can answer
+    honestly from it; this is where the answering happens. Two things a
+    version-3 file lacks, and they are not the same kind of absence.
+
+    No `session_meta` table needs nothing said. No rows is exactly what "the
+    caller supplied none" looks like in a current file, so `read_meta`
+    answering `{}` is true of both, which is the whole reason 3 is in the
+    window.
+
+    No `trade.currency` is the other kind. Those trades did settle cash legs
+    -- the file simply never recorded which currency they settled in -- so
+    there is nothing here to rebuild `trade_leg` from, and synthesising a
+    degraded view would be worse than having none: two instrument legs and no
+    cash legs is how the current schema says the instrument had no declared
+    currency, which is a different fact and, for these trades, a false one. So
+    the view stays absent, and the reader is told why rather than meeting `no
+    such table: trade_leg` and guessing.
+
+    The log is untouched by any of this, and re-recording it through a current
+    sink rebuilds the projections at this version -- the fold reads the
+    currency out of the `InstrumentConfigured` events it passes, which is
+    where the original got it. That is the remedy, so the warning names it.
+
+    Only worth saying about a file that traded: a version-3 recording with no
+    trades in it is missing a column that would have said nothing.
+    """
+    if not (_has_object(conn, "trade") and conn.execute(_ANY_TRADE).fetchone()[0]):
+        return
+    _log.warning(
+        "reading a schema version %d recording, and this module writes %d: its "
+        "trades did not record the currency they settled in, so this file has "
+        "no trade_leg view and nothing to build one from. The log is "
+        "unaffected -- re-recording it through a current SQLiteSink rebuilds "
+        "the projections at version %d, trade_leg included",
+        version,
+        SCHEMA_VERSION,
+        SCHEMA_VERSION,
+    )
+
+
+def _check_log(conn: sqlite3.Connection) -> None:
+    version = _check_schema_window(conn)
+    if version < SCHEMA_VERSION:
+        _warn_what_an_older_file_lacks(conn, version)
 
     # Before the arithmetic, because a loss the sink recorded comes with the
     # error that caused it: the more specific diagnosis of the same file.
@@ -1543,6 +1664,60 @@ def _check_log(conn: sqlite3.Connection) -> None:
             f"{last_seq}, and now holds {count} ending at seq {highest}: it has "
             f"been edited since the session that wrote it finished"
         )
+
+
+def read_meta(
+    source: str | os.PathLike[str] | sqlite3.Connection,
+) -> dict[str, str | int | float]:
+    """The provenance a recording was opened with, as a plain dict.
+
+    `source` is a database path or an open connection (the connection is left
+    open; a path is closed before this returns).
+
+        read_meta("sweep/episode-07.db")
+        {'episode': 7, 'label': 'sweep-a', 'seed': 20260814}
+
+    Keys come back sorted, and values keep the types SQLite stored, because
+    `session_meta.value` is deliberately untyped: `meta={"seed": 42}` reads
+    back as `42` and not as `'42'`. A `True` reads back as `1`, which is how
+    SQLite holds a bool and what a `WHERE value = 1` in a sweep script will
+    match.
+
+    **This does not call `check_log`, deliberately.** The metadata was
+    committed in the opening transaction, before the first event, so an
+    unfinished log's metadata is exactly as trustworthy as a finished one's --
+    and the file a sweep most wants named is the one whose process was killed,
+    since that is the run worth looking at. Refusing to answer for it would
+    withhold the one thing that file is certain to hold. Ask `check_log`
+    separately about the events; the two questions are independent here in a
+    way they are nowhere else in this module.
+
+    An empty dict means no metadata was recorded. That is an answer and not an
+    error: the caller supplied none. A file too old to have `session_meta` at
+    all -- schema version 3, which ADR-0007 keeps readable -- has no such
+    table and gets the same answer for the same reason, since no metadata
+    reached a sink that could not have recorded any.
+
+    A schema version outside the readable window still raises `EventLogError`:
+    a file this module cannot read is not a file it can vouch for the
+    provenance of either.
+    """
+    if isinstance(source, sqlite3.Connection):
+        return _read_meta(source)
+    conn = sqlite3.connect(os.fspath(source))
+    try:
+        return _read_meta(conn)
+    finally:
+        conn.close()
+
+
+def _read_meta(conn: sqlite3.Connection) -> dict[str, str | int | float]:
+    _check_schema_window(conn)
+    # Presence rather than the version number: `CREATE TABLE IF NOT EXISTS`
+    # means the table is the fact and the stamp is the claim about it.
+    if not _has_object(conn, "session_meta"):
+        return {}
+    return dict(conn.execute(_META_SELECT))
 
 
 def decode_event(kind: str, payload: str) -> Event:

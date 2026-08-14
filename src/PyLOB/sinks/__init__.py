@@ -28,6 +28,7 @@ whose size you know. A long run wants `SQLiteSink`.
 
 from ..events import Event
 from .sqlite import (
+    MIN_READABLE_SCHEMA_VERSION,
     SCHEMA_VERSION,
     EventLogError,
     IncompleteLogError,
@@ -35,17 +36,20 @@ from .sqlite import (
     check_log,
     decode_event,
     read_events,
+    read_meta,
 )
 
 __all__ = [
     "SQLiteSink",
     "ListSink",
     "SCHEMA_VERSION",
+    "MIN_READABLE_SCHEMA_VERSION",
     "EventLogError",
     "IncompleteLogError",
     "check_log",
     "decode_event",
     "read_events",
+    "read_meta",
 ]
 
 

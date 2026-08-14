@@ -85,12 +85,14 @@ from PyLOB.events import (
 from PyLOB.sinks import ListSink
 from PyLOB.sinks.sqlite import (
     DEFAULT_BUFFER_SIZE,
+    MIN_READABLE_SCHEMA_VERSION,
     SCHEMA_VERSION,
     EventLogError,
     IncompleteLogError,
     SQLiteSink,
     check_log,
     read_events,
+    read_meta,
 )
 
 TICK = 0.01
@@ -1071,8 +1073,10 @@ def test_a_foreign_schema_version_is_refused(tmp_path, version):
     Both are named outright rather than reached as `SCHEMA_VERSION - 1`, which
     is a different question: ADR-0007 decided that the readers accept a
     *window* down to `MIN_READABLE_SCHEMA_VERSION`, so the version immediately
-    below this one is on its way to being read rather than refused. These two
-    sit outside any window, which is what this test is about.
+    below this one is read rather than refused. These two sit outside any
+    window, which is what this test is about -- and every reader is on the
+    same window, `read_meta` included: a file this module cannot read is not
+    one it can report the provenance of either.
     """
     path = tmp_path / "old.db"
     sink = SQLiteSink(path, buffer_size=100)
@@ -1087,6 +1091,8 @@ def test_a_foreign_schema_version_is_refused(tmp_path, version):
 
     with pytest.raises(EventLogError, match="schema version"):
         check_log(path)
+    with pytest.raises(EventLogError, match="schema version"):
+        read_meta(path)
 
 
 def test_an_empty_log_is_not_a_damaged_one(tmp_path):
@@ -1349,6 +1355,16 @@ RECORDED_META = [
     ("warmed_up", 1, "integer"),
 ]
 
+#: The same rows as `read_meta` hands them back: keys sorted, values with the
+#: types SQLite stored, and `warmed_up` as the 1 a bool is held as -- which is
+#: what a sweep script filtering on `value = 1` will meet.
+READ_META = {
+    "episode": 7,
+    "label": "sweep-a",
+    "seed": 20260814,
+    "warmed_up": 1,
+}
+
 
 def test_metadata_survives_a_session_killed_before_its_first_flush(tmp_path):
     """The file with nothing in it still says which run it was.
@@ -1439,6 +1455,385 @@ def test_metadata_that_cannot_be_recorded_is_refused_before_anything_opens(tmp_p
     sink = SQLiteSink(path, meta={})
     sink.close()
     assert meta_rows(path) == []
+
+
+def test_read_meta_answers_out_of_a_log_that_never_finished(tmp_path):
+    """The metadata of a killed run is exactly as good as anybody else's.
+
+    `read_meta` deliberately does not run `check_log`. The row was committed
+    in the opening transaction, before the first event, so nothing `check_log`
+    decides bears on it -- and the file a sweep most wants named is precisely
+    the one whose process died, because that is the run worth looking at. A
+    reader that refused to name it would withhold the one thing the file is
+    certain to hold.
+
+    The log is still unfinished, and asking about the log still says so: the
+    two questions are independent, not merged.
+    """
+    path = tmp_path / "killed-read-meta.db"
+    sink = killed_session(path, buffer_size=DEFAULT_BUFFER_SIZE, n_orders=5, meta=META)
+
+    assert sink.buffered > 0, "nothing was actually lost with the process"
+    assert seqs(path) == [], "the file with no events in it is the case that matters"
+    with pytest.raises(IncompleteLogError):
+        check_log(path)
+
+    assert read_meta(path) == READ_META
+
+
+def test_read_meta_keeps_the_types_the_untyped_column_stored(tmp_path):
+    """`meta={"seed": 42}` reads back as `42`, and never as `'42'`.
+
+    The reason `session_meta.value` has no declared type: SQLite's dynamic
+    typing hands back what was put in, and a seed that arrives as a string is
+    a seed somebody has to remember to cast in every sweep script forever.
+    Asserted on the type as well as the value, since `42 == 42.0` and a dict
+    comparison alone would not notice an integer that came back as a float.
+    """
+    path = tmp_path / "typed.db"
+    sink = SQLiteSink(path, meta=META)
+    sink.close()
+
+    meta = read_meta(path)
+    assert meta == READ_META
+    assert list(meta) == sorted(READ_META), "keys come back sorted"
+    assert [type(value) for _, value in sorted(meta.items())] == [int, str, int, int]
+
+
+def test_read_meta_is_empty_rather_than_absent_when_none_was_supplied(tmp_path):
+    """No metadata is an answer -- "the caller supplied none" -- not an error.
+
+    Also the one reader here that a still-running sink can be asked through
+    its own connection, since a recording states what it is before it has
+    anything else to say.
+    """
+    path = tmp_path / "unlabelled.db"
+    sink = SQLiteSink(path)
+    assert read_meta(sink.connection) == {}
+    sink.close()
+    assert read_meta(path) == {}
+
+
+# --------------------------------------------------------------------------
+# an older recording, and what it can still be asked (ADR-0007)
+# --------------------------------------------------------------------------
+
+#: The schema `SQLiteSink` wrote at version 3: `sqlite.py`'s own `SCHEMA` as
+#: it stood before the commit "Schema 4: session_meta, trade.currency, and the
+#: trade_leg view", with the explanatory comments dropped -- they are
+#: documentation, and structure is what makes a file version 3. What matters
+#: here is what is *not* in it: no `session_meta` table, no `currency` column
+#: on `trade`, and therefore no `trade_leg` view.
+V3_SCHEMA = """
+CREATE TABLE IF NOT EXISTS event (
+    seq        INTEGER PRIMARY KEY,
+    kind       TEXT    NOT NULL,
+    timestamp  REAL    NOT NULL,
+    replayable INTEGER NOT NULL,
+    payload    TEXT    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS event_kind ON event (kind);
+
+CREATE TABLE IF NOT EXISTS event_loss (
+    first_seq   INTEGER NOT NULL,
+    last_seq    INTEGER NOT NULL,
+    count       INTEGER NOT NULL,
+    recorded_at REAL    NOT NULL,
+    error       TEXT    NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS session_end (
+    recorded_at REAL    NOT NULL,
+    last_seq    INTEGER,
+    event_count INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS session (
+    seq            INTEGER PRIMARY KEY,
+    timestamp      REAL    NOT NULL,
+    tick_size      REAL    NOT NULL,
+    stream_version INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS instrument (
+    symbol     TEXT PRIMARY KEY,
+    currency   TEXT NOT NULL,
+    last_price REAL
+);
+
+CREATE TABLE IF NOT EXISTS trader (
+    tid                   INTEGER PRIMARY KEY,
+    name                  TEXT,
+    allow_self_matching   INTEGER NOT NULL,
+    commission_min        REAL    NOT NULL,
+    commission_max_percnt REAL    NOT NULL,
+    commission_per_unit   REAL    NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS orders (
+    idNum         INTEGER PRIMARY KEY,
+    tid           INTEGER NOT NULL REFERENCES trader (tid),
+    instrument    TEXT    NOT NULL REFERENCES instrument (symbol),
+    currency      TEXT,
+    side          TEXT    NOT NULL,
+    order_type    TEXT    NOT NULL,
+    price         REAL,
+    qty           INTEGER NOT NULL,
+    fulfilled     INTEGER NOT NULL DEFAULT 0,
+    value         REAL    NOT NULL DEFAULT 0.0,
+    commission    REAL    NOT NULL DEFAULT 0.0,
+    priority      INTEGER NOT NULL,
+    status        TEXT    NOT NULL,
+    cancel_reason TEXT,
+    accepted_seq  INTEGER NOT NULL,
+    accepted_ts   REAL    NOT NULL,
+    last_seq      INTEGER NOT NULL,
+    last_ts       REAL    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS orders_book ON orders (instrument, side, status);
+CREATE INDEX IF NOT EXISTS orders_tid ON orders (tid);
+
+CREATE TABLE IF NOT EXISTS trade (
+    trade_id             INTEGER PRIMARY KEY,
+    seq                  INTEGER NOT NULL,
+    timestamp            REAL    NOT NULL,
+    instrument           TEXT    NOT NULL REFERENCES instrument (symbol),
+    price                REAL    NOT NULL,
+    qty                  INTEGER NOT NULL,
+    taker_side           TEXT    NOT NULL,
+    bid_idNum            INTEGER NOT NULL REFERENCES orders (idNum),
+    bid_tid              INTEGER NOT NULL,
+    bid_fulfilled        INTEGER NOT NULL,
+    bid_value            REAL    NOT NULL,
+    bid_commission       REAL    NOT NULL,
+    bid_commission_delta REAL    NOT NULL,
+    ask_idNum            INTEGER NOT NULL REFERENCES orders (idNum),
+    ask_tid              INTEGER NOT NULL,
+    ask_fulfilled        INTEGER NOT NULL,
+    ask_value            REAL    NOT NULL,
+    ask_commission       REAL    NOT NULL,
+    ask_commission_delta REAL    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS trade_instrument ON trade (instrument, seq);
+
+CREATE TABLE IF NOT EXISTS balance (
+    tid    INTEGER NOT NULL REFERENCES trader (tid),
+    symbol TEXT    NOT NULL,
+    amount REAL    NOT NULL DEFAULT 0.0,
+    PRIMARY KEY (tid, symbol)
+);
+
+CREATE VIEW IF NOT EXISTS resting_order AS
+    SELECT idNum, tid, instrument, side, price, qty, fulfilled,
+           qty - fulfilled AS available, priority
+    FROM orders
+    WHERE status = 'open';
+
+CREATE VIEW IF NOT EXISTS trader_commission AS
+    SELECT tid, currency, SUM(commission) AS commission
+    FROM orders
+    GROUP BY tid, currency;
+"""
+
+#: Every table a version-3 recording holds. Views are rebuilt by the DDL, not
+#: copied.
+V3_TABLES = (
+    "event",
+    "event_loss",
+    "session_end",
+    "session",
+    "instrument",
+    "trader",
+    "orders",
+    "trade",
+    "balance",
+)
+
+
+def as_version_3(source, target):
+    """Rebuild the recording at `source` as a genuine version-3 file.
+
+    The same events and the same projections, in the schema that preceded this
+    one: each table is filled by naming the columns *version 3* has, so the
+    version-4 additions are dropped exactly the way a file recorded before the
+    bump never had them.
+
+    Stamping `PRAGMA user_version = 3` on a current file would test nothing.
+    The whole question ADR-0007 answers is what a reader does when the schema
+    differs, and a file that still has `session_meta`, `trade.currency` and
+    `trade_leg` is a version-4 file wearing a label.
+    """
+    conn = sqlite3.connect(target)
+    try:
+        conn.executescript(V3_SCHEMA)
+        conn.execute("PRAGMA user_version = 3")
+        conn.execute("ATTACH DATABASE ? AS src", (str(source),))
+        for table in V3_TABLES:
+            # From `main`, so the column list is version 3's and the version-4
+            # columns are simply never selected.
+            columns = ", ".join(
+                row[1] for row in conn.execute("PRAGMA main.table_info(%s)" % table)
+            )
+            conn.execute(
+                "INSERT INTO main.%s (%s) SELECT %s FROM src.%s"
+                % (table, columns, columns, table)
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    return target
+
+
+def recorded(tmp_path, name, n_ops=200, seed=11):
+    """A closed, healthy recording with trades in it, at the current version."""
+    path = tmp_path / name
+    book, _ = build(path, buffer_size=17)
+    workload(book, random.Random(seed), n_ops=n_ops)
+    book.close()
+    return path
+
+
+def objects(path):
+    """Every table, view and index name in the file."""
+    conn = sqlite3.connect(path)
+    try:
+        return {row[0] for row in conn.execute("SELECT name FROM sqlite_master")}
+    finally:
+        conn.close()
+
+
+def test_a_version_3_recording_still_reads(tmp_path):
+    """The point of ADR-0007: a bump does not make existing recordings junk.
+
+    Under the old rule -- every reader demanding `user_version ==
+    SCHEMA_VERSION` -- shipping version 4 would have made every recording ever
+    made unopenable. Not degraded, not partially readable: refused. The ADR
+    accepts an older file when a reader can answer the new question honestly
+    from it, and version 3 qualifies, so the events must come back out.
+
+    The assertions on the file's shape are the ones a `user_version`-stamped
+    version-4 file would fail, and they are here because that file would pass
+    everything below them while testing nothing.
+    """
+    assert MIN_READABLE_SCHEMA_VERSION == 3, (
+        "this suite builds the version-3 schema by hand: a window that no "
+        "longer starts at 3 is a decision (ADR-0007), not a stale fixture"
+    )
+    original = recorded(tmp_path, "current.db")
+    old = as_version_3(original, tmp_path / "v3.db")
+
+    conn = sqlite3.connect(old)
+    try:
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert conn.execute("SELECT COUNT(*) FROM trade").fetchone()[0] > 0
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(trade)")}
+    finally:
+        conn.close()
+    assert "session_meta" not in objects(old), "version 3 had no metadata table"
+    assert "trade_leg" not in objects(old), "and no per-leg view"
+    assert "currency" not in columns, "nor the column that view is built on"
+
+    check_log(old)
+    assert list(read_events(old)) == list(read_events(original))
+    assert list(read_events(old, replayable_only=True)) == list(
+        read_events(original, replayable_only=True)
+    )
+
+    # An absent `session_meta` table is the same answer as an empty one: the
+    # caller supplied no metadata. That is what puts version 3 in the window.
+    assert read_meta(old) == {}
+
+
+def test_a_version_3_recording_is_still_refused_for_writing(tmp_path):
+    """The half of ADR-0007 that did not move, and the reason the two differ.
+
+    Opening this file for writing would run the current DDL over it: `CREATE
+    TABLE IF NOT EXISTS` would hand it `session_meta` and the `trade_leg`
+    view, and nothing whatsoever would hand `trade` its `currency` column,
+    because SQLite does not retrofit one into existing rows. The file would
+    then be stamped version 4 while carrying a view over a column that is not
+    there -- a recording that lies about itself, produced by nothing worse
+    than opening it.
+
+    So the writer keeps demanding equality even for the version the readers
+    now accept, and the refusal must leave the file exactly as it found it.
+    """
+    original = recorded(tmp_path, "current.db")
+    old = as_version_3(original, tmp_path / "v3.db")
+    before = objects(old)
+
+    with pytest.raises(ValueError, match="schema version 3"):
+        SQLiteSink(old)
+
+    assert objects(old) == before, "the refusal did not half-upgrade the file"
+    conn = sqlite3.connect(old)
+    try:
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
+    finally:
+        conn.close()
+    # And the reader still reads it, which is the whole asymmetry in one line.
+    check_log(old)
+
+
+def test_reading_an_older_file_says_what_it_does_not_carry(tmp_path, caplog):
+    """A reader that accepts an old file owes the reader of it the difference.
+
+    ADR-0007's cost lands here: absence used to be impossible, so no reader
+    had to describe it. A version-3 file's trades did settle cash legs -- it
+    simply never recorded which currency they settled in -- so `trade_leg`
+    cannot be rebuilt over them, and synthesising a degraded view would be
+    worse than none, since two instrument legs and no cash legs is how the
+    current schema says the instrument had no declared currency. Saying so is
+    what the reader does instead, and it names the remedy: the log still
+    carries the `InstrumentConfigured` events the fold takes the currency
+    from, so re-recording it produces a current file with `trade_leg` in it.
+    """
+    original = recorded(tmp_path, "current.db")
+    old = as_version_3(original, tmp_path / "v3.db")
+
+    with caplog.at_level(logging.WARNING, logger="PyLOB.sinks.sqlite"):
+        check_log(old)
+    assert "version 3" in caplog.text
+    assert "trade_leg" in caplog.text
+    assert "currency" in caplog.text
+
+    # The remedy the warning names, asserted rather than merely offered: the
+    # log still carries the `InstrumentConfigured` events the fold takes each
+    # trade's currency from, so re-recording it produces a current file with
+    # the cash legs the old one could not express. A message that promised
+    # this and was wrong would be worse than saying nothing.
+    def currency_legs(path):
+        conn = sqlite3.connect(path)
+        try:
+            return conn.execute(
+                "SELECT COUNT(*) FROM trade_leg WHERE leg = 'currency'"
+            ).fetchone()[0]
+        finally:
+            conn.close()
+
+    rebuilt = tmp_path / "rebuilt.db"
+    refold(old, rebuilt)
+    conn = sqlite3.connect(rebuilt)
+    try:
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+    finally:
+        conn.close()
+    assert currency_legs(rebuilt) == currency_legs(original) > 0
+
+    # A version-3 file that never traded is missing a column that would have
+    # said nothing, and is read without a word about it.
+    caplog.clear()
+    quiet = tmp_path / "no-trades.db"
+    sink = SQLiteSink(quiet, buffer_size=100)
+    for event in stream(20):
+        sink.consume(event)
+    sink.close()
+    old_quiet = as_version_3(quiet, tmp_path / "v3-no-trades.db")
+
+    with caplog.at_level(logging.WARNING, logger="PyLOB.sinks.sqlite"):
+        check_log(old_quiet)
+        assert list(read_events(old_quiet)) == list(read_events(quiet))
+    assert "trade_leg" not in caplog.text
 
 
 # --------------------------------------------------------------------------
