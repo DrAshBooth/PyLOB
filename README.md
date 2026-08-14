@@ -338,6 +338,12 @@ Where to read next:
 `src/PyLOB/engine.py` for the internals and the cost table, and
 `python -m PyLOB.bench --list` for performance.
 
+**Porting code written against the pre-2026 SQL engine:**
+[docs/migrating-from-the-legacy-engine.md](docs/migrating-from-the-legacy-engine.md)
+lists every behavioural difference, including the ones that answer rather than
+raise — a legacy call that used to return `0` or silently no-op and now does
+something else is the kind that costs an afternoon.
+
 **Contributing:** `CLAUDE.md`, then the `context:` block of
 `openspec/config.yaml` for the standing constraints, then
 [docs/adr/README.md](docs/adr/README.md), then `openspec/specs/`. The

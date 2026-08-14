@@ -1,6 +1,6 @@
 """The in-memory engine at its boundaries: bad input, gated walks, heap hygiene.
 
-Four findings from the pre-retirement review (`docs/engine-review-2026-08.md`),
+Five findings from the pre-retirement review (`docs/engine-review-2026-08.md`),
 one section each. They are together in one module because they are one kind of
 test -- none of them would be caught by asking the engine to trade correctly.
 They are the cases where an engine that trades correctly still ends up wrong.
@@ -9,7 +9,10 @@ The first three are P1 and none of them is a scenario from a frozen spec. The
 fourth, `lob-8r6`, is: a spec change ratified the refusal, so the requirement's
 own scenarios are covered in `tests/acceptance/test_order_lifecycle.py` like
 every other scenario, and what is here is what the acceptance suite deliberately
-cannot see -- the exact refusal, and that nothing at all moved.
+cannot see -- the exact refusal, and that nothing at all moved. The fifth,
+`lob-49r`, is the first section's rule applied to a surface the acceptance
+suites never drive: they speak to the engine through an adapter, and the
+dict-quote shim is what legacy callers hold.
 
 `lob-d6i` -- the input gate
     A limit price of `float("nan")` was accepted. Every comparison against NaN
@@ -47,6 +50,15 @@ cannot see -- the exact refusal, and that nothing at all moved.
     2026-08-14): modify refuses too. Both routes into the filled state are
     tested, because the clamp reaches it without a trade ever touching the
     order again.
+
+`lob-49r` -- the dict quote
+    `processOrder` read its five required fields off the quote by direct index,
+    so a quote missing one raised `KeyError` from inside the engine.
+    `order-lifecycle` requires an invalid submission to raise *a library
+    exception*, and `KeyError` is neither a `PyLOBError` nor a `ValueError` --
+    the two a caller is told to catch -- so wrapping the call in either one
+    caught nothing. `modifyOrder` had already been given the fix (lob-crf); the
+    shim had not.
 
 The engine is exercised through its public surface wherever the finding can be
 seen there. It cannot always be: a heap's length is the subject of `lob-n3n`,
@@ -866,3 +878,102 @@ def test_a_partly_filled_order_still_modifies_freely():
     book.modifyOrder(order.idNum, dict(side="bid", qty=None, price=99.0))
     assert order.price == 99.0 and order.resting
     assert book.getVolumeAtPrice(INSTRUMENT, "bid", 99.0) == 5
+
+
+# --------------------------------------------------------------------------
+# lob-49r: the same gate, on the dict-quote shim
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("missing", ["tid", "instrument", "side", "type", "qty"])
+def test_a_quote_missing_a_field_is_refused_by_name(missing):
+    """Each required key, absent: an `InvalidOrder` that says which one.
+
+    Parameterized over the fields rather than asserting on one, because the
+    defect was per-key -- five direct indexes, each its own way out of the
+    library's exception hierarchy -- and a fix applied to four of them looks
+    exactly like a fix applied to five.
+    """
+    book = make_book()
+    quote = dict(
+        tid=1, instrument=INSTRUMENT, side="bid", type="limit", qty=5, price=100.0
+    )
+    del quote[missing]
+
+    with pytest.raises(InvalidOrder, match=repr(missing)) as refusal:
+        book.processOrder(quote)
+
+    assert missing in str(refusal.value)
+
+
+def test_a_malformed_quote_raises_the_librarys_own_exception():
+    """`order-lifecycle`: an invalid submission raises *a library exception*.
+
+    A bare `KeyError` is neither a `PyLOBError` nor a `ValueError`, so a caller
+    who had wrapped `processOrder` in the two exceptions this library documents
+    caught nothing at all -- the same reading of the same requirement that
+    `test_the_price_gate_raises_the_librarys_own_exception` makes of the price
+    gate, applied to the shim legacy callers actually hold.
+    """
+    book = make_book()
+    for exception in (PyLOBError, ValueError):
+        with pytest.raises(exception):
+            book.processOrder(dict(tid=1, instrument=INSTRUMENT, side="bid"))
+    with pytest.raises(InvalidOrder):
+        book.processOrder({})
+
+
+def test_a_refused_quote_moves_nothing_at_all():
+    """No order, no event, no clock tick -- the quote is read before `submit`.
+
+    The counters are read through the next accepted order, as in
+    `test_a_refused_submission_moves_nothing_at_all`: an identifier or a
+    priority stamp consumed by a refused quote would show up there and nowhere
+    else.
+    """
+    sink = ListSink()
+    book = make_book(sink=sink)
+    first, _ = book.submit(1, INSTRUMENT, "bid", "limit", 5, 100.0)
+    before_events = list(sink.events)
+    before_orders = list(book.orders())
+    before_time = book.time
+
+    for missing in ("tid", "instrument", "side", "type", "qty"):
+        quote = dict(
+            tid=2, instrument=INSTRUMENT, side="ask", type="limit", qty=3, price=101.0
+        )
+        del quote[missing]
+        with pytest.raises(InvalidOrder):
+            book.processOrder(quote)
+        assert "idNum" not in quote and "timestamp" not in quote, (
+            "a refused quote came back stamped: %r" % (quote,)
+        )
+
+    assert sink.events == before_events
+    assert list(book.orders()) == before_orders
+    assert book.time == before_time
+    assert book.snapshot(INSTRUMENT, "ask") == ()
+
+    second, _ = book.submit(1, INSTRUMENT, "bid", "limit", 5, 100.0)
+    assert second.idNum == first.idNum + 1
+    assert second.priority == first.priority + 1
+    assert second.timestamp == first.timestamp + 1
+
+
+def test_a_quote_with_every_field_present_is_untouched_by_the_gate():
+    """The gate is a gate and not a filter: a well-formed quote still trades.
+
+    A refusal that also refused legal quotes would be caught by the suite
+    elsewhere, but not by this section, and this section is where someone
+    tightening the gate will be reading.
+    """
+    book = make_book()
+    book.submit(1, INSTRUMENT, "ask", "limit", 5, 100.0)
+
+    trades, quote = book.processOrder(
+        dict(tid=2, instrument=INSTRUMENT, side="bid", type="market", qty=4)
+    )
+
+    assert [(trade.price, trade.qty) for trade in trades] == [(100.0, 4)]
+    assert quote["idNum"] in {order.idNum for order in book.orders()}
+    assert quote["timestamp"] == book.time and quote["price"] is None

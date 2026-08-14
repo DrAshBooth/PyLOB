@@ -1006,6 +1006,10 @@ class OrderBook:
     Single-threaded and synchronous throughout. An operation is finished --
     matched, rested or cancelled, balances moved, events emitted -- before it
     returns, so there is no in-flight state for a caller to observe.
+
+    One book is one session and there is no `reset()`: an episode is a fresh
+    `OrderBook`, which is the intended pattern and the measured-faster one
+    (ADR-0006). `close()` flushes the sink and clears nothing.
     """
 
     valid_types: Final = tuple(str(member) for member in OrderType)
@@ -1418,15 +1422,29 @@ class OrderBook:
         updated in place with the identifier, timestamp and quantized working
         price the engine assigned -- callers read those back out of it.
 
+        `tid`, `instrument`, `side`, `type` and `qty` are required, and a
+        missing one is an `InvalidOrder` naming it, never a `KeyError` from
+        inside the engine -- the same rule, for the same reason, as
+        `modifyOrder`'s (`_quote_field`). Nothing has moved when it raises:
+        the quote is read before `submit` is called, and `submit`'s own gate
+        runs before the clock does.
+
         `fromData` is the replay path: the quote's own `idNum` and `timestamp`
-        are used as given instead of being assigned.
+        are used as given instead of being assigned. Either one absent is
+        assigned rather than refused, so a quote that carries neither replays
+        as an ordinary submission.
+
+        The differences a caller porting from the retired SQL engine meets --
+        this return shape, the keys that are no longer written back, and the
+        refusals that used to be silent no-ops -- are enumerated in
+        `docs/migrating-from-the-legacy-engine.md` (ADR-0003).
         """
         order, trades = self.submit(
-            tid=quote["tid"],
-            instrument=quote["instrument"],
-            side=quote["side"],
-            order_type=quote["type"],
-            qty=quote["qty"],
+            tid=_quote_field(quote, "tid"),
+            instrument=_quote_field(quote, "instrument"),
+            side=_quote_field(quote, "side"),
+            order_type=_quote_field(quote, "type"),
+            qty=_quote_field(quote, "qty"),
             price=quote.get("price"),
             idNum=quote.get("idNum") if fromData else None,
             timestamp=quote.get("timestamp") if fromData else None,
@@ -2000,11 +2018,14 @@ class OrderBook:
         directly.
 
         The trades section differs, and not by omission: this engine keeps no
-        trade log, because growing one would put unbounded memory on the
-        sinkless path ADR-0002 exists to keep free in order to serve a debug
-        print. `last_price` is what it does retain, so that is what the
-        section shows; a full history is `select * from trade` against a
-        `SQLiteSink` database.
+        trade log. Retention is not the objection -- `_orders` keeps every
+        order the book has ever seen, because that store is the
+        identifier-uniqueness test `order-lifecycle` requires. A trade log is
+        required by nothing, so it would be a second unbounded structure,
+        grown on every run to serve a debug print, and a sink already records
+        those executions for the runs that want them. `last_price` is what
+        the engine does retain, so that is what the section shows; a full
+        history is `select * from trade` against a `SQLiteSink` database.
         """
         book = self.book(instrument)
         lines = ["------ Bids -------"]
@@ -2246,6 +2267,30 @@ def _required(update: dict[str, Any], field_name: str, idNum: int) -> Any:
         raise InvalidOrder(
             "modifying order %r needs a %r (None leaves it unchanged)"
             % (idNum, field_name)
+        ) from None
+
+
+def _quote_field(quote: dict[str, Any], field_name: str) -> Any:
+    """One field of a dict quote, or an `InvalidOrder` naming what is missing.
+
+    `_required`'s counterpart on the submission side. A quote states an order
+    the caller wants; a quote that omits part of it is malformed input, and
+    `order-lifecycle` has malformed input raise a library exception rather
+    than something from inside the engine. Indexing the dict directly raised
+    `KeyError`, which is neither a `PyLOBError` nor a `ValueError`, so a
+    caller who had wrapped the call in the two exceptions this library
+    documents saw it go past them (lob-49r).
+
+    `price` is not read through this: it is absent for every market order, and
+    a limit order without one is refused by `create_order` where the rule that
+    requires it lives.
+    """
+    try:
+        return quote[field_name]
+    except KeyError:
+        raise InvalidOrder(
+            "a quote needs a %r: processOrder reads tid, instrument, side, "
+            "type and qty off it, and price for a limit order" % (field_name,)
         ) from None
 
 
