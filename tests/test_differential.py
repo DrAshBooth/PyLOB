@@ -1005,6 +1005,25 @@ class Run:
         """
         return self.generator.probes
 
+    def _two_instruments_resting(self):
+        """Whether two instruments hold resting orders at this same moment.
+
+        The tag this earns used to be added from `len(profile.instruments)`,
+        which is the profile restating its own configuration -- it was true
+        before the run started and would have stayed true had every order gone
+        to one symbol. Simultaneous resting depth is the state that makes
+        instrument scoping real, because it is the only moment at which a
+        query answered out of the wrong book, or a level keyed without its
+        symbol, returns a number that belongs to the other instrument.
+        """
+        seen = 0
+        for symbol, _currency in self.profile.instruments:
+            if any(self.reference.snapshot(side, symbol) for side in ("bid", "ask")):
+                seen += 1
+                if seen == 2:
+                    return True
+        return False
+
     @property
     def levels(self):
         """Distinct resting price levels across every instrument, right now."""
@@ -1084,6 +1103,12 @@ class Run:
         )
 
         self.tags.update(op.tags)
+        if (
+            "two instruments" not in self.tags
+            and len(self.profile.instruments) > 1
+            and self._two_instruments_resting()
+        ):
+            self.tags.add("two instruments")
         if op.kind in ("limit", "market"):
             self.known_ids.append(reference_id)
             state = self.reference.order_state(reference_id)
@@ -1169,8 +1194,6 @@ def test_the_engine_agrees_with_the_reference(tmp_path, profile, seed):
     assert len(run.known_ids) >= profile.ops // 3
     assert all(executions.values()), "an instrument never traded: %r" % (executions,)
 
-    if len(profile.instruments) > 1:
-        run.tags.add("two instruments")
     missing = profile.expects - run.tags
     assert not missing, (
         "this workload never reached %s, so it proves less than it claims; "
